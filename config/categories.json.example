@@ -1,0 +1,37 @@
+{
+  "_comment": "自定义分类规则（可选）。如果文档标题包含 keywords 中的任意关键词，则强制归入该分类，跳过 AI 判断。留空则全部交由 AI 自动分类。",
+  "categories": [
+    {
+      "name": "技术文档",
+      "keywords": ["API", "SDK", "架构", "设计文档", "技术方案", "代码", "开发"],
+      "icon": "💻"
+    },
+    {
+      "name": "工作记录",
+      "keywords": ["周报", "月报", "会议纪要", "复盘", "OKR", "KPI"],
+      "icon": "📋"
+    },
+    {
+      "name": "学习笔记",
+      "keywords": ["笔记", "学习", "总结", "读书", "课程"],
+      "icon": "📚"
+    },
+    {
+      "name": "项目文档",
+      "keywords": ["项目", "需求", "PRD", "规划", "roadmap"],
+      "icon": "🚀"
+    },
+    {
+      "name": "AI 工具",
+      "keywords": ["AI", "ChatGPT", "Claude", "大模型", "LLM", "Prompt"],
+      "icon": "🤖"
+    },
+    {
+      "name": "参考资料",
+      "keywords": ["参考", "文档", "手册", "指南", "教程"],
+      "icon": "📖"
+    }
+  ],
+  "default_category": "其他",
+  "default_icon": "📄"
+}

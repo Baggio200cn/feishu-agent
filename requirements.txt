@@ -1,0 +1,8 @@
+# 飞书开放平台 Python SDK
+lark-oapi>=1.3.0
+
+# HTTP 请求（GitHub API、豆包 AI API）
+requests==2.31.0
+
+# 环境变量支持
+python-dotenv==1.0.0
