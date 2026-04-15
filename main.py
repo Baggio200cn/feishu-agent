@@ -29,6 +29,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.utils.config_loader import config_loader
 from src.utils.feishu_client import FeishuClientFactory
+from src.plugins.registry import PluginRegistry
+
+# Shared registry — lives for the duration of the process.
+_plugin_registry = PluginRegistry()
 
 
 def cmd_organize(args):
@@ -212,6 +216,57 @@ def _manage_contacts(client, args):
         print(f"  {c.get('name', '')} — {c.get('email', '')} {c.get('job_title', '')}")
 
 
+def cmd_reload_plugins(args):
+    """重新加载 plugins/ 目录中的所有插件（无需重启进程）。"""
+    registry = _plugin_registry
+
+    if args.plugin:
+        # If the registry is empty (fresh CLI invocation), populate it first so
+        # reload() can find already-known plugins by name.
+        if not registry._plugins:
+            registry.load_all()
+        result = registry.reload(args.plugin)
+        _print_reload_result({args.plugin: result})
+    else:
+        # Reload everything (and discover new files).
+        results = registry.reload_all()
+        if not results:
+            # Nothing was loaded before — do an initial load instead.
+            loaded = registry.load_all()
+            results = {name: "loaded" for name in loaded}
+
+        if results:
+            _print_reload_result(results)
+        else:
+            print("plugins/ 目录为空或不存在，无插件可加载。")
+            print(f"  插件目录: {registry.plugins_dir}")
+
+    # Also bust the config cache so updated credentials/categories take effect.
+    if args.reload_config:
+        config_loader.reload()
+        print("配置缓存已清除，下次访问将重新读取配置文件。")
+
+    # List currently active plugins.
+    active = registry.list_plugins()
+    if active:
+        print(f"\n当前已加载插件 ({len(active)} 个):")
+        for info in active:
+            print(f"  • {info['name']}: {info['description']}  [{info['module']}]")
+
+
+def _print_reload_result(results: dict) -> None:
+    ok = {k: v for k, v in results.items() if not v.startswith("error")}
+    err = {k: v for k, v in results.items() if v.startswith("error")}
+    if ok:
+        print(f"成功处理 {len(ok)} 个插件:")
+        for name, status in ok.items():
+            print(f"  ✓ {name}: {status}")
+    if err:
+        print(f"失败 {len(err)} 个插件:")
+        for name, status in err.items():
+            print(f"  ✗ {name}: {status}")
+
+
 def main():
     os.makedirs("logs", exist_ok=True)
     parser = argparse.ArgumentParser(description="飞书智能管理 Agent")
@@ -230,6 +285,23 @@ def main():
     p_manage.add_argument("--chat-id", dest="chat_id", help="IM 群聊 ID（管理消息时必填）")
     p_manage.add_argument("--query", help="搜索关键词（管理联系人时可用）")
 
+    # reload-plugins 子命令
+    p_reload = subparsers.add_parser(
+        "reload-plugins",
+        help="重新加载 plugins/ 目录中的插件（无需重启）",
+    )
+    p_reload.add_argument(
+        "plugin",
+        nargs="?",
+        default=None,
+        help="仅重载指定插件名；省略则重载全部",
+    )
+    p_reload.add_argument(
+        "--reload-config",
+        action="store_true",
+        help="同时清除配置文件缓存，强制重新读取 credentials.json / categories.json",
+    )
+
     args = parser.parse_args()
 
     if args.command == "organize":
@@ -238,6 +310,8 @@ def main():
         cmd_import_github(args)
     elif args.command == "manage":
         cmd_manage(args)
+    elif args.command == "reload-plugins":
+        cmd_reload_plugins(args)
     else:
         parser.print_help()
 

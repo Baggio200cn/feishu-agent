@@ -51,5 +51,10 @@ class ConfigLoader:
     def get_github_config(self) -> Dict[str, Any]:
         return self.load_credentials().get("github", {})
 
+    def reload(self) -> None:
+        """Discard cached config so the next access re-reads files from disk."""
+        self._credentials = None
+        self._categories = None
+
 
 config_loader = ConfigLoader()
