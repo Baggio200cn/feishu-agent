@@ -216,6 +216,52 @@ def _manage_contacts(client, args):
         print(f"  {c.get('name', '')} — {c.get('email', '')} {c.get('job_title', '')}")
 
 
+def cmd_plugins(args):
+    """列出 plugins/ 目录中的所有插件及其状态。"""
+    registry = _plugin_registry
+    plugins_dir = registry.plugins_dir
+
+    # Discover files on disk.
+    if not os.path.isdir(plugins_dir):
+        print(f"插件目录不存在: {plugins_dir}")
+        print("请创建该目录并放入插件文件（*.py）。")
+        return
+
+    files = sorted(
+        f for f in os.listdir(plugins_dir)
+        if f.endswith(".py") and not f.startswith("_")
+    )
+
+    if not files:
+        print(f"插件目录为空: {plugins_dir}")
+        return
+
+    # Load all so we can report accurate metadata.
+    if not registry._plugins:
+        registry.load_all()
+
+    loaded_by_file = {}
+    for name, (instance, mod_name) in registry._plugins.items():
+        stem = mod_name.removeprefix("_feishu_plugin_")
+        loaded_by_file[stem] = instance
+
+    print(f"插件目录: {plugins_dir}")
+    print(f"共 {len(files)} 个插件文件:\n")
+    for filename in files:
+        stem = os.path.splitext(filename)[0]
+        instance = loaded_by_file.get(stem)
+        if instance:
+            info = instance.get_info()
+            status = "已加载"
+            desc = info["description"] or "(无描述)"
+            reg_name = info["name"]
+            print(f"  [{status}]  {filename}")
+            print(f"            名称: {reg_name}   描述: {desc}")
+        else:
+            print(f"  [未加载]  {filename}")
+        print()
+
+
 def cmd_reload_plugins(args):
     """重新加载 plugins/ 目录中的所有插件（无需重启进程）。"""
     registry = _plugin_registry
@@ -285,6 +331,9 @@ def main():
     p_manage.add_argument("--chat-id", dest="chat_id", help="IM 群聊 ID（管理消息时必填）")
     p_manage.add_argument("--query", help="搜索关键词（管理联系人时可用）")
 
+    # plugins 子命令
+    subparsers.add_parser("plugins", help="列出 plugins/ 目录中的所有插件及其状态")
+
     # reload-plugins 子命令
     p_reload = subparsers.add_parser(
         "reload-plugins",
@@ -310,6 +359,8 @@ def main():
         cmd_import_github(args)
     elif args.command == "manage":
         cmd_manage(args)
+    elif args.command == "plugins":
+        cmd_plugins(args)
     elif args.command == "reload-plugins":
         cmd_reload_plugins(args)
     else:
