@@ -25,7 +25,7 @@ class EmailManager:
             while fetched < limit:
                 req_builder = (
                     ListUserMailboxMessageRequest.builder()
-                    .folder_type(folder)
+                    .user_mailbox_id("me")
                     .page_size(min(20, limit - fetched))
                 )
                 if page_token:
