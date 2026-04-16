@@ -6,3 +6,6 @@ requests==2.31.0
 
 # 环境变量支持
 python-dotenv==1.0.0
+
+# RSS Feed 解析（Reddit 图片抓取）
+feedparser>=6.0.0
