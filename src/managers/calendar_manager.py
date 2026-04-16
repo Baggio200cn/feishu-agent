@@ -46,8 +46,9 @@ class CalendarManager:
             from lark_oapi.api.calendar.v4 import ListCalendarEventRequest
 
             now = datetime.utcnow()
-            start = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-            end = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # 飞书 Calendar API 要求 Unix 时间戳（秒级字符串）
+            start = str(int(now.timestamp()))
+            end = str(int((now + timedelta(days=days_ahead)).timestamp()))
 
             req = (
                 ListCalendarEventRequest.builder()
@@ -88,7 +89,7 @@ class CalendarManager:
     ) -> Optional[str]:
         """
         创建日历事件。
-        - start_time / end_time 格式: "2026-04-01T10:00:00+08:00"
+        - start_time / end_time: Unix 时间戳字符串，秒级，如 "1743487200"
         返回 event_id，失败返回 None。
         """
         calendar_id = self.get_primary_calendar_id()

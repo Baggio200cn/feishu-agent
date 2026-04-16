@@ -10,8 +10,13 @@ logger = logging.getLogger(__name__)
 class EmailManager:
     """管理飞书邮箱（mail.v1 API）"""
 
-    def __init__(self, client):
+    def __init__(self, client, user_mailbox_id: str = "me"):
+        """
+        初始化邮箱管理器。
+        - user_mailbox_id: 用户邮箱地址或 "me"（代表当前授权用户）
+        """
         self._client = client
+        self._user_mailbox_id = user_mailbox_id
 
     def list_mails(self, folder: str = "INBOX", limit: int = 20) -> List[Dict[str, Any]]:
         """列出邮件，返回邮件摘要列表"""
@@ -25,7 +30,7 @@ class EmailManager:
             while fetched < limit:
                 req_builder = (
                     ListUserMailboxMessageRequest.builder()
-                    .folder_type(folder)
+                    .user_mailbox_id(self._user_mailbox_id)
                     .page_size(min(20, limit - fetched))
                 )
                 if page_token:
@@ -63,6 +68,7 @@ class EmailManager:
 
             req = (
                 GetUserMailboxMessageRequest.builder()
+                .user_mailbox_id(self._user_mailbox_id)
                 .message_id(message_id)
                 .build()
             )
@@ -88,7 +94,10 @@ class EmailManager:
     def reply_mail(self, message_id: str, body: str) -> bool:
         """回复邮件"""
         try:
-            from lark_oapi.api.mail.v1 import ReplyUserMailboxMessageRequest, ReplyUserMailboxMessageRequestBody
+            from lark_oapi.api.mail.v1 import (
+                ReplyUserMailboxMessageRequest,
+                ReplyUserMailboxMessageRequestBody,
+            )
 
             body_obj = (
                 ReplyUserMailboxMessageRequestBody.builder()
@@ -97,6 +106,7 @@ class EmailManager:
             )
             req = (
                 ReplyUserMailboxMessageRequest.builder()
+                .user_mailbox_id(self._user_mailbox_id)
                 .message_id(message_id)
                 .request_body(body_obj)
                 .build()
@@ -118,6 +128,7 @@ class EmailManager:
 
             req = (
                 DeleteUserMailboxMessageRequest.builder()
+                .user_mailbox_id(self._user_mailbox_id)
                 .message_id(message_id)
                 .build()
             )

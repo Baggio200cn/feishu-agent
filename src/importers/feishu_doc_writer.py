@@ -1,5 +1,6 @@
 """
 飞书文档写入器 — 将 Markdown / 代码内容转换为飞书 Wiki 页面
+使用 lark_oapi SDK 的 Block 对象（非原始 dict）构建文档内容。
 """
 import logging
 import re
@@ -7,17 +8,97 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# 飞书文档 Block 类型常量
-BLOCK_PAGE = 1
-BLOCK_TEXT = 2
-BLOCK_H1 = 3
-BLOCK_H2 = 4
-BLOCK_H3 = 5
-BLOCK_H4 = 6
-BLOCK_ORDERED_LIST = 12
-BLOCK_BULLET = 13
-BLOCK_CODE = 14
-BLOCK_DIVIDER = 22
+
+def _build_text_elements(text: str):
+    """构建 TextElement 列表（SDK 对象）"""
+    from lark_oapi.api.docx.v1 import TextElement, TextRun
+
+    return [TextElement.builder().text_run(TextRun.builder().content(text).build()).build()]
+
+
+def _build_block(block_type: int, **kwargs):
+    """通用 Block 构建器"""
+    from lark_oapi.api.docx.v1 import Block
+
+    builder = Block.builder().block_type(block_type)
+    for key, value in kwargs.items():
+        getattr(builder, key)(value)
+    return builder.build()
+
+
+def _text_block(text: str):
+    from lark_oapi.api.docx.v1 import Block, Text
+    return (
+        Block.builder()
+        .block_type(2)
+        .text(Text.builder().elements(_build_text_elements(text)).build())
+        .build()
+    )
+
+
+def _heading_block(level: int, text: str):
+    """level: 1-4 对应 block_type 3-6 及 heading1-heading4"""
+    from lark_oapi.api.docx.v1 import Block, Text
+
+    block_type = level + 2  # h1=3, h2=4, h3=5, h4=6
+    heading_obj = Text.builder().elements(_build_text_elements(text)).build()
+    builder = Block.builder().block_type(block_type)
+    # 根据 level 设置对应的 heading 字段
+    heading_setters = {1: "heading1", 2: "heading2", 3: "heading3", 4: "heading4"}
+    getattr(builder, heading_setters[level])(heading_obj)
+    return builder.build()
+
+
+def _bullet_block(text: str):
+    from lark_oapi.api.docx.v1 import Block, Text
+    return (
+        Block.builder()
+        .block_type(13)
+        .bullet(Text.builder().elements(_build_text_elements(text)).build())
+        .build()
+    )
+
+
+def _ordered_block(text: str):
+    from lark_oapi.api.docx.v1 import Block, Text
+    return (
+        Block.builder()
+        .block_type(12)
+        .ordered(Text.builder().elements(_build_text_elements(text)).build())
+        .build()
+    )
+
+
+def _code_block(code: str, language: int = 0):
+    """
+    构建代码块。language 为语言枚举值（int）。
+    """
+    from lark_oapi.api.docx.v1 import Block, Text
+
+    return (
+        Block.builder()
+        .block_type(14)
+        .code(
+            Text.builder()
+            .elements(_build_text_elements(code))
+            .build()
+        )
+        .build()
+    )
+
+
+def _divider_block():
+    from lark_oapi.api.docx.v1 import Block
+    return Block.builder().block_type(22).build()
+
+
+# 语言名称 → lark_oapi 代码块语言枚举值（常用子集）
+LANG_MAP = {
+    "python": 49, "javascript": 33, "typescript": 67, "go": 29,
+    "rust": 56, "java": 32, "bash": 9, "shell": 9, "sh": 9,
+    "json": 35, "yaml": 73, "yml": 73, "toml": 65, "markdown": 41,
+    "html": 30, "css": 16, "sql": 60, "plaintext": 0, "": 0,
+}
 
 
 class FeishuDocWriter:
@@ -52,42 +133,46 @@ class FeishuDocWriter:
                 urls.append(url)
         return urls
 
-    def _build_repo_blocks(self, repo: Dict) -> List[Dict]:
-        """构建仓库文档的 Block 列表"""
+    def _build_repo_blocks(self, repo: Dict) -> List:
+        """构建仓库文档的 Block 列表（SDK 对象）"""
         blocks = []
 
         # 仓库基本信息
-        blocks.append(self._text_block(f"⭐ Stars: {repo.get('stars', 0)}  |  语言: {repo.get('language', 'N/A')}  |  链接: {repo.get('url', '')}"))
+        blocks.append(_text_block(
+            f"Stars: {repo.get('stars', 0)}  |  "
+            f"语言: {repo.get('language', 'N/A')}  |  "
+            f"链接: {repo.get('url', '')}"
+        ))
         if repo.get("description"):
-            blocks.append(self._text_block(repo["description"]))
+            blocks.append(_text_block(repo["description"]))
         if repo.get("topics"):
-            blocks.append(self._text_block("标签: " + "、".join(repo["topics"])))
-        blocks.append(self._divider())
+            blocks.append(_text_block("标签: " + "、".join(repo["topics"])))
+        blocks.append(_divider_block())
 
         # README 内容
         if repo.get("readme"):
-            blocks.append(self._h2_block("README"))
+            blocks.append(_heading_block(2, "README"))
             readme_blocks = self._markdown_to_blocks(repo["readme"])
-            blocks.extend(readme_blocks[:80])  # 限制长度避免超出 API 限制
+            blocks.extend(readme_blocks[:80])
 
         # 核心代码文件
         for cf in repo.get("core_files", []):
-            blocks.append(self._divider())
-            blocks.append(self._h2_block(f"📄 {cf['path']}"))
-            lang = self._detect_language(cf["path"])
-            blocks.append(self._code_block(cf["content"][:3000], lang))
+            blocks.append(_divider_block())
+            blocks.append(_heading_block(2, f"📄 {cf['path']}"))
+            lang_name = self._detect_language(cf["path"]).lower()
+            lang_id = LANG_MAP.get(lang_name, 0)
+            blocks.append(_code_block(cf["content"][:3000], lang_id))
 
         return blocks
 
-    def _markdown_to_blocks(self, markdown: str) -> List[Dict]:
-        """将 Markdown 文本逐行转换为飞书 Block 列表"""
+    def _markdown_to_blocks(self, markdown: str) -> List:
+        """将 Markdown 文本逐行转换为飞书 Block 列表（SDK 对象）"""
         blocks = []
         in_code_block = False
         code_lines = []
         code_lang = ""
 
         for line in markdown.splitlines():
-            # 代码块处理
             if line.startswith("```"):
                 if not in_code_block:
                     in_code_block = True
@@ -95,7 +180,8 @@ class FeishuDocWriter:
                     code_lines = []
                 else:
                     in_code_block = False
-                    blocks.append(self._code_block("\n".join(code_lines), code_lang))
+                    lang_id = LANG_MAP.get(code_lang.lower(), 0)
+                    blocks.append(_code_block("\n".join(code_lines), lang_id))
                     code_lines = []
                 continue
 
@@ -108,35 +194,35 @@ class FeishuDocWriter:
                 continue
 
             if stripped.startswith("#### "):
-                blocks.append(self._h4_block(stripped[5:]))
+                blocks.append(_heading_block(4, stripped[5:]))
             elif stripped.startswith("### "):
-                blocks.append(self._h3_block(stripped[4:]))
+                blocks.append(_heading_block(3, stripped[4:]))
             elif stripped.startswith("## "):
-                blocks.append(self._h2_block(stripped[3:]))
+                blocks.append(_heading_block(2, stripped[3:]))
             elif stripped.startswith("# "):
-                blocks.append(self._h1_block(stripped[2:]))
+                blocks.append(_heading_block(1, stripped[2:]))
             elif stripped == "---" or stripped == "***":
-                blocks.append(self._divider())
+                blocks.append(_divider_block())
             elif stripped.startswith("- ") or stripped.startswith("* "):
-                blocks.append(self._bullet_block(self._strip_inline_md(stripped[2:])))
+                blocks.append(_bullet_block(self._strip_inline_md(stripped[2:])))
             elif re.match(r"^\d+\. ", stripped):
                 text = re.sub(r"^\d+\. ", "", stripped)
-                blocks.append(self._ordered_block(self._strip_inline_md(text)))
+                blocks.append(_ordered_block(self._strip_inline_md(text)))
             else:
                 text = self._strip_inline_md(stripped)
                 if text:
-                    blocks.append(self._text_block(text))
+                    blocks.append(_text_block(text))
 
         return blocks
 
     @staticmethod
     def _strip_inline_md(text: str) -> str:
         """移除内联 Markdown 标记，转为纯文本"""
-        text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)   # 图片
+        text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)     # 图片
         text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)  # 链接
-        text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)  # 粗体
-        text = re.sub(r"\*([^*]+)\*", r"\1", text)       # 斜体
-        text = re.sub(r"`([^`]+)`", r"\1", text)          # 行内代码
+        text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)        # 粗体
+        text = re.sub(r"\*([^*]+)\*", r"\1", text)             # 斜体
+        text = re.sub(r"`([^`]+)`", r"\1", text)               # 行内代码
         return text.strip()
 
     @staticmethod
@@ -152,36 +238,7 @@ class FeishuDocWriter:
                 return lang
         return "PlainText"
 
-    # --- Block 构造器 ---
-
-    def _text_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_TEXT, "text": {"elements": [{"text_run": {"content": text}}]}}
-
-    def _h1_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_H1, "heading1": {"elements": [{"text_run": {"content": text}}]}}
-
-    def _h2_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_H2, "heading2": {"elements": [{"text_run": {"content": text}}]}}
-
-    def _h3_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_H3, "heading3": {"elements": [{"text_run": {"content": text}}]}}
-
-    def _h4_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_H4, "heading4": {"elements": [{"text_run": {"content": text}}]}}
-
-    def _bullet_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_BULLET, "bullet": {"elements": [{"text_run": {"content": text}}]}}
-
-    def _ordered_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_ORDERED_LIST, "ordered": {"elements": [{"text_run": {"content": text}}]}}
-
-    def _code_block(self, code: str, language: str = "PlainText") -> Dict:
-        return {"block_type": BLOCK_CODE, "code": {"language": language, "elements": [{"text_run": {"content": code}}]}}
-
-    def _divider(self) -> Dict:
-        return {"block_type": BLOCK_DIVIDER}
-
-    def _create_wiki_page(self, title: str, blocks: List[Dict]) -> Optional[str]:
+    def _create_wiki_page(self, title: str, blocks: List) -> Optional[str]:
         """创建 Wiki 页面节点并写入内容，返回 node_token"""
         try:
             from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, CreateSpaceNodeRequestBody
@@ -209,7 +266,6 @@ class FeishuDocWriter:
             node_token = resp.data.node.node_token
             obj_token = resp.data.node.obj_token
 
-            # 写入内容块
             if blocks:
                 self._populate_blocks(obj_token, blocks)
 
@@ -219,8 +275,8 @@ class FeishuDocWriter:
             logger.warning(f"创建 Wiki 页面异常: {e}")
             return None
 
-    def _populate_blocks(self, document_id: str, blocks: List[Dict]) -> None:
-        """批量写入文档内容块（分批，每批最多 50 个）"""
+    def _populate_blocks(self, document_id: str, blocks: List) -> None:
+        """批量写入文档内容块（分批，每批最多 50 个 SDK Block 对象）"""
         try:
             from lark_oapi.api.docx.v1 import (
                 BatchCreateDocumentBlockChildrenRequest,
@@ -243,6 +299,6 @@ class FeishuDocWriter:
                 )
                 resp = self._client.docx.v1.document_block_children.batch_create(req)
                 if not resp.success():
-                    logger.warning(f"写入内容块失败 (batch {i//batch_size}): {resp.msg}")
+                    logger.warning(f"写入内容块失败 (batch {i // batch_size}): {resp.msg}")
         except Exception as e:
             logger.warning(f"写入文档内容异常: {e}")

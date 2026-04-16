@@ -100,17 +100,23 @@ class MessageManager:
             return False
 
     def mark_as_read(self, message_ids: List[str]) -> bool:
-        """批量标记消息为已读"""
+        """批量标记消息为已读（使用 im.v1.message.read_users API）"""
         try:
-            from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+            import json
+            from lark_oapi.api.im.v1 import CreateMessageReadUsersRequest
 
             success_count = 0
             for mid in message_ids:
-                body = PatchMessageRequestBody.builder().content("").build()
-                req = PatchMessageRequest.builder().message_id(mid).request_body(body).build()
-                resp = self._client.im.v1.message.patch(req)
+                req = (
+                    CreateMessageReadUsersRequest.builder()
+                    .message_id(mid)
+                    .build()
+                )
+                resp = self._client.im.v1.message_read_users.create(req)
                 if resp.success():
                     success_count += 1
+                else:
+                    logger.warning(f"标记已读失败 [{mid}]: {resp.msg}")
 
             logger.info(f"标记已读: {success_count}/{len(message_ids)}")
             return success_count == len(message_ids)

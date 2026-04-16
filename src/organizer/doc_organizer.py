@@ -61,7 +61,7 @@ class DocOrganizer:
         return report
 
     def _ensure_category_folder(self, folder_name: str) -> str:
-        """确保分类目录存在，返回节点 token"""
+        """确保分类目录（Wiki 节点）存在，返回节点 token"""
         if folder_name in self._category_nodes:
             return self._category_nodes[folder_name]
 
@@ -72,10 +72,12 @@ class DocOrganizer:
 
         from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, CreateSpaceNodeRequestBody
 
+        # obj_type="docx" 创建一个空文档节点作为分类目录
+        # node_type="origin" 表示新建节点（非快捷方式）
         body = (
             CreateSpaceNodeRequestBody.builder()
-            .obj_type("wiki")
-            .node_type("section")
+            .obj_type("docx")
+            .node_type("origin")
             .title(folder_name)
             .build()
         )

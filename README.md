@@ -73,8 +73,6 @@ feishu-agent/
 │   ├── credentials.json.example   # 凭证模板
 │   └── categories.json.example    # 自定义分类规则（可选）
 ├── src/
-│   ├── auth/
-│   │   └── feishu_auth.py         # Token 管理
 │   ├── organizer/
 │   │   ├── doc_scanner.py         # 扫描 Wiki/云盘文档
 │   │   ├── ai_categorizer.py      # AI 自动分类
@@ -89,10 +87,10 @@ feishu-agent/
 │   │   └── contact_manager.py     # 联系人管理
 │   └── utils/
 │       ├── config_loader.py       # 配置读取
-│       └── feishu_client.py       # Client 工厂（双账号）
+│       └── feishu_client.py       # Client 工厂（双账号，Token 由 lark_oapi 自动管理）
 ├── main.py                        # CLI 入口
 ├── requirements.txt
-└── logs/                          # 运行日志和整理报告
+└── logs/                          # 运行日志和整理报告（自动创建）
 ```
 
 ---

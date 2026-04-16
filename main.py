@@ -1,19 +1,22 @@
 """
 飞书智能管理 Agent — 主入口
 用法:
-  python main.py organize          # 扫描两个账号文档 → AI 分类 → 整理到个人 Wiki
-  python main.py organize --dry-run  # 仅预览，不实际移动
-  python main.py import-github     # 将 GitHub 仓库导入飞书
-  python main.py manage email      # 邮箱管理
-  python main.py manage messages   # IM 消息管理
-  python main.py manage calendar   # 日历管理
-  python main.py manage contacts   # 联系人管理
+  python main.py organize                   # 扫描两个账号文档 → AI 分类 → 整理到个人 Wiki
+  python main.py organize --dry-run         # 仅预览，不实际移动
+  python main.py organize --include-drive   # 同时扫描个人云盘文件
+  python main.py import-github              # 将 GitHub 仓库导入飞书
+  python main.py manage email               # 邮箱管理
+  python main.py manage messages            # IM 消息管理
+  python main.py manage calendar            # 日历管理
+  python main.py manage contacts            # 联系人管理
 """
 import argparse
 import json
 import logging
 import os
 import sys
+
+os.makedirs("logs", exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +59,16 @@ def cmd_organize(args):
     personal_docs = personal_scanner.scan_wiki(wiki_space_id)
     all_docs.extend(personal_docs)
     logger.info(f"个人账号: {len(personal_docs)} 篇文档")
+
+    # 扫描个人云盘文件（如指定 --include-drive）
+    if getattr(args, "include_drive", False):
+        logger.info("=== 扫描个人云盘文件 ===")
+        try:
+            drive_docs = personal_scanner.scan_drive()
+            all_docs.extend(drive_docs)
+            logger.info(f"个人云盘: {len(drive_docs)} 个文件")
+        except Exception as e:
+            logger.warning(f"个人云盘扫描失败（跳过）: {e}")
 
     # 扫描企业账号（如已配置）
     enterprise_cfg = creds["accounts"].get("enterprise", {})
@@ -161,7 +174,8 @@ def cmd_manage(args):
 
 def _manage_email(client):
     from src.managers.email_manager import EmailManager
-    mgr = EmailManager(client)
+    mailbox_id = config_loader.get_account_config("personal").get("mailbox_id", "me")
+    mgr = EmailManager(client, user_mailbox_id=mailbox_id)
     mails = mgr.list_mails(limit=10)
     if not mails:
         print("收件箱为空（或无权限）")
@@ -213,13 +227,13 @@ def _manage_contacts(client, args):
 
 
 def main():
-    os.makedirs("logs", exist_ok=True)
     parser = argparse.ArgumentParser(description="飞书智能管理 Agent")
     subparsers = parser.add_subparsers(dest="command")
 
     # organize 子命令
     p_organize = subparsers.add_parser("organize", help="扫描文档并整理到个人 Wiki")
     p_organize.add_argument("--dry-run", action="store_true", help="仅预览，不实际移动文档")
+    p_organize.add_argument("--include-drive", action="store_true", dest="include_drive", help="同时扫描个人云盘文件")
 
     # import-github 子命令
     subparsers.add_parser("import-github", help="将 GitHub 仓库导入飞书")
