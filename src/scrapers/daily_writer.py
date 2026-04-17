@@ -176,7 +176,7 @@ class DailyWriter:
 
         node = (
             Node.builder()
-            .obj_type("doc")
+            .obj_type("docx")
             .node_type("origin")
             .title(folder_name)
             .build()
@@ -214,7 +214,7 @@ class DailyWriter:
 
             node_builder = (
                 Node.builder()
-                .obj_type("doc")
+                .obj_type("docx")
                 .node_type("origin")
                 .title(title)
             )

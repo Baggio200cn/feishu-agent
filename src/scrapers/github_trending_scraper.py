@@ -158,9 +158,11 @@ class GitHubTrendingScraper:
             return repos
 
         for i in range(0, len(repos), 5):
+            if i == 0:
+                time.sleep(1)  # 避免首次请求触发 burst 限速
             self._summarize_batch(client, repos[i:i + 5])
             if i + 5 < len(repos):
-                time.sleep(0.5)
+                time.sleep(1)
 
         return repos
 
