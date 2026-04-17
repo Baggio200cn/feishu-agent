@@ -153,7 +153,7 @@ class DocOrganizer:
 
         body = (
             Node.builder()
-            .obj_type("doc")
+            .obj_type("docx")
             .node_type("origin")
             .title(folder_name)
             .build()
@@ -253,7 +253,7 @@ class DocOrganizer:
         title = f"[引用] {doc.get('title', '未知文档')}"
         body = (
             Node.builder()
-            .obj_type("doc")
+            .obj_type("docx")
             .node_type("origin")
             .title(title)
             .parent_node_token(parent_node_token)
