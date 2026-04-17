@@ -83,17 +83,14 @@ body {
 }
 
 .titlebar-logo {
-  width: 18px;
-  height: 18px;
-  border-radius: 4px;
-  background: var(--accent);
-  color: white;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 11px;
-  font-weight: 600;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
   flex-shrink: 0;
+  display: block;
+  -webkit-user-drag: none;
+  image-rendering: -webkit-optimize-contrast;
 }
 
 .titlebar-title { font-size: 13px; font-weight: 500; flex: 1; }
@@ -300,7 +297,7 @@ button.flex { flex: 1; }
 <body>
 
 <div class="titlebar">
-  <div class="titlebar-logo">F</div>
+  <img class="titlebar-logo" src="icon.png" alt="飞书智能 Agent">
   <div class="titlebar-title">飞书智能 Agent</div>
 </div>
 
