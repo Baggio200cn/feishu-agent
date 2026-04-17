@@ -177,9 +177,17 @@ class DailyWriter:
                 info_parts.append(f"语言: {repo['language']}")
             blocks.append(_text("  ".join(info_parts)))
 
-            summary = repo.get("summary_cn") or repo.get("description_cn") or repo.get("description", "")
+            desc = repo.get("description_cn") or repo.get("description", "")
+            if desc:
+                blocks.append(_text(f"📌 {desc}"))
+
+            summary = repo.get("summary_cn", "")
             if summary:
-                blocks.append(_text(f"简介: {summary}"))
+                blocks.append(_h3("详细介绍"))
+                for para in summary.split("\n"):
+                    para = para.strip()
+                    if para:
+                        blocks.append(_text(para))
 
             blocks.append(_divider())
 

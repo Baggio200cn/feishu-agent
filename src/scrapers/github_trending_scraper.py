@@ -39,6 +39,7 @@ class GitHubTrendingScraper:
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
+        self.github_token = github_token
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         if github_token:
@@ -137,6 +138,33 @@ class GitHubTrendingScraper:
             logger.warning(f"解析仓库条目失败: {e}")
             return None
 
+    # ── README 抓取 ───────────────────────────────────────────────────────────
+
+    def fetch_readmes(self, repos: List[Dict]) -> List[Dict]:
+        """为每个仓库抓取 README.md，存入 repo['readme']"""
+        import base64
+        gh_headers = {"Accept": "application/vnd.github.v3+json"}
+        if self.github_token:
+            gh_headers["Authorization"] = f"token {self.github_token}"
+
+        for repo in repos:
+            full_name = repo.get("full_name", "")
+            try:
+                resp = requests.get(
+                    f"https://api.github.com/repos/{full_name}/readme",
+                    headers=gh_headers, timeout=15,
+                )
+                if resp.status_code == 200:
+                    content = base64.b64decode(resp.json()["content"]).decode("utf-8", errors="replace")
+                    repo["readme"] = content[:3000]  # 最多取前 3000 字符
+                else:
+                    repo["readme"] = ""
+            except Exception as e:
+                logger.warning(f"抓取 README 失败 [{full_name}]: {e}")
+                repo["readme"] = ""
+
+        return repos
+
     # ── 摘要生成 ──────────────────────────────────────────────────────────────
 
     def generate_summaries(self, repos: List[Dict]) -> List[Dict]:
@@ -156,6 +184,11 @@ class GitHubTrendingScraper:
                 r["description_cn"] = r.get("description", "")
                 r["summary_cn"] = r.get("description", "")
             return repos
+
+        # 先抓取 README（如果还没有）
+        if repos and "readme" not in repos[0]:
+            logger.info("抓取各仓库 README...")
+            self.fetch_readmes(repos)
 
         for i in range(0, len(repos), 5):
             for attempt in range(5):
@@ -180,15 +213,21 @@ class GitHubTrendingScraper:
     def _summarize_batch(self, client, repos: List[Dict]):
         items = []
         for j, r in enumerate(repos):
+            readme_excerpt = r.get("readme", "")[:800]
             items.append(
-                f"{j + 1}. [{r['full_name']}] {r.get('description', '')} "
-                f"(语言: {r.get('language', 'N/A')}, 今日star: {r.get('stars_today', 0)})"
+                f"{j + 1}. [{r['full_name']}]\n"
+                f"   描述: {r.get('description', '(无)')}\n"
+                f"   语言: {r.get('language', 'N/A')}  今日Star: {r.get('stars_today', 0)}\n"
+                f"   README节选:\n{readme_excerpt}\n"
             )
 
         prompt = (
-            f"你是技术专家，请为以下 {len(repos)} 个 GitHub 热门仓库生成简洁中文简介（每个 30-60 字）。"
-            "包含：功能定位、主要特点、适用场景。保留 AI、LLM、API 等专业术语。\n\n"
-            "仓库列表：\n" + "\n".join(items) + "\n\n"
+            f"你是技术专家，请为以下 {len(repos)} 个 GitHub 热门仓库生成详细中文介绍。\n"
+            "每个仓库要求：\n"
+            "- description_cn: 一句话定位（30字内）\n"
+            "- summary_cn: 详细介绍（150-300字），包含：项目背景、核心功能、技术亮点、适用场景\n"
+            "保留 AI、LLM、API 等专业术语。\n\n"
+            "仓库信息：\n" + "\n".join(items) + "\n\n"
             "请严格按以下 JSON 格式返回，不要其他文字：\n"
             '[{"index": 1, "description_cn": "...", "summary_cn": "..."}, ...]'
         )
