@@ -82,7 +82,9 @@ Write-Host '桌面快捷方式已更新'
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, encoding="utf-8",
+            capture_output=True,
+            # 中文 Windows PowerShell 默认 GBK 输出，用 errors=replace 兜底
+            encoding="gbk", errors="replace",
         )
         if result.returncode == 0:
             print("✅ 桌面快捷方式已重新创建（使用新图标）")
