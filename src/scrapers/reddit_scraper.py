@@ -1,4 +1,4 @@
-﻿"""
+"""
 Reddit r/AI_Agents 爬虫
 抓取 new + hot 帖子，使用 Claude API 翻译成中文
 """
