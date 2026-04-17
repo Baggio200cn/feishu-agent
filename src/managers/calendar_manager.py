@@ -46,8 +46,8 @@ class CalendarManager:
             from lark_oapi.api.calendar.v4 import ListCalendarEventRequest
 
             now = datetime.utcnow()
-            start = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-            end = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            start = str(int(now.timestamp()))
+            end = str(int((now + timedelta(days=days_ahead)).timestamp()))
 
             req = (
                 ListCalendarEventRequest.builder()
