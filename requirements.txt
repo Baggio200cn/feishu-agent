@@ -1,8 +1,14 @@
 # 飞书开放平台 Python SDK
 lark-oapi>=1.3.0
 
-# HTTP 请求（GitHub API、豆包 AI API）
+# HTTP 请求（GitHub API、Reddit API 等）
 requests==2.31.0
+
+# Anthropic Claude API（AI 分类、翻译、摘要）
+anthropic>=0.25.0
+
+# HTML 解析（GitHub Trending 爬虫）
+beautifulsoup4>=4.12.0
 
 # 环境变量支持
 python-dotenv==1.0.0

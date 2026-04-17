@@ -14,51 +14,30 @@ class DocScanner:
         self._client = client
         self.account_name = account_name
 
-    def scan_wiki(self, space_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        扫描 Wiki 空间的所有节点。
-        - space_id 为 None 时，自动列出账号下所有 Wiki 空间后逐个扫描。
-        返回文档列表，每项格式：
-        {
-            "title": str,
-            "node_token": str,
-            "obj_token": str,
-            "obj_type": str,   # "doc" / "sheet" / "mindnote" 等
-            "space_id": str,
-            "parent_node_token": str,
-            "account": str,
-            "source": "wiki"
-        }
-        """
+    def scan_wiki(
+        self,
+        space_id: Optional[str] = None,
+        exclude_tokens: Optional[set] = None,
+    ) -> List[Dict[str, Any]]:
         try:
             import lark_oapi as lark
             from lark_oapi.api.wiki.v2 import ListSpaceRequest, ListSpaceNodeRequest
         except ImportError:
             raise ImportError("请先安装 lark-oapi: pip install lark-oapi")
 
+        known_folders: set = exclude_tokens or set()
         docs = []
         space_ids = [space_id] if space_id else self._list_wiki_spaces()
 
         for sid in space_ids:
             logger.info(f"[{self.account_name}] 扫描 Wiki 空间: {sid}")
-            nodes = self._list_nodes_recursive(sid, "")
+            nodes = self._list_nodes_recursive(sid, "", known_folders)
             docs.extend(nodes)
 
         logger.info(f"[{self.account_name}] Wiki 扫描完成，共 {len(docs)} 个节点")
         return docs
 
     def scan_drive(self) -> List[Dict[str, Any]]:
-        """
-        扫描云盘根目录的文件（My Drive）。
-        返回文件列表，格式：
-        {
-            "title": str,
-            "token": str,
-            "type": str,   # "doc" / "sheet" / "file" 等
-            "account": str,
-            "source": "drive"
-        }
-        """
         try:
             from lark_oapi.api.drive.v1 import ListFileRequest
         except ImportError:
@@ -95,7 +74,6 @@ class DocScanner:
         return docs
 
     def _list_wiki_spaces(self) -> List[str]:
-        """列出账号下所有 Wiki 空间 ID"""
         from lark_oapi.api.wiki.v2 import ListSpaceRequest
 
         space_ids = []
@@ -121,10 +99,15 @@ class DocScanner:
 
         return space_ids
 
-    def _list_nodes_recursive(self, space_id: str, parent_node_token: str) -> List[Dict]:
-        """递归列出 Wiki 空间下的所有节点"""
+    def _list_nodes_recursive(
+        self,
+        space_id: str,
+        parent_node_token: str,
+        exclude_tokens: Optional[set] = None,
+    ) -> List[Dict]:
         from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
 
+        known_folders: set = exclude_tokens or set()
         nodes = []
         page_token = None
 
@@ -145,6 +128,10 @@ class DocScanner:
                 break
 
             for node in (resp.data.items or []):
+                if node.node_token in known_folders:
+                    logger.debug(f"[{self.account_name}] 跳过分类文件夹: {node.title}")
+                    continue
+
                 nodes.append({
                     "title": node.title,
                     "node_token": node.node_token,
@@ -155,9 +142,10 @@ class DocScanner:
                     "account": self.account_name,
                     "source": "wiki",
                 })
-                # 递归扫描子节点
                 if node.has_child:
-                    children = self._list_nodes_recursive(space_id, node.node_token)
+                    children = self._list_nodes_recursive(
+                        space_id, node.node_token, known_folders
+                    )
                     nodes.extend(children)
 
             if not resp.data.has_more:
