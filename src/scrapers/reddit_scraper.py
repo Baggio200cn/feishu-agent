@@ -22,11 +22,11 @@ HEADERS = {
 
 DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 
-# Atom/RSS namespace
-NS = {
-    "atom": "http://www.w3.org/2005/Atom",
-    "media": "http://search.yahoo.com/mrss/",
-}
+ATOM = "http://www.w3.org/2005/Atom"
+
+
+def _atag(name: str) -> str:
+    return f"{{{ATOM}}}{name}"
 
 
 class RedditScraper:
@@ -77,7 +77,7 @@ class RedditScraper:
             return []
 
     def _parse_rss(self, xml_text: str) -> List[Dict]:
-        """解析 Reddit RSS/Atom XML，返回帖子列表"""
+        """解析 Reddit Atom Feed，返回帖子列表"""
         posts: List[Dict] = []
         try:
             root = ET.fromstring(xml_text)
@@ -85,12 +85,13 @@ class RedditScraper:
             logger.warning(f"RSS XML 解析失败: {e}")
             return posts
 
-        # Reddit returns Atom feed
-        entries = root.findall("atom:entry", NS)
+        # Reddit 返回 Atom feed，所有标签带完整命名空间
+        entries = root.findall(_atag("entry"))
         if not entries:
-            # Fallback: try without namespace (RSS 2.0)
+            # 兜底：RSS 2.0 <item>
             entries = root.findall(".//item")
 
+        logger.debug(f"找到 {len(entries)} 个 RSS 条目")
         for entry in entries:
             post = self._parse_entry(entry)
             if post:
@@ -100,65 +101,51 @@ class RedditScraper:
 
     def _parse_entry(self, entry) -> Optional[Dict]:
         try:
-            # Atom format
-            title_el = entry.find("atom:title", NS) or entry.find("title")
+            title_el = entry.find(_atag("title")) or entry.find("title")
             title = html.unescape((title_el.text or "").strip()) if title_el is not None else ""
             if not title:
                 return None
 
-            link_el = entry.find("atom:link", NS)
+            # 链接：Atom 用 <link href="...">
+            link_el = entry.find(_atag("link"))
             if link_el is not None:
                 url = link_el.get("href", "")
             else:
                 link_el = entry.find("link")
                 url = (link_el.text or "") if link_el is not None else ""
 
-            # Extract post ID from URL or id element
-            id_el = entry.find("atom:id", NS) or entry.find("id")
+            # ID → Reddit post ID (t3_xxxxx)
+            id_el = entry.find(_atag("id")) or entry.find("id")
             raw_id = (id_el.text or "") if id_el is not None else url
-            # Reddit IDs look like t3_abc123
             id_match = re.search(r"t3_([a-z0-9]+)", raw_id)
             post_id = id_match.group(1) if id_match else re.sub(r"[^a-z0-9]", "", raw_id)[-8:]
 
-            # Body / selftext from content element
+            # 正文：Atom 用 <content type="html">
             content_el = (
-                entry.find("atom:content", NS)
-                or entry.find("content")
-                or entry.find("atom:summary", NS)
+                entry.find(_atag("content"))
+                or entry.find(_atag("summary"))
                 or entry.find("description")
             )
             raw_content = (content_el.text or "") if content_el is not None else ""
             selftext = self._strip_html(html.unescape(raw_content))
 
-            # Author
-            author_el = (
-                entry.find("atom:author/atom:name", NS)
-                or entry.find("author/name")
-            )
+            # 作者
+            author_el = entry.find(f"{_atag('author')}/{_atag('name')}")
+            if author_el is None:
+                author_el = entry.find("author/name")
             author = (author_el.text or "").strip() if author_el is not None else ""
 
-            # Published time → unix timestamp
-            updated_el = (
-                entry.find("atom:updated", NS)
-                or entry.find("atom:published", NS)
-                or entry.find("pubDate")
-            )
+            # 发布时间
+            updated_el = entry.find(_atag("updated")) or entry.find(_atag("published")) or entry.find("pubDate")
             created_utc = 0
             if updated_el is not None and updated_el.text:
                 try:
-                    from email.utils import parsedate_to_datetime
-                    from datetime import timezone
-                    dt = parsedate_to_datetime(updated_el.text)
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(updated_el.text.replace("Z", "+00:00"))
                     created_utc = int(dt.timestamp())
                 except Exception:
-                    try:
-                        from datetime import datetime
-                        dt = datetime.fromisoformat(updated_el.text.replace("Z", "+00:00"))
-                        created_utc = int(dt.timestamp())
-                    except Exception:
-                        pass
+                    pass
 
-            # permalink — use url if it's a reddit link, else construct
             permalink = url if "reddit.com" in url else f"https://www.reddit.com/r/{SUBREDDIT}/comments/{post_id}/"
 
             return {
@@ -169,7 +156,7 @@ class RedditScraper:
                 "selftext_cn": "",
                 "url": url,
                 "permalink": permalink,
-                "score": 0,       # RSS doesn't expose vote counts
+                "score": 0,
                 "num_comments": 0,
                 "author": author,
                 "created_utc": created_utc,
