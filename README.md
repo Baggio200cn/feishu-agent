@@ -40,6 +40,17 @@ cp config/credentials.json.example config/credentials.json
 
 ### 3. 运行
 
+#### 桌面界面（Electron）
+
+```bash
+npm install
+npm start
+```
+
+界面包含：连接状态栏、对话助手入口、GitHub / Reddit 每日抓取卡片、Wiki 整理工作流、每日定时任务开关。按钮会通过 IPC 调用 `main.py` 的对应子命令。文字已针对 Retina / HiDPI 屏幕做字体平滑和抗锯齿优化。
+
+#### 命令行
+
 ```bash
 # 预览文档分类（不实际移动）
 python main.py organize --dry-run
