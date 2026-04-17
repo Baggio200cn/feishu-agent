@@ -256,6 +256,7 @@ class DailyWriter:
             obj_token = resp.data.node.obj_token
 
             if blocks:
+                time.sleep(2)  # 等待文档初始化
                 self._populate_blocks(obj_token, blocks)
 
             return node_token
@@ -265,7 +266,7 @@ class DailyWriter:
             return None
 
     def _populate_blocks(self, document_id: str, blocks: List[Dict]) -> None:
-        """直接调用 REST API 写入内容块，避免 SDK 版本兼容问题"""
+        """直接调用 REST API 写入内容块"""
         url = (
             f"{FEISHU_BASE}/docx/v1/documents/{document_id}"
             f"/blocks/{document_id}/children"
@@ -274,34 +275,53 @@ class DailyWriter:
             "Authorization": f"Bearer {self._get_token()}",
             "Content-Type": "application/json",
         }
-        for i in range(0, len(blocks), 50):
-            batch = blocks[i:i + 50]
+        # 过滤掉内容为空的文本块
+        valid = [b for b in blocks if b.get("block_type") == BLOCK_DIVIDER
+                 or b.get("block_type") not in (BLOCK_TEXT, BLOCK_H1, BLOCK_H2, BLOCK_H3)
+                 or any(
+                     el.get("text_run", {}).get("content", "").strip()
+                     for el in (b.get("text") or b.get("heading1") or b.get("heading2")
+                                or b.get("heading3") or {}).get("elements", [])
+                 )]
+        for i in range(0, len(valid), 50):
+            batch = valid[i:i + 50]
             resp = requests.post(
                 url, headers=headers,
-                json={"children": batch, "index": 0},
+                json={"children": batch, "index": i},
                 timeout=30,
             )
             data = resp.json()
             if data.get("code") != 0:
-                logger.warning(f"写入内容块失败 (batch {i // 50}): {data.get('msg')}")
+                logger.warning(
+                    f"写入内容块失败 (batch {i // 50}): "
+                    f"code={data.get('code')} msg={data.get('msg')}"
+                )
 
 
 # ── Block 工厂函数 ─────────────────────────────────────────────────────────────
 
+def _elem(content: str) -> Dict:
+    return {"text_run": {"content": content[:2000], "text_element_style": {}}}
+
 def _text(content: str) -> Dict:
-    return {"block_type": BLOCK_TEXT, "text": {"elements": [{"text_run": {"content": content}}]}}
+    return {"block_type": BLOCK_TEXT,
+            "text": {"style": {}, "elements": [_elem(content)]}}
 
 def _h1(content: str) -> Dict:
-    return {"block_type": BLOCK_H1, "heading1": {"elements": [{"text_run": {"content": content}}]}}
+    return {"block_type": BLOCK_H1,
+            "heading1": {"style": {}, "elements": [_elem(content)]}}
 
 def _h2(content: str) -> Dict:
-    return {"block_type": BLOCK_H2, "heading2": {"elements": [{"text_run": {"content": content}}]}}
+    return {"block_type": BLOCK_H2,
+            "heading2": {"style": {}, "elements": [_elem(content)]}}
 
 def _h3(content: str) -> Dict:
-    return {"block_type": BLOCK_H3, "heading3": {"elements": [{"text_run": {"content": content}}]}}
+    return {"block_type": BLOCK_H3,
+            "heading3": {"style": {}, "elements": [_elem(content)]}}
 
 def _bullet(content: str) -> Dict:
-    return {"block_type": BLOCK_BULLET, "bullet": {"elements": [{"text_run": {"content": content}}]}}
+    return {"block_type": BLOCK_BULLET,
+            "bullet": {"style": {}, "elements": [_elem(content)]}}
 
 def _divider() -> Dict:
-    return {"block_type": BLOCK_DIVIDER}
+    return {"block_type": BLOCK_DIVIDER, "divider": {}}
