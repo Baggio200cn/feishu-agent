@@ -57,7 +57,7 @@ class DailyWriter:
             return self._token
 
         # 从 lark_oapi 客户端配置中取 app_id / app_secret
-        cfg = self._client._config.app_settings
+        cfg = self._client._config
         resp = requests.post(
             f"{FEISHU_BASE}/auth/v3/tenant_access_token/internal",
             json={"app_id": cfg.app_id, "app_secret": cfg.app_secret},
