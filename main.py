@@ -3,7 +3,12 @@
 用法:
   python main.py organize          # 扫描两个账号文档 → AI 分类 → 整理到个人 Wiki
   python main.py organize --dry-run  # 仅预览，不实际移动
-  python main.py import-github     # 将 GitHub 仓库导入飞书
+  python main.py import-github --repo owner/repo  # 将指定 GitHub 仓库导入飞书
+  python main.py daily-reddit [--limit N]          # Reddit AI_Agents 日报
+  python main.py daily-github [--since daily] [--top-n 15]  # GitHub Trending 日报
+  python main.py search --keyword 关键词           # 搜索 Wiki 文档
+  python main.py list-spaces                       # 列出所有 Wiki 知识空间
+  python main.py daily-report                      # 每日摘要报告
   python main.py manage email      # 邮箱管理
   python main.py manage messages   # IM 消息管理
   python main.py manage calendar   # 日历管理
@@ -116,17 +121,27 @@ def cmd_import_github(args):
 
     all_repos = []
 
-    # 导入指定仓库列表
-    repo_list = github_cfg.get("repo_list", [])
-    if repo_list:
-        logger.info(f"导入指定仓库列表: {repo_list}")
-        all_repos.extend(importer.import_repo_list(repo_list))
+    # 单个仓库（来自 --repo 参数或 chat agent）
+    if getattr(args, "repo", None):
+        logger.info(f"导入指定仓库: {args.repo}")
+        data = importer.fetch_repo(args.repo)
+        if data:
+            all_repos.append(data)
+        else:
+            print(f"❌ 无法获取仓库: {args.repo}")
+            return
+    else:
+        # 导入配置文件中的仓库列表
+        repo_list = github_cfg.get("repo_list", [])
+        if repo_list:
+            logger.info(f"导入指定仓库列表: {repo_list}")
+            all_repos.extend(importer.import_repo_list(repo_list))
 
-    # 按主题搜索
-    topics = github_cfg.get("search_topics", [])
-    if topics:
-        logger.info(f"搜索主题仓库: {topics}")
-        all_repos.extend(importer.search_by_topics(topics, per_topic=5))
+        # 按主题搜索
+        topics = github_cfg.get("search_topics", [])
+        if topics:
+            logger.info(f"搜索主题仓库: {topics}")
+            all_repos.extend(importer.search_by_topics(topics, per_topic=5))
 
     if not all_repos:
         logger.info("未获取到任何仓库，请检查 credentials.json 中的 github 配置")
@@ -138,6 +153,186 @@ def cmd_import_github(args):
     print(f"\n✅ 已成功导入 {len(urls)} 个仓库到飞书 Wiki:")
     for url in urls:
         print(f"  {url}")
+
+
+def cmd_daily_reddit(args):
+    """抓取 Reddit r/AI_Agents 日报并写入飞书"""
+    creds = config_loader.load_credentials()
+    factory = FeishuClientFactory(creds["accounts"])
+    personal_client = factory.get_client("personal")
+    wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
+
+    from src.scrapers.reddit_scraper import RedditScraper
+    from src.scrapers.daily_writer import DailyWriter
+
+    ai_cfg = config_loader.get_ai_config()
+    scraper = RedditScraper(
+        api_key=ai_cfg.get("api_key", ""),
+        model=ai_cfg.get("model", "doubao-seed-2-0-code-preview-260215"),
+        base_url=ai_cfg.get("base_url", "https://ark.cn-beijing.volces.com/api/v3"),
+    )
+    limit = getattr(args, "limit", 20) or 20
+    logger.info(f"抓取 Reddit r/AI_Agents，每种排序 {limit} 篇...")
+    posts = scraper.fetch_posts(limit=limit)
+    if not posts:
+        print("❌ 未抓取到任何帖子（RSS 可能暂时不可用）")
+        return
+
+    logger.info(f"抓取到 {len(posts)} 篇帖子，开始翻译...")
+    posts = scraper.translate_posts(posts)
+
+    writer = DailyWriter(personal_client, wiki_space_id)
+    report = writer.write_reddit_posts(posts)
+    print(
+        f"\n✅ Reddit 日报写入完成: 成功 {report['written']} 篇，"
+        f"失败 {report['failed']} 篇 → [{report['folder']}]"
+    )
+
+
+def cmd_daily_github(args):
+    """抓取 GitHub Trending 日报并写入飞书"""
+    creds = config_loader.load_credentials()
+    factory = FeishuClientFactory(creds["accounts"])
+    personal_client = factory.get_client("personal")
+    wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
+
+    from src.scrapers.github_trending_scraper import GitHubTrendingScraper
+    from src.scrapers.daily_writer import DailyWriter
+
+    ai_cfg = config_loader.get_ai_config()
+    github_cfg = config_loader.get_github_config()
+    scraper = GitHubTrendingScraper(
+        api_key=ai_cfg.get("api_key", ""),
+        model=ai_cfg.get("model", "doubao-seed-2-0-code-preview-260215"),
+        base_url=ai_cfg.get("base_url", "https://ark.cn-beijing.volces.com/api/v3"),
+        github_token=github_cfg.get("token", ""),
+    )
+    since = getattr(args, "since", "daily") or "daily"
+    top_n = int(getattr(args, "top_n", 15) or 15)
+
+    logger.info(f"抓取 GitHub Trending ({since}, top {top_n})...")
+    repos = scraper.fetch_trending(since=since, top_n=top_n)
+    if not repos:
+        print("❌ 未抓取到任何仓库")
+        return
+
+    logger.info("生成中文摘要...")
+    repos = scraper.generate_summaries(repos)
+
+    writer = DailyWriter(personal_client, wiki_space_id)
+    report = writer.write_github_trending(repos)
+    print(
+        f"\n✅ GitHub Trending 日报写入完成: {report['written']} 个仓库 → [{report['folder']}]"
+    )
+
+
+def cmd_search(args):
+    """按关键词搜索 Wiki 文档（从本地 SQLite 索引）"""
+    import sqlite3
+    keyword = (getattr(args, "keyword", "") or "").strip()
+    if not keyword:
+        print("请提供搜索关键词: --keyword <词>")
+        return
+
+    db_path = "data/agent.db"
+    if not os.path.exists(db_path):
+        print("本地索引不存在，请先运行 organize 命令建立索引。")
+        return
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT title, category, node_token FROM wiki_docs WHERE title LIKE ? LIMIT 50",
+        (f"%{keyword}%",),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print(f"未找到包含「{keyword}」的文档。")
+        return
+
+    from collections import defaultdict
+    by_cat = defaultdict(list)
+    for title, cat, token in rows:
+        by_cat[cat or "未分类"].append(title)
+
+    print(f"\n搜索「{keyword}」找到 {len(rows)} 篇文档:\n")
+    for cat, titles in sorted(by_cat.items()):
+        print(f"  [{cat}] ({len(titles)} 篇)")
+        for t in titles[:10]:
+            print(f"    · {t}")
+        if len(titles) > 10:
+            print(f"    ... 共 {len(titles)} 篇")
+
+
+def cmd_list_spaces(args):
+    """列出飞书所有 Wiki 知识空间"""
+    creds = config_loader.load_credentials()
+    factory = FeishuClientFactory(creds["accounts"])
+    client = factory.get_client("personal")
+
+    try:
+        from lark_oapi.api.wiki.v2 import ListSpaceRequest
+        req = ListSpaceRequest.builder().page_size(50).build()
+        resp = client.wiki.v2.space.list(req)
+        if not resp.success():
+            print(f"获取失败: {resp.msg}")
+            return
+        spaces = resp.data.items or []
+        print(f"\n共 {len(spaces)} 个 Wiki 知识空间:")
+        for sp in spaces:
+            print(f"  space_id={sp.space_id}  名称={sp.name}")
+    except Exception as e:
+        print(f"❌ 列出知识空间失败: {e}")
+
+
+def cmd_daily_report(args):
+    """生成每日摘要报告"""
+    import sqlite3
+    from collections import Counter
+
+    report_lines = [f"📊 每日摘要报告\n"]
+
+    # Wiki 文档统计
+    db_path = "data/agent.db"
+    if os.path.exists(db_path):
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("SELECT category FROM wiki_docs").fetchall()
+        conn.close()
+        if rows:
+            cat_counts = Counter(r[0] or "未分类" for r in rows)
+            report_lines.append(f"📚 Wiki 文档总计: {len(rows)} 篇")
+            for cat, cnt in cat_counts.most_common(10):
+                report_lines.append(f"  · {cat}: {cnt} 篇")
+        else:
+            report_lines.append("📚 Wiki 索引暂无数据（请先运行 organize）")
+    else:
+        report_lines.append("📚 Wiki 索引不存在（请先运行 organize）")
+
+    # 近期日历事件
+    try:
+        creds = config_loader.load_credentials()
+        factory = FeishuClientFactory(creds["accounts"])
+        client = factory.get_client("personal")
+        from src.managers.calendar_manager import CalendarManager
+        events = CalendarManager(client).list_events(days_ahead=7)
+        report_lines.append(f"\n📅 未来 7 天日历事件: {len(events)} 个")
+        for e in events[:5]:
+            report_lines.append(f"  · [{e.get('start_time', '')}] {e.get('summary', '')}")
+    except Exception as e:
+        report_lines.append(f"\n📅 日历获取失败: {e}")
+
+    # 最新邮件
+    try:
+        from src.managers.email_manager import EmailManager
+        mails = EmailManager(client).list_mails(limit=5)
+        report_lines.append(f"\n📧 最新邮件: {len(mails)} 封")
+        for m in mails:
+            status = "" if m.get("is_read") else "【未读】"
+            report_lines.append(f"  · {status}{m.get('subject', '(无主题)')} — {m.get('from', '')}")
+    except Exception as e:
+        report_lines.append(f"\n📧 邮件获取失败: {e}")
+
+    print("\n".join(report_lines))
 
 
 def cmd_manage(args):
@@ -222,7 +417,27 @@ def main():
     p_organize.add_argument("--dry-run", action="store_true", help="仅预览，不实际移动文档")
 
     # import-github 子命令
-    subparsers.add_parser("import-github", help="将 GitHub 仓库导入飞书")
+    p_import = subparsers.add_parser("import-github", help="将 GitHub 仓库导入飞书")
+    p_import.add_argument("--repo", help="仓库名，格式 owner/repo")
+
+    # daily-reddit 子命令
+    p_reddit = subparsers.add_parser("daily-reddit", help="Reddit AI_Agents 日报写入飞书")
+    p_reddit.add_argument("--limit", type=int, default=20, help="每种排序各抓取多少篇")
+
+    # daily-github 子命令
+    p_github = subparsers.add_parser("daily-github", help="GitHub Trending 日报写入飞书")
+    p_github.add_argument("--since", default="daily", choices=["daily", "weekly", "monthly"])
+    p_github.add_argument("--top-n", type=int, default=15, dest="top_n")
+
+    # search 子命令
+    p_search = subparsers.add_parser("search", help="按关键词搜索 Wiki 文档")
+    p_search.add_argument("--keyword", required=True, help="搜索关键词")
+
+    # list-spaces 子命令
+    subparsers.add_parser("list-spaces", help="列出所有 Wiki 知识空间")
+
+    # daily-report 子命令
+    subparsers.add_parser("daily-report", help="生成每日摘要报告")
 
     # manage 子命令
     p_manage = subparsers.add_parser("manage", help="管理飞书资源")
@@ -236,6 +451,16 @@ def main():
         cmd_organize(args)
     elif args.command == "import-github":
         cmd_import_github(args)
+    elif args.command == "daily-reddit":
+        cmd_daily_reddit(args)
+    elif args.command == "daily-github":
+        cmd_daily_github(args)
+    elif args.command == "search":
+        cmd_search(args)
+    elif args.command == "list-spaces":
+        cmd_list_spaces(args)
+    elif args.command == "daily-report":
+        cmd_daily_report(args)
     elif args.command == "manage":
         cmd_manage(args)
     else:
