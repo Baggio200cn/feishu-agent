@@ -79,6 +79,13 @@ def cmd_organize(args):
     else:
         logger.info("企业账号未配置，跳过")
 
+    # 按 node_token 去重（防止两账号扫描同一空间重复计入）
+    before = len(all_docs)
+    seen: set = set()
+    all_docs = [d for d in all_docs if d.get("node_token") not in seen and not seen.add(d.get("node_token"))]
+    if len(all_docs) < before:
+        logger.info(f"去重后: {len(all_docs)} 篇（过滤 {before - len(all_docs)} 个重复节点）")
+
     if not all_docs:
         logger.info("未扫描到任何文档，退出")
         return
