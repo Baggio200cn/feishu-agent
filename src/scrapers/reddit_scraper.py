@@ -1,11 +1,12 @@
 """
 Reddit r/AI_Agents 爬虫
-抓取 new + hot 帖子，使用豆包 API 翻译成中文
+使用 RSS Feed 抓取帖子（无需 OAuth，支持代理），使用豆包 API 翻译成中文
 """
 import html
 import logging
 import re
 import time
+import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional
 
 import requests
@@ -13,29 +14,38 @@ import requests
 logger = logging.getLogger(__name__)
 
 SUBREDDIT = "AI_Agents"
-BASE_URL = f"https://www.reddit.com/r/{SUBREDDIT}"
+RSS_BASE = "https://www.reddit.com/r/{subreddit}/{sort}.rss"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; feishu-agent/1.0)",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (compatible; feishu-agent/1.0; RSS reader)",
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
 DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 
+# Atom/RSS namespace
+NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "media": "http://search.yahoo.com/mrss/",
+}
+
 
 class RedditScraper:
-    """抓取 r/AI_Agents 最新和热门帖子，可选豆包翻译"""
+    """通过 RSS Feed 抓取 r/AI_Agents 最新和热门帖子，可选豆包翻译"""
 
     def __init__(
         self,
         api_key: str = "",
         model: str = "doubao-seed-2-0-code-preview-260215",
         base_url: str = DOUBAO_BASE_URL,
+        proxy: str = "",
     ):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
 
     def fetch_posts(self, limit: int = 20) -> List[Dict]:
         """抓取 new + hot 帖子，按帖子 ID 去重后返回"""
@@ -57,73 +67,125 @@ class RedditScraper:
         return all_posts
 
     def _fetch_sort(self, sort: str, limit: int) -> List[Dict]:
-        url = f"{BASE_URL}/{sort}.json"
+        url = RSS_BASE.format(subreddit=SUBREDDIT, sort=sort)
         try:
-            resp = self.session.get(url, params={"limit": limit}, timeout=15)
+            resp = self.session.get(url, params={"limit": limit}, timeout=20)
             resp.raise_for_status()
-            data = resp.json()
-            posts = []
-            for child in data.get("data", {}).get("children", []):
-                d = child.get("data", {})
-                post = self._parse_post(d)
-                if post:
-                    posts.append(post)
-            return posts
+            return self._parse_rss(resp.text)
         except Exception as e:
-            logger.warning(f"抓取 r/{SUBREDDIT}/{sort} 失败: {e}")
+            logger.warning(f"抓取 r/{SUBREDDIT}/{sort} RSS 失败: {e}")
             return []
 
-    def _parse_post(self, d: Dict) -> Optional[Dict]:
-        title = d.get("title", "").strip()
-        if not title:
+    def _parse_rss(self, xml_text: str) -> List[Dict]:
+        """解析 Reddit RSS/Atom XML，返回帖子列表"""
+        posts: List[Dict] = []
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as e:
+            logger.warning(f"RSS XML 解析失败: {e}")
+            return posts
+
+        # Reddit returns Atom feed
+        entries = root.findall("atom:entry", NS)
+        if not entries:
+            # Fallback: try without namespace (RSS 2.0)
+            entries = root.findall(".//item")
+
+        for entry in entries:
+            post = self._parse_entry(entry)
+            if post:
+                posts.append(post)
+
+        return posts
+
+    def _parse_entry(self, entry) -> Optional[Dict]:
+        try:
+            # Atom format
+            title_el = entry.find("atom:title", NS) or entry.find("title")
+            title = html.unescape((title_el.text or "").strip()) if title_el is not None else ""
+            if not title:
+                return None
+
+            link_el = entry.find("atom:link", NS)
+            if link_el is not None:
+                url = link_el.get("href", "")
+            else:
+                link_el = entry.find("link")
+                url = (link_el.text or "") if link_el is not None else ""
+
+            # Extract post ID from URL or id element
+            id_el = entry.find("atom:id", NS) or entry.find("id")
+            raw_id = (id_el.text or "") if id_el is not None else url
+            # Reddit IDs look like t3_abc123
+            id_match = re.search(r"t3_([a-z0-9]+)", raw_id)
+            post_id = id_match.group(1) if id_match else re.sub(r"[^a-z0-9]", "", raw_id)[-8:]
+
+            # Body / selftext from content element
+            content_el = (
+                entry.find("atom:content", NS)
+                or entry.find("content")
+                or entry.find("atom:summary", NS)
+                or entry.find("description")
+            )
+            raw_content = (content_el.text or "") if content_el is not None else ""
+            selftext = self._strip_html(html.unescape(raw_content))
+
+            # Author
+            author_el = (
+                entry.find("atom:author/atom:name", NS)
+                or entry.find("author/name")
+            )
+            author = (author_el.text or "").strip() if author_el is not None else ""
+
+            # Published time → unix timestamp
+            updated_el = (
+                entry.find("atom:updated", NS)
+                or entry.find("atom:published", NS)
+                or entry.find("pubDate")
+            )
+            created_utc = 0
+            if updated_el is not None and updated_el.text:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    from datetime import timezone
+                    dt = parsedate_to_datetime(updated_el.text)
+                    created_utc = int(dt.timestamp())
+                except Exception:
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(updated_el.text.replace("Z", "+00:00"))
+                        created_utc = int(dt.timestamp())
+                    except Exception:
+                        pass
+
+            # permalink — use url if it's a reddit link, else construct
+            permalink = url if "reddit.com" in url else f"https://www.reddit.com/r/{SUBREDDIT}/comments/{post_id}/"
+
+            return {
+                "id": post_id,
+                "title": title,
+                "title_cn": "",
+                "selftext": selftext[:2000],
+                "selftext_cn": "",
+                "url": url,
+                "permalink": permalink,
+                "score": 0,       # RSS doesn't expose vote counts
+                "num_comments": 0,
+                "author": author,
+                "created_utc": created_utc,
+                "images": [],
+                "flair": "",
+            }
+        except Exception as e:
+            logger.warning(f"解析 RSS 条目失败: {e}")
             return None
 
-        selftext = d.get("selftext", "").strip()
-        if selftext in ("[removed]", "[deleted]"):
-            selftext = ""
-
-        return {
-            "id": d.get("id", ""),
-            "title": title,
-            "title_cn": "",
-            "selftext": selftext,
-            "selftext_cn": "",
-            "url": d.get("url", ""),
-            "permalink": "https://www.reddit.com" + d.get("permalink", ""),
-            "score": d.get("score", 0),
-            "num_comments": d.get("num_comments", 0),
-            "author": d.get("author", ""),
-            "created_utc": d.get("created_utc", 0),
-            "images": self._extract_images(d),
-            "flair": d.get("link_flair_text", ""),
-        }
-
-    def _extract_images(self, d: Dict) -> List[str]:
-        images: List[str] = []
-
-        for img in d.get("preview", {}).get("images", []):
-            url = img.get("source", {}).get("url", "")
-            if url:
-                images.append(html.unescape(url))
-
-        post_url = d.get("url", "")
-        if d.get("post_hint") == "image" or any(
-            post_url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp")
-        ):
-            if post_url not in images:
-                images.append(post_url)
-
-        if d.get("is_gallery") and d.get("gallery_data"):
-            media_meta = d.get("media_metadata", {})
-            for item in d["gallery_data"].get("items", []):
-                mid = item.get("media_id", "")
-                meta = media_meta.get(mid, {})
-                if meta.get("e") == "Image":
-                    src = meta.get("s", {}).get("u", "")
-                    if src:
-                        images.append(html.unescape(src))
-
-        return images[:3]
+    @staticmethod
+    def _strip_html(text: str) -> str:
+        """简单去除 HTML 标签"""
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s{2,}", " ", text)
+        return text.strip()
 
     # ── 翻译 ──────────────────────────────────────────────────────────────────
 
