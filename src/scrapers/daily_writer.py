@@ -173,7 +173,10 @@ class DailyWriter:
         ]
 
         for i, repo in enumerate(repos, 1):
-            lines.append(f"## {i}. [{repo['full_name']}]({repo.get('url', '')})")
+            url = repo.get("url", f"https://github.com/{repo['full_name']}")
+            lines.append(f"## {i}. [{repo['full_name']}]({url})")
+            lines.append("")
+            lines.append(f"🔗 **仓库链接**: {url}")
             lines.append("")
 
             info = [f"⭐ 今日 +{repo.get('stars_today', 0)} stars"]
