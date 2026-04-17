@@ -1,19 +1,22 @@
 """
-每日内容写入器 — 生成 Markdown 文件并通过飞书 import_tasks 导入到 Wiki 专区
+每日内容写入器 — 在飞书 Wiki 中创建 docx 节点并写入内容块
 """
-import io
 import logging
 import os
-import requests
 import sqlite3
-import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 DB_PATH = "data/agent.db"
-FEISHU_BASE = "https://open.feishu.cn/open-apis"
+
+BLOCK_TEXT    = 2
+BLOCK_H1      = 3
+BLOCK_H2      = 4
+BLOCK_H3      = 5
+BLOCK_BULLET  = 13
+BLOCK_DIVIDER = 22
 
 
 def _get_db():
@@ -31,7 +34,7 @@ def _get_db():
 
 
 class DailyWriter:
-    """将 Reddit / GitHub Trending 内容以 .md 文件导入飞书 Wiki 专区"""
+    """将 Reddit / GitHub Trending 内容写入飞书 Wiki 专区"""
 
     REDDIT_FOLDER = "🤖 agent专区"
     GITHUB_FOLDER = "📈 github专区"
@@ -46,48 +49,13 @@ class DailyWriter:
                 "SELECT node_token, folder_name FROM organizer_folders"
             ).fetchall()
         }
-        self._token: str = ""
-        self._token_expire: float = 0
-
-    # ── Token 管理 ────────────────────────────────────────────────────────────
-
-    def _get_token(self) -> str:
-        """获取飞书 tenant_access_token（带缓存，自动续期）"""
-        if self._token and time.time() < self._token_expire:
-            return self._token
-
-        # 从 lark_oapi 客户端配置中取 app_id / app_secret
-        cfg = self._client._config
-        resp = requests.post(
-            f"{FEISHU_BASE}/auth/v3/tenant_access_token/internal",
-            json={"app_id": cfg.app_id, "app_secret": cfg.app_secret},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        self._token = data.get("tenant_access_token", "")
-        self._token_expire = time.time() + data.get("expire", 7200) - 60
-        return self._token
-
-    def _headers(self) -> Dict:
-        return {"Authorization": f"Bearer {self._get_token()}"}
-
-    def _get_root_folder_token(self) -> str:
-        """获取我的空间根目录 token"""
-        resp = requests.get(
-            f"{FEISHU_BASE}/drive/explorer/v2/root_folder/meta",
-            headers=self._headers(),
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return resp.json()["data"]["token"]
 
     # ── 公开接口 ──────────────────────────────────────────────────────────────
 
     def write_reddit_posts(
         self, posts: List[Dict], folder_name: str = REDDIT_FOLDER
     ) -> Dict:
-        """将 Reddit 帖子逐篇以 .md 导入 Wiki"""
+        """将 Reddit 帖子逐篇写入 Wiki 专区文件夹"""
         folder_token = self._ensure_folder(folder_name)
         today = datetime.now().strftime("%Y-%m-%d")
         report = {"written": 0, "failed": 0, "folder": folder_name, "date": today}
@@ -96,11 +64,11 @@ class DailyWriter:
             try:
                 title_cn = post.get("title_cn") or post.get("title", "无标题")
                 wiki_title = f"[Reddit·AI_Agents] {title_cn[:60]} ({today})"
-                md = self._build_reddit_md(post)
-                node_token = self._import_md_to_wiki(wiki_title, md, folder_token)
+                blocks = self._build_reddit_blocks(post)
+                node_token = self._create_wiki_page(wiki_title, blocks, folder_token)
                 if node_token:
                     report["written"] += 1
-                    logger.info(f"已导入: {wiki_title[:50]}")
+                    logger.info(f"已写入: {wiki_title[:50]}")
                 else:
                     report["failed"] += 1
             except Exception as e:
@@ -112,102 +80,92 @@ class DailyWriter:
     def write_github_trending(
         self, repos: List[Dict], folder_name: str = GITHUB_FOLDER
     ) -> Dict:
-        """将 GitHub Trending 日报（汇总为一篇）以 .md 导入 Wiki"""
+        """将 GitHub Trending 日报（汇总为一篇）写入 Wiki"""
         folder_token = self._ensure_folder(folder_name)
         today = datetime.now().strftime("%Y-%m-%d")
         wiki_title = f"GitHub Trending 日报 {today}"
-        md = self._build_github_trending_md(repos, today)
-        node_token = self._import_md_to_wiki(wiki_title, md, folder_token)
+        blocks = self._build_github_trending_blocks(repos, today)
+        node_token = self._create_wiki_page(wiki_title, blocks, folder_token)
 
         if node_token:
-            logger.info(f"GitHub Trending 日报已导入: {wiki_title}")
+            logger.info(f"GitHub Trending 日报已写入: {wiki_title}")
             return {"written": len(repos), "failed": 0, "folder": folder_name, "date": today}
         return {"written": 0, "failed": len(repos), "folder": folder_name, "date": today}
 
-    # ── Markdown 内容构建 ─────────────────────────────────────────────────────
+    # ── Block 构建 ────────────────────────────────────────────────────────────
 
-    def _build_reddit_md(self, post: Dict) -> str:
-        lines = []
+    def _build_reddit_blocks(self, post: Dict) -> List[Dict]:
+        blocks: List[Dict] = []
 
+        parts = []
         created = post.get("created_utc", 0)
         if created:
             dt = datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            lines.append(f"**时间**: {dt}")
+            parts.append(f"时间: {dt}")
         if post.get("author"):
-            lines.append(f"**作者**: u/{post['author']}")
-        lines.append(f"**热度**: 👍 {post.get('score', 0)} | 💬 {post.get('num_comments', 0)} 评论")
-        lines.append(f"**原帖**: {post.get('permalink', '')}")
+            parts.append(f"作者: u/{post['author']}")
+        parts.append(f"👍 {post.get('score', 0)}  💬 {post.get('num_comments', 0)} 评论")
+        blocks.append(_text(", ".join(parts)))
+        blocks.append(_text(f"原帖链接: {post.get('permalink', '')}"))
         if post.get("flair"):
-            lines.append(f"**标签**: {post['flair']}")
-        lines.append("")
-        lines.append("---")
-        lines.append("")
+            blocks.append(_text(f"分类标签: {post['flair']}"))
+        blocks.append(_divider())
 
         images = post.get("images", [])
         if images:
-            lines.append("## 图片")
-            for img_url in images:
-                lines.append(f"![]({img_url})")
-            lines.append("")
+            blocks.append(_h2("图片"))
+            for i, img_url in enumerate(images, 1):
+                blocks.append(_text(f"图片 {i}: {img_url}"))
+            blocks.append(_divider())
 
         title_cn = post.get("title_cn") or post.get("title", "")
         selftext_cn = post.get("selftext_cn") or post.get("selftext", "")
 
-        lines.append("## 中文标题")
-        lines.append(title_cn)
-        lines.append("")
+        blocks.append(_h2("中文标题"))
+        blocks.append(_text(title_cn))
 
         if selftext_cn:
-            lines.append("## 中文正文")
-            lines.append(selftext_cn)
-            lines.append("")
+            blocks.append(_h2("中文正文"))
+            for para in selftext_cn.split("\n\n")[:20]:
+                para = para.strip()
+                if para:
+                    blocks.append(_text(para))
 
-        lines.append("---")
-        lines.append("")
-        lines.append("## 原文 (English)")
-        lines.append(f"### {post.get('title', '')}")
+        blocks.append(_divider())
+        blocks.append(_h2("原文 (English)"))
+        blocks.append(_text(post.get("title", "")))
         if post.get("selftext"):
-            lines.append("")
-            lines.append(post["selftext"][:2000])
+            blocks.append(_text(post["selftext"][:2000]))
 
-        return "\n".join(lines)
+        return blocks
 
-    def _build_github_trending_md(self, repos: List[Dict], date: str) -> str:
-        lines = [
-            f"# GitHub Trending 日报 {date}",
-            "",
-            f"> 共 {len(repos)} 个热门仓库 | 生成时间: {date}",
-            "",
-            "---",
-            "",
-        ]
+    def _build_github_trending_blocks(self, repos: List[Dict], date: str) -> List[Dict]:
+        blocks: List[Dict] = []
+        blocks.append(_text(f"生成时间: {date}  |  共 {len(repos)} 个热门仓库"))
+        blocks.append(_divider())
 
         for i, repo in enumerate(repos, 1):
-            url = repo.get("url", f"https://github.com/{repo['full_name']}")
-            lines.append(f"## {i}. [{repo['full_name']}]({url})")
-            lines.append("")
-            lines.append(f"🔗 **仓库链接**: {url}")
-            lines.append("")
+            blocks.append(_h2(f"{i}. {repo['full_name']}"))
 
-            info = [f"⭐ 今日 +{repo.get('stars_today', 0)} stars"]
+            url = repo.get("url", f"https://github.com/{repo['full_name']}")
+            blocks.append(_text(f"🔗 仓库链接: {url}"))
+
+            info_parts = [f"⭐ 今日 +{repo.get('stars_today', 0)} stars"]
             if repo.get("total_stars"):
-                info.append(f"共 {repo['total_stars']:,} stars")
+                info_parts.append(f"共 {repo['total_stars']:,} stars")
             if repo.get("language"):
-                info.append(f"语言: `{repo['language']}`")
-            lines.append(" | ".join(info))
-            lines.append("")
+                info_parts.append(f"语言: {repo['language']}")
+            blocks.append(_text("  ".join(info_parts)))
 
             summary = repo.get("summary_cn") or repo.get("description_cn") or repo.get("description", "")
             if summary:
-                lines.append(f"> {summary}")
-                lines.append("")
+                blocks.append(_text(f"简介: {summary}"))
 
-            lines.append("---")
-            lines.append("")
+            blocks.append(_divider())
 
-        return "\n".join(lines)
+        return blocks
 
-    # ── Feishu API 操作 ───────────────────────────────────────────────────────
+    # ── Wiki 操作 ─────────────────────────────────────────────────────────────
 
     def _ensure_folder(self, folder_name: str) -> str:
         """确保 Wiki 文件夹节点存在，返回 node_token"""
@@ -247,91 +205,88 @@ class DailyWriter:
         logger.info(f"创建文件夹节点: {folder_name} (token={token})")
         return token
 
-    def _import_md_to_wiki(
-        self, title: str, md_content: str, parent_token: str = ""
+    def _create_wiki_page(
+        self, title: str, blocks: List[Dict], parent_token: str = ""
     ) -> Optional[str]:
-        """
-        将 Markdown 内容作为 .md 文件导入到飞书 Wiki：
-        1. 上传 .md 文件到云空间
-        2. 创建 import_task（mount_type=4 挂载到 Wiki 节点）
-        3. 轮询等待导入完成，返回 node_token
-        """
+        """创建 Wiki 页面节点并写入内容块，返回 node_token"""
         try:
-            md_bytes = md_content.encode("utf-8")
-            file_name = f"{title}.md"
+            from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, Node
 
-            # Step 1: 上传 .md 文件到我的空间根目录
-            root_token = self._get_root_folder_token()
-            upload_resp = requests.post(
-                f"{FEISHU_BASE}/drive/v1/files/upload_all",
-                headers=self._headers(),
-                files={"file": (file_name, io.BytesIO(md_bytes), "text/markdown")},
-                data={
-                    "file_name": file_name,
-                    "parent_type": "explorer",
-                    "parent_node": root_token,
-                    "size": str(len(md_bytes)),
-                },
-                timeout=30,
+            node_builder = (
+                Node.builder()
+                .obj_type("docx")
+                .node_type("origin")
+                .title(title)
             )
-            upload_resp.raise_for_status()
-            upload_data = upload_resp.json()
-            if upload_data.get("code") != 0:
-                logger.warning(f"上传文件失败: {upload_data.get('msg')}")
-                return None
-            file_token = upload_data["data"]["file_token"]
+            if parent_token:
+                node_builder.parent_node_token(parent_token)
 
-            # Step 2: 创建导入任务，挂载到 Wiki 节点
-            mount_key = parent_token if parent_token else self.space_id
-            imp_resp = requests.post(
-                f"{FEISHU_BASE}/drive/v1/import_tasks",
-                headers={**self._headers(), "Content-Type": "application/json"},
-                json={
-                    "file_extension": "md",
-                    "file_token": file_token,
-                    "type": "docx",
-                    "file_name": title,
-                    "point": {
-                        "mount_type": 4,      # 4 = Wiki 节点
-                        "mount_key": mount_key,
-                    },
-                },
-                timeout=30,
+            req = (
+                CreateSpaceNodeRequest.builder()
+                .space_id(self.space_id)
+                .request_body(node_builder.build())
+                .build()
             )
-            imp_resp.raise_for_status()
-            imp_data = imp_resp.json()
-            if imp_data.get("code") != 0:
-                logger.warning(f"创建导入任务失败: {imp_data.get('msg')}")
+            resp = self._client.wiki.v2.space_node.create(req)
+            if not resp.success():
+                logger.warning(f"创建页面失败: {resp.msg}")
                 return None
-            ticket = imp_data["data"]["ticket"]
 
-            # Step 3: 轮询等待完成（最多等 60s）
-            for _ in range(30):
-                time.sleep(2)
-                poll = requests.get(
-                    f"{FEISHU_BASE}/drive/v1/import_tasks/{ticket}",
-                    headers=self._headers(),
-                    timeout=10,
-                )
-                poll_data = poll.json()
-                if poll_data.get("code") != 0:
-                    continue
-                job = poll_data["data"]["result"]
-                status = job.get("job_status")
-                if status == 0:
-                    node_token = job.get("token", "")
-                    logger.info(f"导入成功: {title} (token={node_token})")
-                    return node_token
-                elif status in (2, 3):
-                    logger.warning(
-                        f"导入失败: status={status}, "
-                        f"error={job.get('job_error_msg', '')}"
-                    )
-                    return None
+            node_token = resp.data.node.node_token
+            obj_token = resp.data.node.obj_token
 
-            logger.warning(f"导入任务超时: {title}")
-            return None
+            if blocks:
+                self._populate_blocks(obj_token, blocks)
+
+            return node_token
 
         except Exception as e:
-            logger.warning(f"Markdown 导入异常: {e}")
+            logger.warning(f"创建页面异常: {e}")
             return None
+
+    def _populate_blocks(self, document_id: str, blocks: List[Dict]) -> None:
+        try:
+            from lark_oapi.api.docx.v1 import (
+                BatchCreateDocumentBlockChildrenRequest,
+                BatchCreateDocumentBlockChildrenRequestBody,
+            )
+            for i in range(0, len(blocks), 50):
+                batch = blocks[i:i + 50]
+                body = (
+                    BatchCreateDocumentBlockChildrenRequestBody.builder()
+                    .children(batch)
+                    .build()
+                )
+                req = (
+                    BatchCreateDocumentBlockChildrenRequest.builder()
+                    .document_id(document_id)
+                    .block_id(document_id)
+                    .request_body(body)
+                    .build()
+                )
+                resp = self._client.docx.v1.document_block_children.batch_create(req)
+                if not resp.success():
+                    logger.warning(f"写入内容块失败 (batch {i // 50}): {resp.msg}")
+        except Exception as e:
+            logger.warning(f"写入文档内容异常: {e}")
+
+
+# ── Block 工厂函数 ─────────────────────────────────────────────────────────────
+
+def _text(content: str) -> Dict:
+    return {"block_type": BLOCK_TEXT, "text": {"elements": [{"text_run": {"content": content}}]}}
+
+def _h1(content: str) -> Dict:
+    return {"block_type": BLOCK_H1, "heading1": {"elements": [{"text_run": {"content": content}}]}}
+
+def _h2(content: str) -> Dict:
+    return {"block_type": BLOCK_H2, "heading2": {"elements": [{"text_run": {"content": content}}]}}
+
+def _h3(content: str) -> Dict:
+    return {"block_type": BLOCK_H3, "heading3": {"elements": [{"text_run": {"content": content}}]}}
+
+def _bullet(content: str) -> Dict:
+    return {"block_type": BLOCK_BULLET, "bullet": {"elements": [{"text_run": {"content": content}}]}}
+
+def _divider() -> Dict:
+    return {"block_type": BLOCK_DIVIDER}

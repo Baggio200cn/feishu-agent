@@ -193,12 +193,12 @@ class GitHubTrendingScraper:
             '[{"index": 1, "description_cn": "...", "summary_cn": "..."}, ...]'
         )
 
+        resp = client.chat.completions.create(
+            model=self.model,
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}],
+        )
         try:
-            resp = client.chat.completions.create(
-                model=self.model,
-                max_tokens=1500,
-                messages=[{"role": "user", "content": prompt}],
-            )
             text = resp.choices[0].message.content.strip()
             text = re.sub(r"^```(?:json)?\s*", "", text)
             text = re.sub(r"\s*```$", "", text)
@@ -213,9 +213,8 @@ class GitHubTrendingScraper:
                     repos[idx]["summary_cn"] = item.get(
                         "summary_cn", repos[idx].get("description", "")
                     )
-
         except Exception as e:
-            logger.warning(f"批量摘要生成失败: {e}")
+            logger.warning(f"解析摘要响应失败: {e}")
             for r in repos:
                 if not r.get("description_cn"):
                     r["description_cn"] = r.get("description", "")
