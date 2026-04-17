@@ -72,6 +72,16 @@ class DailyWriter:
     def _headers(self) -> Dict:
         return {"Authorization": f"Bearer {self._get_token()}"}
 
+    def _get_root_folder_token(self) -> str:
+        """获取我的空间根目录 token"""
+        resp = requests.get(
+            f"{FEISHU_BASE}/drive/explorer/v2/root_folder/meta",
+            headers=self._headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()["data"]["token"]
+
     # ── 公开接口 ──────────────────────────────────────────────────────────────
 
     def write_reddit_posts(
@@ -250,7 +260,8 @@ class DailyWriter:
             md_bytes = md_content.encode("utf-8")
             file_name = f"{title}.md"
 
-            # Step 1: 上传 .md 文件
+            # Step 1: 上传 .md 文件到我的空间根目录
+            root_token = self._get_root_folder_token()
             upload_resp = requests.post(
                 f"{FEISHU_BASE}/drive/v1/files/upload_all",
                 headers=self._headers(),
@@ -258,7 +269,7 @@ class DailyWriter:
                 data={
                     "file_name": file_name,
                     "parent_type": "explorer",
-                    "parent_node": "root",
+                    "parent_node": root_token,
                     "size": str(len(md_bytes)),
                 },
                 timeout=30,

@@ -158,11 +158,22 @@ class GitHubTrendingScraper:
             return repos
 
         for i in range(0, len(repos), 5):
-            if i == 0:
-                time.sleep(1)  # 避免首次请求触发 burst 限速
-            self._summarize_batch(client, repos[i:i + 5])
+            for attempt in range(5):
+                try:
+                    if attempt == 0 and i == 0:
+                        time.sleep(2)
+                    self._summarize_batch(client, repos[i:i + 5])
+                    break
+                except Exception as e:
+                    if "429" in str(e) and attempt < 4:
+                        wait = 15 * (attempt + 1)
+                        logger.info(f"触发限速，等待 {wait}s 后重试...")
+                        time.sleep(wait)
+                    else:
+                        logger.warning(f"摘要生成失败（已重试{attempt+1}次）: {e}")
+                        break
             if i + 5 < len(repos):
-                time.sleep(1)
+                time.sleep(3)
 
         return repos
 
