@@ -54,11 +54,16 @@ class CalendarManager:
                 .calendar_id(calendar_id)
                 .start_time(start)
                 .end_time(end)
+                .page_size(50)
                 .build()
             )
+            logger.info(f"[calendar.list] calendar_id={calendar_id} start={start} end={end}")
             resp = self._client.calendar.v4.calendar_event.list(req)
             if not resp.success():
-                logger.warning(f"获取日历事件失败: {resp.msg}")
+                logger.warning(
+                    f"获取日历事件失败: code={resp.code} msg={resp.msg} "
+                    f"raw={getattr(resp, 'raw', None) and resp.raw.content}"
+                )
                 return []
 
             results = []
