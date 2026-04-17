@@ -3,9 +3,13 @@
 """
 import logging
 import os
+import requests
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+
+FEISHU_BASE = "https://open.feishu.cn/open-apis"
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +53,22 @@ class DailyWriter:
                 "SELECT node_token, folder_name FROM organizer_folders"
             ).fetchall()
         }
+        self._token: str = ""
+        self._token_expire: float = 0
+
+    def _get_token(self) -> str:
+        if self._token and time.time() < self._token_expire:
+            return self._token
+        cfg = self._client._config
+        resp = requests.post(
+            f"{FEISHU_BASE}/auth/v3/tenant_access_token/internal",
+            json={"app_id": cfg.app_id, "app_secret": cfg.app_secret},
+            timeout=10,
+        )
+        data = resp.json()
+        self._token = data.get("tenant_access_token", "")
+        self._token_expire = time.time() + data.get("expire", 7200) - 60
+        return self._token
 
     # ── 公开接口 ──────────────────────────────────────────────────────────────
 
@@ -245,30 +265,25 @@ class DailyWriter:
             return None
 
     def _populate_blocks(self, document_id: str, blocks: List[Dict]) -> None:
-        try:
-            from lark_oapi.api.docx.v1 import (
-                CreateDocumentBlockChildrenRequest,
-                CreateDocumentBlockChildrenRequestBody,
+        """直接调用 REST API 写入内容块，避免 SDK 版本兼容问题"""
+        url = (
+            f"{FEISHU_BASE}/docx/v1/documents/{document_id}"
+            f"/blocks/{document_id}/children"
+        )
+        headers = {
+            "Authorization": f"Bearer {self._get_token()}",
+            "Content-Type": "application/json",
+        }
+        for i in range(0, len(blocks), 50):
+            batch = blocks[i:i + 50]
+            resp = requests.post(
+                url, headers=headers,
+                json={"children": batch, "index": 0},
+                timeout=30,
             )
-            for i in range(0, len(blocks), 50):
-                batch = blocks[i:i + 50]
-                body = (
-                    CreateDocumentBlockChildrenRequestBody.builder()
-                    .children(batch)
-                    .build()
-                )
-                req = (
-                    CreateDocumentBlockChildrenRequest.builder()
-                    .document_id(document_id)
-                    .block_id(document_id)
-                    .request_body(body)
-                    .build()
-                )
-                resp = self._client.docx.v1.document_block_children.create(req)
-                if not resp.success():
-                    logger.warning(f"写入内容块失败 (batch {i // 50}): {resp.msg}")
-        except Exception as e:
-            logger.warning(f"写入文档内容异常: {e}")
+            data = resp.json()
+            if data.get("code") != 0:
+                logger.warning(f"写入内容块失败 (batch {i // 50}): {data.get('msg')}")
 
 
 # ── Block 工厂函数 ─────────────────────────────────────────────────────────────
