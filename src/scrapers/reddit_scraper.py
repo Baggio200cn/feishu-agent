@@ -1,4 +1,4 @@
-"""
+﻿"""
 Reddit r/AI_Agents 爬虫
 抓取 new + hot 帖子，使用 Claude API 翻译成中文
 """
@@ -159,7 +159,7 @@ class RedditScraper:
         prompt = (
             f"请将以下 {len(posts)} 篇 Reddit 帖子翻译成中文。"
             "保留 AI、LLM、API 等专业缩写。\n"
-            "格式：\n---帖子1---\n标题：<中文标题>\n正文：<中文正文，无正文写"（无正文）">\n"
+            "格式：\n---帖子1---\n标题：<中文标题>\n正文：<中文正文，无正文写\"(无正文)\">\n"
             "---帖子2---\n...\n\n原文：\n" + "\n".join(items_text)
         )
 
