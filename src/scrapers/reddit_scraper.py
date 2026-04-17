@@ -100,43 +100,46 @@ class RedditScraper:
         return posts
 
     def _parse_entry(self, entry) -> Optional[Dict]:
+        def _find(tag_atom: str, tag_plain: str = "") -> Optional[ET.Element]:
+            """安全查找元素，避免 ElementTree bool 陷阱（无子元素时 bool(el)=False）"""
+            el = entry.find(_atag(tag_atom))
+            if el is not None:
+                return el
+            if tag_plain:
+                return entry.find(tag_plain)
+            return None
+
         try:
-            title_el = entry.find(_atag("title")) or entry.find("title")
+            title_el = _find("title")
             title = html.unescape((title_el.text or "").strip()) if title_el is not None else ""
             if not title:
                 return None
 
             # 链接：Atom 用 <link href="...">
-            link_el = entry.find(_atag("link"))
-            if link_el is not None:
-                url = link_el.get("href", "")
-            else:
-                link_el = entry.find("link")
-                url = (link_el.text or "") if link_el is not None else ""
+            link_el = _find("link")
+            url = link_el.get("href", "") if link_el is not None else ""
 
             # ID → Reddit post ID (t3_xxxxx)
-            id_el = entry.find(_atag("id")) or entry.find("id")
+            id_el = _find("id")
             raw_id = (id_el.text or "") if id_el is not None else url
             id_match = re.search(r"t3_([a-z0-9]+)", raw_id)
             post_id = id_match.group(1) if id_match else re.sub(r"[^a-z0-9]", "", raw_id)[-8:]
 
             # 正文：Atom 用 <content type="html">
-            content_el = (
-                entry.find(_atag("content"))
-                or entry.find(_atag("summary"))
-                or entry.find("description")
-            )
+            content_el = _find("content")
+            if content_el is None:
+                content_el = _find("summary")
             raw_content = (content_el.text or "") if content_el is not None else ""
             selftext = self._strip_html(html.unescape(raw_content))
 
             # 作者
             author_el = entry.find(f"{_atag('author')}/{_atag('name')}")
-            if author_el is None:
-                author_el = entry.find("author/name")
             author = (author_el.text or "").strip() if author_el is not None else ""
 
             # 发布时间
-            updated_el = entry.find(_atag("updated")) or entry.find(_atag("published")) or entry.find("pubDate")
+            updated_el = _find("updated")
+            if updated_el is None:
+                updated_el = _find("published")
             created_utc = 0
             if updated_el is not None and updated_el.text:
                 try:
