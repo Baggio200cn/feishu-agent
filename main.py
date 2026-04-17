@@ -140,52 +140,6 @@ def cmd_import_github(args):
         print(f"  {url}")
 
 
-def cmd_daily_report(args):
-    """汇总今日日历事件 + 未读邮件，输出日报"""
-    creds = config_loader.load_credentials()
-    factory = FeishuClientFactory(creds["accounts"])
-    client = factory.get_client("personal")
-
-    print("\n========== 今日日报 ==========\n")
-
-    # 日历事件
-    print("【日历】今日及明日事件")
-    print("-" * 30)
-    try:
-        from src.managers.calendar_manager import CalendarManager
-        mgr = CalendarManager(client)
-        events = mgr.list_events(days_ahead=2)
-        if not events:
-            print("  （无事件，或缺少 calendar:calendar:readonly 权限）")
-        else:
-            for e in events:
-                print(f"  {e.get('start_time', '')}  {e.get('summary', '')}  @ {e.get('location', '')}")
-    except Exception as exc:
-        logger.warning(f"日历获取失败: {exc}")
-        print(f"  获取失败: {exc}")
-
-    print()
-
-    # 邮件
-    print("【邮件】最近未读邮件")
-    print("-" * 30)
-    try:
-        from src.managers.email_manager import EmailManager
-        mgr = EmailManager(client)
-        mails = mgr.list_mails(limit=10)
-        unread = [m for m in mails if not m.get("is_read")]
-        if not unread:
-            print("  （无未读邮件，或缺少 mail:user_mailbox.message:readonly 权限）")
-        else:
-            for m in unread:
-                print(f"  [{m.get('date', '')}] {m.get('subject', '(无主题)')}  — {m.get('from', '')}")
-    except Exception as exc:
-        logger.warning(f"邮件获取失败: {exc}")
-        print(f"  获取失败: {exc}")
-
-    print("\n==============================\n")
-
-
 def cmd_manage(args):
     """管理飞书各类功能（邮件/消息/日历/联系人）"""
     creds = config_loader.load_credentials()
@@ -270,9 +224,6 @@ def main():
     # import-github 子命令
     subparsers.add_parser("import-github", help="将 GitHub 仓库导入飞书")
 
-    # daily-report 子命令
-    subparsers.add_parser("daily-report", help="输出今日日历事件 + 未读邮件日报")
-
     # manage 子命令
     p_manage = subparsers.add_parser("manage", help="管理飞书资源")
     p_manage.add_argument("resource", choices=["email", "messages", "calendar", "contacts"])
@@ -285,8 +236,6 @@ def main():
         cmd_organize(args)
     elif args.command == "import-github":
         cmd_import_github(args)
-    elif args.command == "daily-report":
-        cmd_daily_report(args)
     elif args.command == "manage":
         cmd_manage(args)
     else:
