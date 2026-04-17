@@ -247,24 +247,24 @@ class DailyWriter:
     def _populate_blocks(self, document_id: str, blocks: List[Dict]) -> None:
         try:
             from lark_oapi.api.docx.v1 import (
-                BatchCreateDocumentBlockChildrenRequest,
-                BatchCreateDocumentBlockChildrenRequestBody,
+                CreateDocumentBlockChildrenRequest,
+                CreateDocumentBlockChildrenRequestBody,
             )
             for i in range(0, len(blocks), 50):
                 batch = blocks[i:i + 50]
                 body = (
-                    BatchCreateDocumentBlockChildrenRequestBody.builder()
+                    CreateDocumentBlockChildrenRequestBody.builder()
                     .children(batch)
                     .build()
                 )
                 req = (
-                    BatchCreateDocumentBlockChildrenRequest.builder()
+                    CreateDocumentBlockChildrenRequest.builder()
                     .document_id(document_id)
                     .block_id(document_id)
                     .request_body(body)
                     .build()
                 )
-                resp = self._client.docx.v1.document_block_children.batch_create(req)
+                resp = self._client.docx.v1.document_block_children.create(req)
                 if not resp.success():
                     logger.warning(f"写入内容块失败 (batch {i // 50}): {resp.msg}")
         except Exception as e:
