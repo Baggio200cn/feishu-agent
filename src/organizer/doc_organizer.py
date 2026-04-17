@@ -149,10 +149,10 @@ class DocOrganizer:
         if folder_name in self._category_nodes:
             return self._category_nodes[folder_name], False
 
-        from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, CreateSpaceNodeRequestBody
+        from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, Node
 
         body = (
-            CreateSpaceNodeRequestBody.builder()
+            Node.builder()
             .obj_type("doc")
             .node_type("origin")
             .title(folder_name)
@@ -248,11 +248,11 @@ class DocOrganizer:
 
     def _create_reference_note(self, doc: Dict, parent_node_token: str) -> None:
         """为跨账号文档创建引用说明页"""
-        from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, CreateSpaceNodeRequestBody
+        from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, Node
 
         title = f"[引用] {doc.get('title', '未知文档')}"
         body = (
-            CreateSpaceNodeRequestBody.builder()
+            Node.builder()
             .obj_type("doc")
             .node_type("origin")
             .title(title)
