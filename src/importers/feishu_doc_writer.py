@@ -184,26 +184,26 @@ class FeishuDocWriter:
     def _create_wiki_page(self, title: str, blocks: List[Dict]) -> Optional[str]:
         """创建 Wiki 页面节点并写入内容，返回 node_token"""
         try:
-            from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, CreateSpaceNodeRequestBody
+            from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, Node
 
-            body_builder = (
-                CreateSpaceNodeRequestBody.builder()
-                .obj_type("doc")
+            node_builder = (
+                Node.builder()
+                .obj_type("docx")
                 .node_type("origin")
                 .title(title)
             )
             if self.target_folder_token:
-                body_builder.parent_node_token(self.target_folder_token)
+                node_builder.parent_node_token(self.target_folder_token)
 
             req = (
                 CreateSpaceNodeRequest.builder()
                 .space_id(self.space_id)
-                .request_body(body_builder.build())
+                .request_body(node_builder.build())
                 .build()
             )
             resp = self._client.wiki.v2.space_node.create(req)
             if not resp.success():
-                logger.warning(f"创建 Wiki 页面失败: {resp.msg}")
+                logger.warning(f"创建 Wiki 页面失败: {resp.code} {resp.msg}")
                 return None
 
             node_token = resp.data.node.node_token
@@ -223,26 +223,27 @@ class FeishuDocWriter:
         """批量写入文档内容块（分批，每批最多 50 个）"""
         try:
             from lark_oapi.api.docx.v1 import (
-                BatchCreateDocumentBlockChildrenRequest,
-                BatchCreateDocumentBlockChildrenRequestBody,
+                CreateDocumentBlockChildrenRequest,
+                CreateDocumentBlockChildrenRequestBody,
             )
             batch_size = 50
             for i in range(0, len(blocks), batch_size):
                 batch = blocks[i:i + batch_size]
                 body = (
-                    BatchCreateDocumentBlockChildrenRequestBody.builder()
+                    CreateDocumentBlockChildrenRequestBody.builder()
                     .children(batch)
+                    .index(-1)
                     .build()
                 )
                 req = (
-                    BatchCreateDocumentBlockChildrenRequest.builder()
+                    CreateDocumentBlockChildrenRequest.builder()
                     .document_id(document_id)
                     .block_id(document_id)
                     .request_body(body)
                     .build()
                 )
-                resp = self._client.docx.v1.document_block_children.batch_create(req)
+                resp = self._client.docx.v1.document_block_children.create(req)
                 if not resp.success():
-                    logger.warning(f"写入内容块失败 (batch {i//batch_size}): {resp.msg}")
+                    logger.warning(f"写入内容块失败 (batch {i//batch_size}): {resp.code} {resp.msg}")
         except Exception as e:
             logger.warning(f"写入文档内容异常: {e}")

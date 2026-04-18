@@ -70,12 +70,12 @@ class DocOrganizer:
             self._category_nodes[folder_name] = fake_token
             return fake_token
 
-        from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, CreateSpaceNodeRequestBody
+        from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, Node
 
         body = (
-            CreateSpaceNodeRequestBody.builder()
-            .obj_type("wiki")
-            .node_type("section")
+            Node.builder()
+            .obj_type("docx")
+            .node_type("origin")
             .title(folder_name)
             .build()
         )
@@ -88,7 +88,7 @@ class DocOrganizer:
         resp = self._client.wiki.v2.space_node.create(req)
 
         if not resp.success():
-            raise RuntimeError(f"创建目录节点失败: {resp.msg}")
+            raise RuntimeError(f"创建目录节点失败: {resp.code} {resp.msg}")
 
         token = resp.data.node.node_token
         self._category_nodes[folder_name] = token
@@ -128,12 +128,12 @@ class DocOrganizer:
 
     def _create_reference_note(self, doc: Dict, parent_node_token: str) -> None:
         """为跨账号文档创建引用说明页"""
-        from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, CreateSpaceNodeRequestBody
+        from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, Node
 
         title = f"[引用] {doc.get('title', '未知文档')}"
         body = (
-            CreateSpaceNodeRequestBody.builder()
-            .obj_type("doc")
+            Node.builder()
+            .obj_type("docx")
             .node_type("origin")
             .title(title)
             .parent_node_token(parent_node_token)
@@ -147,7 +147,7 @@ class DocOrganizer:
         )
         resp = self._client.wiki.v2.space_node.create(req)
         if not resp.success():
-            raise RuntimeError(f"创建引用节点失败: {resp.msg}")
+            raise RuntimeError(f"创建引用节点失败: {resp.code} {resp.msg}")
 
     def _save_report(self, report: Dict) -> None:
         """保存整理报告到本地"""
