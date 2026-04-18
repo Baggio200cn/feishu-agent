@@ -310,6 +310,7 @@ class FeishuDocWriter:
         items_with_summary: List[Dict[str, Any]],
         parent_folder_title: str = "github专区",
         date_str: Optional[str] = None,
+        auto_create_parent: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """
         在 parent_folder_title 父节点下创建一个当日"文件夹"节点，
@@ -319,6 +320,7 @@ class FeishuDocWriter:
             items_with_summary: [{"repo": {...}, "summary": {one_liner, detail}}, ...]
             parent_folder_title: 父节点标题，默认 "github专区"
             date_str: 日期，默认为今天（YYYY-MM-DD）
+            auto_create_parent: 找不到父节点时是否在空间根下自动创建
 
         Returns:
             {
@@ -339,10 +341,29 @@ class FeishuDocWriter:
 
         parent_token = self.find_node_by_title(parent_folder_title)
         if not parent_token:
-            logger.error(
-                f"父节点 '{parent_folder_title}' 在 Wiki 里不存在，请先手动创建该节点。"
+            if not auto_create_parent:
+                logger.error(
+                    f"父节点 '{parent_folder_title}' 不存在且未开启自动创建"
+                )
+                return None
+            logger.warning(
+                f"父节点 '{parent_folder_title}' 不存在，自动在空间根下创建"
             )
-            return None
+            parent_token, _ = self._create_wiki_node(
+                title=parent_folder_title,
+                parent_node_token=None,
+                blocks=[
+                    self._h1_block(parent_folder_title),
+                    self._text_block(
+                        "自动生成的 GitHub Trending 日报归档。"
+                        "每天会在本节点下创建一个日期文件夹，文件夹里每个仓库一页。"
+                    ),
+                ],
+            )
+            if not parent_token:
+                logger.error(f"自动创建父节点 '{parent_folder_title}' 失败")
+                return None
+            logger.info(f"✅ 自动创建父节点: {parent_folder_title} (token={parent_token})")
 
         # 找/建 当日日报文件夹
         folder_token = self.find_node_by_title(folder_title, parent_node_token=parent_token)
@@ -420,24 +441,26 @@ class FeishuDocWriter:
         }
 
     def _create_wiki_node(
-        self, title: str, parent_node_token: str, blocks: Optional[List[Dict]] = None
+        self, title: str, parent_node_token: Optional[str], blocks: Optional[List[Dict]] = None
     ) -> tuple:
-        """创建一个 Wiki 节点并可选写入内容块。返回 (node_token, obj_token) 或 (None, None)。"""
+        """创建一个 Wiki 节点并可选写入内容块。parent_node_token=None 表示在空间根下创建。
+        返回 (node_token, obj_token) 或 (None, None)。"""
         try:
             from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, Node
 
-            node = (
+            node_builder = (
                 Node.builder()
                 .obj_type("docx")
                 .node_type("origin")
                 .title(title)
-                .parent_node_token(parent_node_token)
-                .build()
             )
+            if parent_node_token:
+                node_builder.parent_node_token(parent_node_token)
+
             req = (
                 CreateSpaceNodeRequest.builder()
                 .space_id(self.space_id)
-                .request_body(node)
+                .request_body(node_builder.build())
                 .build()
             )
             resp = self._client.wiki.v2.space_node.create(req)
