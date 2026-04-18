@@ -1,0 +1,13 @@
+{
+  "name": "feishu-agent-ui",
+  "version": "0.1.0",
+  "description": "飞书智能 Agent — Electron 桌面界面",
+  "main": "ui/main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^30.0.0"
+  }
+}

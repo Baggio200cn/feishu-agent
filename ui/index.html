@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, shrink-to-fit=no">
+<title>飞书智能 Agent</title>
+<style>
+:root {
+  --accent: #3370FF;
+  --accent-hover: #2861E5;
+  --accent-active: #1F4FCC;
+  --accent-bg: #EBF1FF;
+
+  --bg-window: #F5F6F8;
+  --bg-card: #FFFFFF;
+  --bg-subtle: #F1F2F4;
+
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.14);
+
+  --text-primary: #1F2329;
+  --text-secondary: #646A73;
+  --text-tertiary: #8F959E;
+
+  --success: #1FAA5C;
+  --success-bg: #E8F7EE;
+  --warning: #B47900;
+  --warning-bg: #FFF6E0;
+  --danger: #E54545;
+  --danger-bg: #FCEAEA;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+}
+
+/* 高清文字渲染:
+   - text-rendering: optimizeLegibility 开启连字与字距微调
+   - -webkit-font-smoothing / -moz-osx-font-smoothing 抗锯齿，Retina 下更锐利
+   - subpixel-antialiased 对 Windows ClearType 效果更好
+   - font-feature-settings 启用常用排版特性
+   - transform: translateZ(0) 触发 GPU 层以避免亚像素模糊
+*/
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--bg-window);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "kern" 1, "liga" 1, "calt" 1, "ss01" 1;
+  letter-spacing: 0.01em;
+  user-select: none;
+  overflow-x: hidden;
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+
+/* 中文字符单独微调，避免 letter-spacing 导致字距偏宽 */
+:lang(zh), :lang(zh-CN) { letter-spacing: 0; }
+
+.titlebar {
+  -webkit-app-region: drag;
+  height: 38px;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 14px;
+  gap: 8px;
+}
+
+.titlebar-logo {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+  display: block;
+  -webkit-user-drag: none;
+  image-rendering: -webkit-optimize-contrast;
+}
+
+.titlebar-title { font-size: 13px; font-weight: 500; flex: 1; }
+
+.app-container { padding: 14px; }
+
+.conn-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  margin-bottom: 16px;
+}
+
+.conn-bar-left { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+.conn-bar-right { font-size: 11px; color: var(--text-tertiary); }
+
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); flex-shrink: 0; }
+.dot.offline { background: var(--text-tertiary); }
+.dot.error { background: var(--danger); }
+
+.section-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0 4px 8px;
+}
+
+section { margin-bottom: 16px; }
+section:last-child { margin-bottom: 0; }
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
+}
+
+.card-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.card-title { font-size: 14px; font-weight: 500; color: var(--text-primary); margin-bottom: 3px; }
+.card-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+
+.card-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  background: var(--accent-bg);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.card-icon svg { width: 18px; height: 18px; }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+.card-compact {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 12px 14px;
+}
+
+.card-compact-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.card-compact-title { font-size: 13px; font-weight: 500; }
+.card-compact-meta { font-size: 11px; color: var(--text-secondary); line-height: 1.6; margin-bottom: 12px; }
+
+.badge {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: 10px;
+  letter-spacing: 0.02em;
+}
+.badge.success { color: var(--success); background: var(--success-bg); }
+.badge.warning { color: var(--warning); background: var(--warning-bg); }
+.badge.danger { color: var(--danger); background: var(--danger-bg); }
+.badge.idle { color: var(--text-tertiary); background: var(--bg-subtle); }
+
+button {
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 7px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, transform 0.08s ease;
+  -webkit-app-region: no-drag;
+  -webkit-font-smoothing: antialiased;
+}
+button:hover { background: var(--bg-subtle); }
+button:active { transform: scale(0.98); }
+button:disabled { opacity: 0.55; cursor: not-allowed; }
+
+button.primary {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.primary:active { background: var(--accent-active); }
+
+button.small { font-size: 12px; padding: 6px 10px; }
+button.flex { flex: 1; }
+
+.btn-row { display: flex; gap: 6px; }
+
+.stats-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--bg-subtle);
+  border-radius: var(--radius-md);
+  margin: 12px 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.stats-strip .sep { color: var(--text-tertiary); opacity: 0.5; }
+
+.toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.toggle-label { font-size: 11px; font-weight: 500; }
+.toggle-label.on { color: var(--success); }
+.toggle-label.off { color: var(--text-tertiary); }
+.toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+.toggle-track {
+  position: relative;
+  width: 32px;
+  height: 18px;
+  background: var(--text-tertiary);
+  border-radius: 9px;
+  transition: background 0.18s ease;
+  display: inline-block;
+}
+.toggle-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  background: white;
+  border-radius: 50%;
+  transition: left 0.18s ease;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+}
+.toggle input:checked + .toggle-track { background: var(--success); }
+.toggle input:checked + .toggle-track .toggle-thumb { left: 16px; }
+
+.toast {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translate(-50%, 0) translateZ(0);
+  background: rgba(0,0,0,0.85);
+  color: white;
+  padding: 8px 14px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+  white-space: nowrap;
+  z-index: 1000;
+  -webkit-font-smoothing: antialiased;
+}
+.toast.show { opacity: 1; }
+
+/* Retina / HiDPI 屏幕再加一层字体平滑 */
+@media (-webkit-min-device-pixel-ratio: 1.5), (min-resolution: 144dpi) {
+  body {
+    -webkit-font-smoothing: subpixel-antialiased;
+  }
+}
+</style>
+</head>
+<body>
+
+<div class="titlebar">
+  <img class="titlebar-logo" src="icon.png" alt="飞书智能 Agent">
+  <div class="titlebar-title">飞书智能 Agent</div>
+</div>
+
+<div class="app-container">
+
+  <div class="conn-bar">
+    <div class="conn-bar-left">
+      <span class="dot offline" id="conn-dot"></span>
+      <span id="conn-text">本地模式 · 配置凭证后联通飞书</span>
+    </div>
+    <div class="conn-bar-right" id="conn-accounts">个人 + 企业账号</div>
+  </div>
+
+  <section>
+    <div class="section-label">对话</div>
+    <div class="card">
+      <div class="card-row">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <div class="card-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          </div>
+          <div>
+            <div class="card-title">对话助手</div>
+            <div class="card-desc">检索 Wiki · 调用 Agent · 跨账号查询</div>
+          </div>
+        </div>
+        <button class="primary" onclick="callAction('open-chat')">打开</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-label">每日抓取</div>
+    <div class="grid-2">
+      <div class="card-compact">
+        <div class="card-compact-header">
+          <span class="card-compact-title">GitHub Trending</span>
+          <span class="badge idle" id="github-status">未执行</span>
+        </div>
+        <div class="card-compact-meta" id="github-meta">
+          尚未执行<br>
+          配置好凭证后由调度器自动执行
+        </div>
+        <div class="btn-row">
+          <button class="small flex" onclick="callAction('run-github')">立即执行</button>
+          <button class="small" onclick="callAction('view-github-log')">日志</button>
+        </div>
+      </div>
+
+      <div class="card-compact">
+        <div class="card-compact-header">
+          <span class="card-compact-title">Reddit AI 日报</span>
+          <span class="badge warning" id="reddit-status">待开发</span>
+        </div>
+        <div class="card-compact-meta" id="reddit-meta">
+          模块尚未实现（步骤 B）<br>
+          调度器会调用，但目前仅记录日志
+        </div>
+        <div class="btn-row">
+          <button class="small flex" onclick="callAction('run-reddit')">立即执行</button>
+          <button class="small" onclick="callAction('view-reddit-result')">查看</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-label">Wiki 整理工作流</div>
+    <div class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title">文档分类与归档</div>
+          <div class="card-desc">扫描 → AI 分类 → 移入个人 Wiki</div>
+        </div>
+        <span style="font-size: 11px; color: var(--text-tertiary);" id="wiki-categories">7 个分类</span>
+      </div>
+      <div class="stats-strip">
+        <span id="wiki-personal">个人 — 篇</span>
+        <span class="sep">·</span>
+        <span id="wiki-enterprise">企业 — 篇</span>
+        <span class="sep">·</span>
+        <span id="wiki-pending">待整理 — 篇</span>
+      </div>
+      <div class="btn-row">
+        <button class="flex" onclick="callAction('preview-wiki')">预览分类结果</button>
+        <button class="primary flex" onclick="callAction('execute-wiki')">执行整理</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-label">调度</div>
+    <div class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title" style="font-size: 13px;">每日定时任务</div>
+          <div class="card-desc" style="font-size: 11px;" id="schedule-desc">已停止 · 点击右侧开关启动</div>
+        </div>
+        <label class="toggle">
+          <span class="toggle-label off" id="schedule-label">已停止</span>
+          <input type="checkbox" id="schedule-toggle">
+          <span class="toggle-track">
+            <span class="toggle-thumb"></span>
+          </span>
+        </label>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+function callAction(action, params = {}) {
+  if (window.feishuAgent && window.feishuAgent.invoke) {
+    window.feishuAgent.invoke(action, params)
+      .then(result => { if (result && result.message) toast(result.message); })
+      .catch(err => toast('错误: ' + err.message));
+  } else {
+    console.log('[Action]', action, params);
+    toast('已触发: ' + action);
+  }
+}
+
+function setBadge(id, label, type) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = label;
+  el.className = 'badge ' + (type || 'idle');
+}
+
+function updateScheduleUI(enabled) {
+  const label = document.getElementById('schedule-label');
+  label.textContent = enabled ? '运行中' : '已停止';
+  label.className = 'toggle-label ' + (enabled ? 'on' : 'off');
+  document.getElementById('schedule-toggle').checked = enabled;
+}
+
+document.getElementById('schedule-toggle').addEventListener('change', (e) => {
+  updateScheduleUI(e.target.checked);
+  callAction('toggle-scheduler', { enabled: e.target.checked });
+});
+
+function updateState(state) {
+  if (!state) return;
+  if (state.connection) {
+    if (state.connection.text) document.getElementById('conn-text').textContent = state.connection.text;
+    if (state.connection.status) document.getElementById('conn-dot').className = 'dot ' + state.connection.status;
+    if (state.connection.accounts) document.getElementById('conn-accounts').textContent = state.connection.accounts;
+  }
+  if (state.github) {
+    if (state.github.meta) document.getElementById('github-meta').innerHTML = state.github.meta;
+    if (state.github.statusLabel) setBadge('github-status', state.github.statusLabel, state.github.statusType);
+  }
+  if (state.reddit) {
+    if (state.reddit.meta) document.getElementById('reddit-meta').innerHTML = state.reddit.meta;
+    if (state.reddit.statusLabel) setBadge('reddit-status', state.reddit.statusLabel, state.reddit.statusType);
+  }
+  if (state.wiki) {
+    if (state.wiki.personal !== undefined) document.getElementById('wiki-personal').textContent = `个人 ${state.wiki.personal} 篇`;
+    if (state.wiki.enterprise !== undefined) document.getElementById('wiki-enterprise').textContent = `企业 ${state.wiki.enterprise} 篇`;
+    if (state.wiki.pending !== undefined) document.getElementById('wiki-pending').textContent = `待整理 ${state.wiki.pending} 篇`;
+    if (state.wiki.categories !== undefined) document.getElementById('wiki-categories').textContent = `${state.wiki.categories} 个分类`;
+  }
+  if (state.scheduler) {
+    if (state.scheduler.enabled !== undefined) updateScheduleUI(state.scheduler.enabled);
+    if (state.scheduler.desc) document.getElementById('schedule-desc').textContent = state.scheduler.desc;
+  }
+}
+
+if (window.feishuAgent && window.feishuAgent.onStateUpdate) {
+  window.feishuAgent.onStateUpdate(updateState);
+}
+
+let toastTimer;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+}
+</script>
+
+</body>
+</html>

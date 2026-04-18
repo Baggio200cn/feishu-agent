@@ -6,3 +6,6 @@ requests==2.31.0
 
 # 环境变量支持
 python-dotenv==1.0.0
+
+# 定时任务调度器
+APScheduler>=3.10.0

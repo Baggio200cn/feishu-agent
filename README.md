@@ -40,6 +40,17 @@ cp config/credentials.json.example config/credentials.json
 
 ### 3. 运行
 
+#### 桌面界面（Electron）
+
+```bash
+npm install
+npm start
+```
+
+界面包含：连接状态栏、对话助手入口、GitHub / Reddit 每日抓取卡片、Wiki 整理工作流、每日定时任务开关。按钮会通过 IPC 调用 `main.py` 的对应子命令。文字已针对 Retina / HiDPI 屏幕做字体平滑和抗锯齿优化。
+
+#### 命令行
+
 ```bash
 # 预览文档分类（不实际移动）
 python main.py organize --dry-run
@@ -47,8 +58,11 @@ python main.py organize --dry-run
 # 执行文档整理
 python main.py organize
 
-# 导入 GitHub 仓库
+# 导入 GitHub 仓库（增量，自动跳过已导入的仓库）
 python main.py import-github
+
+# 强制重新导入所有仓库（忽略去重索引）
+python main.py import-github --force
 
 # 查看邮件
 python main.py manage email
@@ -61,7 +75,45 @@ python main.py manage contacts --query 张三
 
 # 查看群聊消息
 python main.py manage messages --chat-id oc_xxxxxx
+
+# 启动定时任务调度器（每天 09:00 抓 GitHub、23:00 整理 Wiki，可在 credentials.json 调整）
+python main.py schedule
+
+# 查询调度器当前状态（输出 JSON，UI 内部使用）
+python main.py schedule-status
 ```
+
+#### 定时任务
+
+调度器配置在 `config/credentials.json` 的 `schedule.jobs` 数组里：
+
+```json
+"schedule": {
+  "jobs": [
+    {"type": "github",   "hour": 9,  "minute": 0, "enabled": true},
+    {"type": "reddit",   "hour": 9,  "minute": 5, "enabled": false},
+    {"type": "organize", "hour": 23, "minute": 0, "enabled": true}
+  ]
+}
+```
+
+- `type`：任务类型，目前支持 `github` / `reddit` / `organize`
+- `hour` / `minute`：cron 触发时间（Asia/Shanghai 时区）
+- `enabled`：是否启用
+- 任务运行状态写入 `logs/scheduler_state.json`，UI 通过该文件展示
+- 调度器进程 PID 写入 `logs/scheduler.pid`
+
+桌面界面右下角的"每日定时任务"开关会调用 `python main.py schedule` 启动后台守护进程，关闭时通过 PID 信号终止。守护进程独立于 Electron，关闭 UI 不会停止调度。
+
+#### GitHub 导入的数据文件
+
+运行 `import-github` 后会在 `logs/` 下产生：
+
+- `logs/github_imported.json` — 已导入仓库索引（去重依据，下次跳过）
+- `logs/github_last_run.json` — 最近一次运行统计，UI 卡片从这里读真实数据
+- `logs/feishu_agent.log` — 完整日志（含限频警告、失败原因）
+
+去重策略：索引记录 `repo_full_name → wiki_url`，下次再跑时同名仓库自动跳过。想强刷就用 `--force`。
 
 ---
 
