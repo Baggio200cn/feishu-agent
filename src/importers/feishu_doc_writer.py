@@ -3,6 +3,7 @@
 """
 import logging
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -247,3 +248,181 @@ class FeishuDocWriter:
                     logger.warning(f"写入内容块失败 (batch {i//batch_size}): {resp.code} {resp.msg}")
         except Exception as e:
             logger.warning(f"写入文档内容异常: {e}")
+
+    # =========================================================
+    # GitHub Trending 日报写入
+    # =========================================================
+
+    def find_node_by_title(self, title: str, parent_node_token: str = None) -> Optional[str]:
+        """
+        按标题在 Wiki 空间里查找节点，返回 node_token（找不到返回 None）。
+
+        - parent_node_token=None 时在空间根下查找
+        - 遍历最多 5 页（250 个节点）
+        """
+        try:
+            from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+        except ImportError as e:
+            logger.warning(f"lark-oapi 缺少 ListSpaceNodeRequest: {e}")
+            return None
+
+        page_token = None
+        for _ in range(5):
+            builder = ListSpaceNodeRequest.builder().space_id(self.space_id).page_size(50)
+            if parent_node_token:
+                builder.parent_node_token(parent_node_token)
+            if page_token:
+                builder.page_token(page_token)
+            resp = self._client.wiki.v2.space_node.list(builder.build())
+            if not resp.success():
+                logger.warning(f"查询节点失败: {resp.code} {resp.msg}")
+                return None
+            items = getattr(resp.data, "items", None) or []
+            for item in items:
+                if getattr(item, "title", None) == title:
+                    return item.node_token
+            if not getattr(resp.data, "has_more", False):
+                break
+            page_token = getattr(resp.data, "page_token", None)
+            if not page_token:
+                break
+        return None
+
+    def write_daily_trending_report(
+        self,
+        items_with_summary: List[Dict[str, Any]],
+        parent_folder_title: str = "github专区",
+        date_str: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        在 Wiki 空间的 parent_folder_title 父节点下创建一份"GitHub Trending 日报 YYYY-MM-DD"。
+
+        Args:
+            items_with_summary: [{"repo": {...trending 元数据...}, "summary": {one_liner, detail}}, ...]
+            parent_folder_title: 父节点标题，默认 "github专区"
+            date_str: 日期字符串，默认为今天（YYYY-MM-DD）
+
+        Returns:
+            成功返回 Wiki 页 URL；跳过（今日已存在）或失败返回 None。
+        """
+        if not items_with_summary:
+            logger.warning("日报内容为空，跳过")
+            return None
+
+        date_str = date_str or datetime.now().strftime("%Y-%m-%d")
+        title = f"GitHub Trending 日报 {date_str}"
+
+        parent_token = self.find_node_by_title(parent_folder_title)
+        if not parent_token:
+            logger.error(
+                f"父节点 '{parent_folder_title}' 在 Wiki 里不存在，请先手动创建该节点。"
+            )
+            return None
+
+        # 去重：今日日报已存在则跳过
+        existing = self.find_node_by_title(title, parent_node_token=parent_token)
+        if existing:
+            logger.info(f"今日日报已存在，跳过创建: {title} → {existing}")
+            return f"https://open.feishu.cn/wiki/{existing}"
+
+        # 构建 blocks
+        blocks = self._build_daily_report_blocks(items_with_summary, date_str)
+
+        # 创建节点
+        try:
+            from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, Node
+
+            node = (
+                Node.builder()
+                .obj_type("docx")
+                .node_type("origin")
+                .title(title)
+                .parent_node_token(parent_token)
+                .build()
+            )
+            req = (
+                CreateSpaceNodeRequest.builder()
+                .space_id(self.space_id)
+                .request_body(node)
+                .build()
+            )
+            resp = self._client.wiki.v2.space_node.create(req)
+            if not resp.success():
+                logger.error(f"创建日报节点失败: {resp.code} {resp.msg}")
+                return None
+
+            node_token = resp.data.node.node_token
+            obj_token = resp.data.node.obj_token
+            self._populate_blocks(obj_token, blocks)
+
+            url = f"https://open.feishu.cn/wiki/{node_token}"
+            logger.info(f"✅ 日报已创建: {title} → {url}")
+            return url
+        except Exception as e:
+            logger.exception(f"创建日报异常: {e}")
+            return None
+
+    def _build_daily_report_blocks(
+        self, items_with_summary: List[Dict[str, Any]], date_str: str
+    ) -> List[Dict]:
+        """把 Trending + AI 摘要组装成飞书 Block 列表（按截图格式）"""
+        blocks: List[Dict] = []
+
+        # 顶部概述
+        blocks.append(self._h1_block(f"GitHub Trending 日报 · {date_str}"))
+        blocks.append(
+            self._text_block(
+                f"自动抓取 https://github.com/trending 今日热门项目，"
+                f"豆包 AI 生成中文摘要。共 {len(items_with_summary)} 个仓库。"
+            )
+        )
+        blocks.append(self._divider())
+
+        for idx, item in enumerate(items_with_summary, 1):
+            repo = item.get("repo", {})
+            summary = item.get("summary") or {}
+
+            full_name = repo.get("full_name", "?")
+            url = repo.get("url", "")
+            stars_total = repo.get("stars_total", 0)
+            stars_today = repo.get("stars_today", 0)
+            language = repo.get("language", "未知")
+
+            # Heading 2: "N. owner/repo"
+            blocks.append(self._h2_block(f"{idx}. {full_name}"))
+
+            # 仓库链接
+            blocks.append(self._text_block(f"🔗 仓库链接: {url}"))
+
+            # Stars / 语言
+            blocks.append(
+                self._text_block(
+                    f"⭐ 今日 +{stars_today} stars · 共 {stars_total:,} stars · 语言: {language}"
+                )
+            )
+
+            # 一句话定位（带 📌 图标）
+            one_liner = summary.get("one_liner") or repo.get("description") or "（无摘要）"
+            blocks.append(self._text_block(f"📌 {one_liner}"))
+
+            # 详细介绍 H3 + 正文段落
+            blocks.append(self._h3_block("详细介绍"))
+            detail = summary.get("detail") or "（AI 摘要失败，请查看原仓库 README）"
+            # 按空行拆段，每段一个 text block
+            for paragraph in self._split_paragraphs(detail):
+                blocks.append(self._text_block(paragraph))
+
+            blocks.append(self._divider())
+
+        return blocks
+
+    @staticmethod
+    def _split_paragraphs(text: str) -> List[str]:
+        """按空行或换行拆段，过滤空串"""
+        parts = re.split(r"\n\s*\n", text.strip())
+        result = []
+        for p in parts:
+            p = p.strip()
+            if p:
+                result.append(p)
+        return result or [text]

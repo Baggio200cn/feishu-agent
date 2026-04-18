@@ -634,6 +634,121 @@ UI 读到这个文件，卡片显示红色"失败"徽章 + 具体原因，用户
 
 ---
 
+## 十一、步骤 A.2：Trending + 豆包 AI 日报（2026-04-18）
+
+### 背景
+
+用户给出了飞书 Wiki 里一份参考格式的截图 —— 按日期汇总的 GitHub Trending 日报，
+每个仓库含：编号标题 / 仓库链接 / stars 数据 / 一句话定位 / 500 字详细介绍。
+原有 `import-github` 流程（静态 repo_list + 搜索 topic）完全不符合这个格式。
+
+### 新数据流
+
+```
+GitHub /trending HTML       
+        ↓ BeautifulSoup 解析      
+   [10 条仓库元数据]      
+        ↓ 逐个调 fetch_repo()      
+   [+ README 内容]      
+        ↓ 豆包 AI（doubao-seed-2-0-mini-260215）      
+   [+ one_liner, detail]      
+        ↓ 按日期聚合      
+  飞书 Wiki "github专区" 下      
+  「GitHub Trending 日报 YYYY-MM-DD」一页      
+```
+
+### 新增/改动文件
+
+| 文件 | 角色 |
+|------|------|
+| `src/importers/github_trending.py`（**新**） | `GitHubTrending.fetch()`：爬 `/trending/{language}?since={period}` HTML，BeautifulSoup 解析 `article.Box-row`，提取 full_name / url / description / language / stars_total / stars_today / forks，带 3 次重试 |
+| `src/importers/ai_summarizer.py`（**新**） | `AISummarizer.summarize_repo()`：调豆包 REST API，`response_format={"type":"json_object"}` 强制 JSON 输出，解析 `{one_liner, detail}`。带占位检测 `configured()` |
+| `src/importers/feishu_doc_writer.py`（改） | 新增 `find_node_by_title()`：分页扫 `ListSpaceNode` 按标题匹配；新增 `write_daily_trending_report()`：找到 `github专区` 父节点 → 当日已存在则跳过 → 否则创建一页按截图格式排版；`_build_daily_report_blocks()` 构造 H1 概述 + (H2 编号标题 → 链接 → ⭐ → 📌 一句话 → H3 详细介绍 → 段落 → 分割线) × N |
+| `main.py` | `cmd_import_github` 重写为 dispatcher：`trending.enabled=true` 走新流程（`_run_trending_pipeline`），否则走老流程（`_run_legacy_pipeline`）。老流程保留不删，用作兼容 |
+| `config/credentials.json.example` | github 下新增 `trending` 配置块（enabled / period / language / limit） + `parent_folder`；`repo_list` / `search_topics` 默认空数组 |
+| `requirements.txt` | 新增 `beautifulsoup4>=4.12.0` |
+
+### 关键设计
+
+**1. HTML 结构解析**
+
+GitHub 无官方 Trending API。在沙箱实测确认了 DOM 结构：
+
+| 字段 | CSS 选择器 |
+|------|-----------|
+| 仓库 full_name | `article.Box-row h2 a[href]` （去掉开头的 `/`） |
+| 描述 | `article p` |
+| 主要语言 | `span[itemprop='programmingLanguage']` |
+| 总 stars | `a.Link--muted[href$='/stargazers']` |
+| Forks | `a.Link--muted[href$='/forks']` |
+| 今日新增 | `span.d-inline-block.float-sm-right`（文本 "458 stars today"） |
+
+`_parse_number()` 容错处理 `1,280` / `45.2k` / `458 stars today` 三种格式。
+
+**2. 豆包 Prompt 设计**
+
+system 设定为"资深中文技术分析师"，user 要求严格 4 段式：
+
+- 项目背景：解决什么痛点
+- 核心功能：能做什么
+- 技术亮点：技术栈 + 先进性（技术术语首次出现加括号注释）
+- 适用场景：哪些团队 / 业务会用
+
+使用豆包的 `response_format: {"type":"json_object"}` 约束输出为 JSON。
+兜底：`_parse_json()` 剥掉 `​`​`​`json 围栏，找不到合法 JSON 就取首尾 `{}`。
+
+**3. 飞书 Wiki 节点定位**
+
+截图里用户的 Wiki 是：`巴老师AI知识库一匹黑马 → github专区 → 今日日报`。
+代码不能硬编码节点 token（每个用户不同），改用 `find_node_by_title`
+扫描 Wiki 顶层节点匹配"github专区"拿 node_token，再以它为
+`parent_node_token` 创建日报页。
+
+**4. 去重策略变化**
+
+老流程按 `repo_full_name` 去重（`github_imported.json`）；新流程**按日期**去重 ——
+同一天已有日报就跳过，除非 `--force`。不再每仓库一页，所以旧索引不再使用（保留代码兼容）。
+
+### 统计文件变化
+
+`logs/github_last_run.json` 新字段（trending 模式）：
+
+```json
+{
+  "at": "...",
+  "status": "success | partial | skipped | error",
+  "mode": "trending",
+  "fetched": 10,
+  "summarized": 10,
+  "ai_failed": 0,
+  "wiki_url": "https://open.feishu.cn/wiki/xxxx",
+  "message": "抓取 10 个 · 摘要成功 10 · AI 失败 0"
+}
+```
+
+老字段 `imported / skipped_dup / failed / urls` 仅在 legacy 模式下填充。
+
+### 成本评估
+
+- Doubao-Seed-2.0-mini：**0.2 元 / 百万 token（输入）**
+- 每个 README 截断到 12K 字符 ≈ 4K token，10 个仓库 ≈ 40K token / 天
+- **每日成本 ≈ 0.008 元，一个月 ≈ 0.25 元**
+
+Pro 模型如果效果不够再切，几乎零成本迁移（改一个模型 ID）。
+
+### 未完成 / 下一步
+
+- 图片支持：Trending 页面有项目预览 OG image，当前不抓
+- 多语言 Trending 轮询：目前只抓"全部语言"，可以按配置轮询 `python` / `typescript` 分别生成分类日报
+- Token 使用量统计：`logs/doubao_usage.json` 记录每日 token 消耗
+- UI 卡片展示：目前 UI 只读 `github_last_run.json` 的老字段，需扩展以展示 `wiki_url`
+
+---
+
+*步骤 A.2 日志生成：2026-04-18*
+
+---
+
 ## 八、启动指南（给未来的自己）
 
 **从零启动：**

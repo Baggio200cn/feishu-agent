@@ -111,8 +111,10 @@ def _validate_github_config(github_cfg: dict, wiki_space_id: str) -> Optional[st
         return "GitHub token 未配置（占位值 ghp_your_...）。请在 config/credentials.json 填入真实 token"
     if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
         return "飞书 Wiki space_id 未配置。请在 config/credentials.json 的 accounts.personal.wiki_space_id 填入"
-    if not github_cfg.get("repo_list") and not github_cfg.get("search_topics"):
-        return "GitHub 任务列表为空：repo_list 和 search_topics 都没填"
+    trending_enabled = github_cfg.get("trending", {}).get("enabled", False)
+    has_static = github_cfg.get("repo_list") or github_cfg.get("search_topics")
+    if not trending_enabled and not has_static:
+        return "GitHub 任务配置为空：trending.enabled / repo_list / search_topics 至少启用一个"
     return None
 
 
@@ -142,7 +144,12 @@ def _write_run_stats(stats: Dict[str, Any]) -> None:
 
 
 def cmd_import_github(args):
-    """将 GitHub 仓库内容导入飞书"""
+    """
+    GitHub Trending 日报：从 /trending 抓热门仓库 → 豆包 AI 中文摘要 →
+    按日期汇总为一页写入飞书 Wiki 的 github专区 子节点。
+
+    老的 repo_list / search_topics 流程保留为兼容模式（若 trending.enabled=false 走老路）。
+    """
     from datetime import datetime
 
     from src.importers.github_importer import GitHubImporter
@@ -151,11 +158,11 @@ def cmd_import_github(args):
     run_stats: Dict[str, Any] = {
         "at": datetime.now().isoformat(timespec="seconds"),
         "status": "error",
-        "imported": 0,
-        "skipped_dup": 0,
+        "mode": "",
         "fetched": 0,
-        "failed": 0,
-        "urls": [],
+        "summarized": 0,
+        "ai_failed": 0,
+        "wiki_url": "",
         "message": "",
     }
 
@@ -173,84 +180,206 @@ def cmd_import_github(args):
 
         factory = FeishuClientFactory(creds["accounts"])
         personal_client = factory.get_client("personal")
-
         importer = GitHubImporter(token=github_cfg.get("token", ""))
         writer = FeishuDocWriter(personal_client, wiki_space_id)
 
-        index = _load_import_index()
-        force_reimport = getattr(args, "force", False)
+        trending_cfg = github_cfg.get("trending", {})
+        force = getattr(args, "force", False)
 
-        all_repos: List[Dict[str, Any]] = []
-
-        repo_list = github_cfg.get("repo_list", [])
-        if repo_list:
-            logger.info(f"导入指定仓库列表: {repo_list}")
-            all_repos.extend(importer.import_repo_list(repo_list))
-
-        topics = github_cfg.get("search_topics", [])
-        if topics:
-            logger.info(f"搜索主题仓库: {topics}")
-            all_repos.extend(importer.search_by_topics(topics, per_topic=5))
-
-        run_stats["fetched"] = len(all_repos)
-
-        if not all_repos:
-            msg = "未获取到任何仓库（可能被限频或配置有误）"
-            logger.warning(msg)
-            run_stats["message"] = msg
-            _write_run_stats(run_stats)
-            return
-
-        # 去重
-        to_import = []
-        for repo in all_repos:
-            full_name = repo.get("full_name")
-            if not full_name:
-                continue
-            if not force_reimport and full_name in index:
-                logger.info(f"跳过已导入: {full_name} → {index[full_name].get('wiki_url')}")
-                run_stats["skipped_dup"] += 1
-                continue
-            to_import.append(repo)
-
-        logger.info(
-            f"共获取 {len(all_repos)} 个仓库，跳过已导入 {run_stats['skipped_dup']} 个，"
-            f"即将写入 {len(to_import)} 个"
-        )
-
-        from datetime import datetime as _dt
-        for repo in to_import:
-            url = writer.write_github_repo(repo)
-            if url:
-                run_stats["imported"] += 1
-                run_stats["urls"].append(url)
-                index[repo["full_name"]] = {
-                    "wiki_url": url,
-                    "imported_at": _dt.now().isoformat(timespec="seconds"),
-                }
-                _save_import_index(index)  # 增量保存，防止中途崩溃丢失
-            else:
-                run_stats["failed"] += 1
-
-        run_stats["status"] = "success" if run_stats["failed"] == 0 else "partial"
-        run_stats["message"] = (
-            f"新增 {run_stats['imported']} · 跳过重复 {run_stats['skipped_dup']}"
-            f" · 失败 {run_stats['failed']}"
-        )
-        if importer.rate_limit_remaining is not None:
-            run_stats["rate_limit_remaining"] = importer.rate_limit_remaining
+        if trending_cfg.get("enabled", False):
+            run_stats["mode"] = "trending"
+            _run_trending_pipeline(
+                github_cfg=github_cfg,
+                trending_cfg=trending_cfg,
+                importer=importer,
+                writer=writer,
+                run_stats=run_stats,
+                force=force,
+            )
+        else:
+            run_stats["mode"] = "legacy"
+            _run_legacy_pipeline(
+                github_cfg=github_cfg,
+                importer=importer,
+                writer=writer,
+                run_stats=run_stats,
+                force=force,
+            )
 
         _write_run_stats(run_stats)
-
-        print(f"\n✅ 本次导入结果：{run_stats['message']}")
-        for url in run_stats["urls"]:
-            print(f"  {url}")
 
     except Exception as e:
         logger.exception("import-github 异常")
         run_stats["message"] = f"异常终止: {e}"
         _write_run_stats(run_stats)
         raise
+
+
+def _run_trending_pipeline(
+    github_cfg: Dict, trending_cfg: Dict, importer, writer, run_stats: Dict, force: bool
+) -> None:
+    """新流程：Trending → 抓 README → 豆包摘要 → 写入飞书日报页"""
+    from datetime import datetime as _dt
+
+    from src.importers.github_trending import GitHubTrending
+    from src.importers.ai_summarizer import AISummarizer
+
+    ai_cfg = config_loader.get_ai_config()
+    summarizer = AISummarizer(ai_cfg)
+    if not summarizer.configured():
+        msg = "豆包 AI 未配置（api_key / model / base_url 任一缺失），trending 模式需要 AI"
+        logger.error(msg)
+        run_stats["message"] = msg
+        return
+
+    # 检查今日日报是否已存在（除非 --force）
+    date_str = _dt.now().strftime("%Y-%m-%d")
+    parent_folder = github_cfg.get("parent_folder", "github专区")
+    if not force:
+        parent_token = writer.find_node_by_title(parent_folder)
+        if parent_token:
+            existing = writer.find_node_by_title(
+                f"GitHub Trending 日报 {date_str}", parent_node_token=parent_token
+            )
+            if existing:
+                url = f"https://open.feishu.cn/wiki/{existing}"
+                msg = f"今日日报已存在，跳过（加 --force 可强刷）: {url}"
+                logger.info(msg)
+                run_stats["status"] = "skipped"
+                run_stats["wiki_url"] = url
+                run_stats["message"] = msg
+                return
+
+    # 1. 抓 Trending
+    trending = GitHubTrending()
+    repos_meta = trending.fetch(
+        period=trending_cfg.get("period", "daily"),
+        language=trending_cfg.get("language", ""),
+        limit=int(trending_cfg.get("limit", 10)),
+    )
+    run_stats["fetched"] = len(repos_meta)
+
+    if not repos_meta:
+        msg = "Trending 列表为空（可能网络受限或 GitHub 限频）"
+        logger.warning(msg)
+        run_stats["message"] = msg
+        return
+
+    # 2. 对每个仓库：抓 README + 豆包摘要
+    items_with_summary: List[Dict[str, Any]] = []
+    for i, meta in enumerate(repos_meta, 1):
+        full_name = meta.get("full_name", "")
+        logger.info(f"[{i}/{len(repos_meta)}] 处理 {full_name}")
+
+        # 2a. 抓 README（复用 GitHubImporter）
+        detail = importer.fetch_repo(full_name)
+        readme = detail.get("readme", "") if detail else ""
+
+        # 2b. 豆包摘要
+        summary = summarizer.summarize_repo(
+            full_name=full_name,
+            description=meta.get("description", ""),
+            language=meta.get("language", ""),
+            stars_total=meta.get("stars_total", 0),
+            stars_today=meta.get("stars_today", 0),
+            readme=readme,
+        )
+        if summary:
+            run_stats["summarized"] += 1
+        else:
+            run_stats["ai_failed"] += 1
+            summary = {
+                "one_liner": meta.get("description", "") or "（AI 摘要失败）",
+                "detail": "AI 摘要失败，请查看原仓库 README。",
+            }
+
+        items_with_summary.append({"repo": meta, "summary": summary})
+
+    # 3. 写飞书日报
+    url = writer.write_daily_trending_report(
+        items_with_summary=items_with_summary,
+        parent_folder_title=parent_folder,
+        date_str=date_str,
+    )
+
+    if url:
+        run_stats["wiki_url"] = url
+        run_stats["status"] = (
+            "success" if run_stats["ai_failed"] == 0 else "partial"
+        )
+        run_stats["message"] = (
+            f"抓取 {run_stats['fetched']} 个 · 摘要成功 {run_stats['summarized']}"
+            f" · AI 失败 {run_stats['ai_failed']}"
+        )
+        print(f"\n✅ GitHub Trending 日报已写入: {url}")
+        print(f"   {run_stats['message']}")
+    else:
+        run_stats["message"] = "日报写入失败，可能父节点不存在或 Wiki 权限问题"
+        logger.error(run_stats["message"])
+
+
+def _run_legacy_pipeline(
+    github_cfg: Dict, importer, writer, run_stats: Dict, force: bool
+) -> None:
+    """老流程：repo_list + search_topics → 每个仓库一个 Wiki 页"""
+    from datetime import datetime as _dt
+
+    index = _load_import_index()
+    all_repos: List[Dict[str, Any]] = []
+
+    repo_list = github_cfg.get("repo_list", [])
+    if repo_list:
+        logger.info(f"导入指定仓库列表: {repo_list}")
+        all_repos.extend(importer.import_repo_list(repo_list))
+
+    topics = github_cfg.get("search_topics", [])
+    if topics:
+        logger.info(f"搜索主题仓库: {topics}")
+        all_repos.extend(importer.search_by_topics(topics, per_topic=5))
+
+    run_stats["fetched"] = len(all_repos)
+
+    if not all_repos:
+        run_stats["message"] = "未获取到任何仓库"
+        logger.warning(run_stats["message"])
+        return
+
+    to_import = []
+    run_stats["skipped_dup"] = 0
+    for repo in all_repos:
+        full_name = repo.get("full_name")
+        if not full_name:
+            continue
+        if not force and full_name in index:
+            logger.info(f"跳过已导入: {full_name}")
+            run_stats["skipped_dup"] += 1
+            continue
+        to_import.append(repo)
+
+    run_stats["imported"] = 0
+    run_stats["failed"] = 0
+    run_stats["urls"] = []
+    for repo in to_import:
+        url = writer.write_github_repo(repo)
+        if url:
+            run_stats["imported"] += 1
+            run_stats["urls"].append(url)
+            index[repo["full_name"]] = {
+                "wiki_url": url,
+                "imported_at": _dt.now().isoformat(timespec="seconds"),
+            }
+            _save_import_index(index)
+        else:
+            run_stats["failed"] += 1
+
+    run_stats["status"] = "success" if run_stats["failed"] == 0 else "partial"
+    run_stats["message"] = (
+        f"新增 {run_stats['imported']} · 跳过 {run_stats['skipped_dup']}"
+        f" · 失败 {run_stats['failed']}"
+    )
+    print(f"\n✅ (legacy 模式) {run_stats['message']}")
+    for url in run_stats["urls"]:
+        print(f"  {url}")
 
 
 def cmd_manage(args):

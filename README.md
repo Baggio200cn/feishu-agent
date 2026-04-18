@@ -58,10 +58,13 @@ python main.py organize --dry-run
 # 执行文档整理
 python main.py organize
 
-# 导入 GitHub 仓库（增量，自动跳过已导入的仓库）
+# GitHub Trending 日报：抓取 /trending → 豆包 AI 中文摘要 → 写入飞书 Wiki
+# 默认模式（credentials.json 里 github.trending.enabled=true 时）：
+#   - 按日期生成一页「GitHub Trending 日报 YYYY-MM-DD」，放在 github专区 子节点下
+#   - 当日已存在则跳过（加 --force 强刷）
 python main.py import-github
 
-# 强制重新导入所有仓库（忽略去重索引）
+# 强刷（忽略当日去重）
 python main.py import-github --force
 
 # 查看邮件
