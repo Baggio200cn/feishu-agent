@@ -245,7 +245,16 @@ class FeishuDocWriter:
                 )
                 resp = self._client.docx.v1.document_block_children.create(req)
                 if not resp.success():
-                    logger.warning(f"写入内容块失败 (batch {i//batch_size}): {resp.code} {resp.msg}")
+                    # 打印完整响应体，便于诊断 invalid param 到底嫌弃哪个字段
+                    raw_body = ""
+                    try:
+                        raw_body = resp.raw.content.decode("utf-8", errors="replace")[:800]
+                    except Exception:
+                        pass
+                    logger.warning(
+                        f"写入内容块失败 (batch {i//batch_size}): "
+                        f"{resp.code} {resp.msg} · body={raw_body}"
+                    )
         except Exception as e:
             logger.warning(f"写入文档内容异常: {e}")
 
