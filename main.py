@@ -8,6 +8,8 @@
   python main.py manage messages   # IM 消息管理
   python main.py manage calendar   # 日历管理
   python main.py manage contacts   # 联系人管理
+  python main.py schedule          # 启动定时任务调度器（守护进程）
+  python main.py schedule-status   # 查询调度器状态（输出 JSON）
 """
 import argparse
 import json
@@ -15,6 +17,7 @@ import logging
 import os
 import sys
 
+os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -212,6 +215,32 @@ def _manage_contacts(client, args):
         print(f"  {c.get('name', '')} — {c.get('email', '')} {c.get('job_title', '')}")
 
 
+def cmd_schedule(args):
+    """启动定时任务调度器（前台守护进程）"""
+    from src.scheduler import FeishuScheduler, default_schedule_config
+
+    try:
+        creds = config_loader.load_credentials()
+    except FileNotFoundError:
+        creds = {}
+
+    schedule_cfg = creds.get("schedule", {})
+    jobs_config = schedule_cfg.get("jobs", default_schedule_config())
+    if not jobs_config:
+        logger.warning("调度器任务列表为空，使用内置默认配置")
+        jobs_config = default_schedule_config()
+
+    scheduler = FeishuScheduler(jobs_config)
+    scheduler.start()
+
+
+def cmd_schedule_status(args):
+    """输出调度器当前状态 JSON（供 UI 调用）"""
+    from src.scheduler import read_scheduler_state
+    state = read_scheduler_state()
+    print(json.dumps(state, ensure_ascii=False, indent=2))
+
+
 def main():
     os.makedirs("logs", exist_ok=True)
     parser = argparse.ArgumentParser(description="飞书智能管理 Agent")
@@ -230,6 +259,10 @@ def main():
     p_manage.add_argument("--chat-id", dest="chat_id", help="IM 群聊 ID（管理消息时必填）")
     p_manage.add_argument("--query", help="搜索关键词（管理联系人时可用）")
 
+    # schedule 子命令（守护进程）
+    subparsers.add_parser("schedule", help="启动定时任务调度器")
+    subparsers.add_parser("schedule-status", help="查询调度器状态（输出 JSON）")
+
     args = parser.parse_args()
 
     if args.command == "organize":
@@ -238,6 +271,10 @@ def main():
         cmd_import_github(args)
     elif args.command == "manage":
         cmd_manage(args)
+    elif args.command == "schedule":
+        cmd_schedule(args)
+    elif args.command == "schedule-status":
+        cmd_schedule_status(args)
     else:
         parser.print_help()
 

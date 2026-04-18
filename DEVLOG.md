@@ -301,11 +301,188 @@ e119a37 feat: add Electron desktop UI with HD text rendering
 | 项 | 状态 | 备注 |
 |---|-----|-----|
 | 对话助手（`open-chat`） | 占位 | 需接入豆包或 Claude，支持检索 Wiki、调用 Agent |
-| Reddit AI 日报模块 | 占位 | 需新增 `python main.py import-reddit` 子命令 |
+| Reddit AI 日报模块 | 占位 | 需新增 `python main.py import-reddit` 子命令（步骤 B） |
 | GitHub 日志查看 | 占位 | 需把 `logs/feishu_agent.log` 尾部推给渲染进程 |
-| 调度器（toggle-scheduler） | 仅 UI | 实际调度需接 `schedule` / `APScheduler` |
-| 状态实时刷新 | 未启用 | 主进程可通过 `win.webContents.send('state-update', …)` 推送 |
+| ~~调度器（toggle-scheduler）~~ | ✅ 已完成 | 见下方"步骤 C" |
+| ~~状态实时刷新~~ | ✅ 已完成 | 主进程每 15s 读 state 文件并推 `state-update` 事件 |
 | 打包为 .exe | 未实施 | `electron-builder` 一键构建，免去用户装 Node 的成本 |
+
+---
+
+## 九、步骤 C：调度器（2026-04-18）
+
+### 背景
+
+用户在第一版 UI 上线后核查发现：界面所有"已完成 / 抓取 32 项 / 运行中"等状态都是
+HTML 写死的占位文本，不是真实数据。本轮目标是把"每日定时任务"开关变成**真的能拉起后台
+守护进程**的功能。
+
+### 设计
+
+```
+┌──────────┐  toggle  ┌──────────┐  spawn detached  ┌──────────────┐
+│   UI     │ ───────→ │ Electron │ ───────────────→ │ python main  │
+│          │          │  主进程   │                  │  .py schedule│
+│          │ ←─────── │          │ ←── poll 15s ────│ (APScheduler)│
+└──────────┘  state   └──────────┘  state.json      └──────────────┘
+                                                           │ writes
+                                                           ▼
+                                              logs/scheduler_state.json
+                                              logs/scheduler.pid
+```
+
+**关键决定**：调度器是**独立的 Python 守护进程**，用 `spawn(... detached: true)` +
+`proc.unref()` 启动，关闭 Electron 窗口后调度器仍然运行。这符合"每日定时"的语义 ——
+用户不可能 24 小时挂着 UI。
+
+### 文件清单
+
+| 文件 | 作用 |
+|------|------|
+| `requirements.txt` | 新增 `APScheduler>=3.10.0` |
+| `src/scheduler.py` | `FeishuScheduler` 类（新建） |
+| `main.py` | 新增 `schedule` / `schedule-status` 子命令 |
+| `config/credentials.json.example` | 新增 `schedule.jobs` 配置块 |
+| `ui/main.js` | 新增 `startScheduler` / `stopScheduler` / `pidAlive` / `buildUiState` / `pushState` |
+| `ui/index.html` | 移除 mock 数据，改为"未执行 / 待开发"等真实初始状态 |
+
+### `FeishuScheduler` 核心实现
+
+```python
+class FeishuScheduler:
+    def __init__(self, jobs_config):
+        self.scheduler = BlockingScheduler(timezone="Asia/Shanghai")
+        self.state = {"running": False, "pid": os.getpid(),
+                      "last_runs": {}, "next_runs": {}, "jobs": []}
+
+    def add_jobs(self):
+        for job in self.jobs_config:
+            handler = self._get_handler(job["type"])  # github / reddit / organize
+            self.scheduler.add_job(
+                handler,
+                CronTrigger(hour=job["hour"], minute=job["minute"], timezone="Asia/Shanghai"),
+                id=job["type"], coalesce=True, misfire_grace_time=300,
+            )
+
+    def start(self):
+        self.add_jobs()
+        self._write_pid()
+        self._save_state()
+        # 监听 SCHEDULER_STARTED / JOB_EXECUTED 事件，每次重写状态文件
+        self.scheduler.add_listener(
+            lambda _e: self._save_state(),
+            EVENT_SCHEDULER_STARTED | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR,
+        )
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+        self.scheduler.start()  # blocks
+```
+
+### 踩坑记录
+
+#### 坑 1：`logs/` 目录不存在导致 logging FileHandler 崩溃
+
+`main.py` 顶部用 `logging.basicConfig(handlers=[FileHandler("logs/feishu_agent.log")])`
+配置日志，但 `os.makedirs("logs")` 写在 `main()` 函数内，**模块加载时就崩**。
+
+**修复**：把 `os.makedirs("logs", exist_ok=True)` 提到 module-level，在
+`logging.basicConfig` 之前。
+
+```python
+import logging
+import os
+
+os.makedirs("logs", exist_ok=True)   # ← 关键：必须在 basicConfig 之前
+logging.basicConfig(...)
+```
+
+#### 坑 2：APScheduler 3.11 的 `Job.next_run_time` 在 start 之前不存在
+
+启动顺序：
+```
+add_jobs()       → job 处于 "tentative" 状态，没有 next_run_time 属性
+_save_state()    → AttributeError: 'Job' object has no attribute 'next_run_time'
+scheduler.start()→ 此时才真正排期，job 才有 next_run_time
+```
+
+**修复**：
+- `getattr(job, "next_run_time", None)` 防御性访问
+- 注册 `EVENT_SCHEDULER_STARTED` 监听器，启动后再写一次状态，把 `next_runs` 持久化
+
+#### 坑 3：跨平台 PID 检查
+
+Node 端用 `process.kill(pid, 0)` 判断进程存活，Python 端用同样思路。但 Windows
+没有 POSIX 信号 0 的概念，用 `OpenProcess` + `GetExitCodeProcess` 替代：
+
+```python
+def _pid_alive(pid):
+    if sys.platform == "win32":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle: return False
+        exit_code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return exit_code.value == 259  # STILL_ACTIVE
+    else:
+        try: os.kill(pid, 0); return True
+        except (ProcessLookupError, PermissionError): return False
+```
+
+#### 坑 4：Windows 上 SIGTERM 信号处理不生效
+
+`process.kill(pid, 'SIGTERM')` 在 Node Windows 实现会调 `TerminateProcess`，
+绕过 Python 的 `signal.SIGTERM` handler，状态文件来不及更新。
+
+**修复**：UI 端 `stopScheduler` 在 Windows 上改用 `taskkill /PID <pid> /T /F`，
+同时主动删 `PID_FILE`，UI 通过 PID 存活检查反推真实状态，不强依赖 state 文件
+是否被进程亲自更新。
+
+### UI 改动
+
+去除界面所有 mock 文案：
+
+| 改动前（假数据） | 改动后（真实状态） |
+|----------------|-------------------|
+| GitHub: "就绪 · 昨天 09:00 · 抓取 32 项" | "未执行 · 配置好凭证后由调度器自动执行" |
+| Reddit: "完成 · 刚刚执行 · 抓取 47 条" | "待开发 · 模块尚未实现（步骤 B）" |
+| Wiki: "个人 142 篇 · 企业 38 篇 · 待整理 23 篇" | "个人 — 篇 · 企业 — 篇 · 待整理 — 篇" |
+| 调度: "运行中"（绿色开关默认 ON） | "已停止"（开关默认 OFF） |
+| 连接: "已连接 · 上次同步 14:23" | "本地模式 · 配置凭证后联通飞书" |
+| `F` 蓝方块 | 圆形 `icon.png` 头像 |
+
+调度卡片下方动态显示：`运行中 · PID xxxx · 已注册 N 个任务`。
+
+### 验证流程
+
+```bash
+# 1. 装依赖
+pip install -r requirements.txt
+
+# 2. 验证调度器能启动并写状态文件
+timeout 4 python main.py schedule
+cat logs/scheduler_state.json
+# 期望看到 next_runs 里有 organize / github 的下一次触发时间
+
+# 3. 通过 schedule-status 子命令读状态
+python main.py schedule-status
+
+# 4. UI 端验证：双击 start-ui.bat → 切换"每日定时任务"开关
+#    ON  → 后台多出一个 python main.py schedule 进程，UI 显示 PID
+#    OFF → 进程消失，UI 显示"已停止"
+```
+
+### 未完成项
+
+- 任务运行进度尚未实时推到 UI（每 15s 拉一次状态足够看，但不够"实时"）
+- 调度器开机自启动（建议用 Windows 任务计划程序触发 start-ui.bat 或单独写一个无 UI 启动器）
+- 任务失败重试策略（目前 `coalesce=True`，错过窗口会合并执行；失败仅记 error 状态）
+
+下一步：步骤 A —— 让 GitHub 抓取真跑通（凭证配置、限频、错误重试）。
+
+---
+
+*步骤 C 日志生成：2026-04-18*
 
 ---
 

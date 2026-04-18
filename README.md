@@ -72,7 +72,35 @@ python main.py manage contacts --query 张三
 
 # 查看群聊消息
 python main.py manage messages --chat-id oc_xxxxxx
+
+# 启动定时任务调度器（每天 09:00 抓 GitHub、23:00 整理 Wiki，可在 credentials.json 调整）
+python main.py schedule
+
+# 查询调度器当前状态（输出 JSON，UI 内部使用）
+python main.py schedule-status
 ```
+
+#### 定时任务
+
+调度器配置在 `config/credentials.json` 的 `schedule.jobs` 数组里：
+
+```json
+"schedule": {
+  "jobs": [
+    {"type": "github",   "hour": 9,  "minute": 0, "enabled": true},
+    {"type": "reddit",   "hour": 9,  "minute": 5, "enabled": false},
+    {"type": "organize", "hour": 23, "minute": 0, "enabled": true}
+  ]
+}
+```
+
+- `type`：任务类型，目前支持 `github` / `reddit` / `organize`
+- `hour` / `minute`：cron 触发时间（Asia/Shanghai 时区）
+- `enabled`：是否启用
+- 任务运行状态写入 `logs/scheduler_state.json`，UI 通过该文件展示
+- 调度器进程 PID 写入 `logs/scheduler.pid`
+
+桌面界面右下角的"每日定时任务"开关会调用 `python main.py schedule` 启动后台守护进程，关闭时通过 PID 信号终止。守护进程独立于 Electron，关闭 UI 不会停止调度。
 
 ---
 

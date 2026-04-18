@@ -305,8 +305,8 @@ button.flex { flex: 1; }
 
   <div class="conn-bar">
     <div class="conn-bar-left">
-      <span class="dot" id="conn-dot"></span>
-      <span id="conn-text">已连接 · 上次同步 14:23</span>
+      <span class="dot offline" id="conn-dot"></span>
+      <span id="conn-text">本地模式 · 配置凭证后联通飞书</span>
     </div>
     <div class="conn-bar-right" id="conn-accounts">个人 + 企业账号</div>
   </div>
@@ -335,14 +335,14 @@ button.flex { flex: 1; }
       <div class="card-compact">
         <div class="card-compact-header">
           <span class="card-compact-title">GitHub Trending</span>
-          <span class="badge success" id="github-status">就绪</span>
+          <span class="badge idle" id="github-status">未执行</span>
         </div>
         <div class="card-compact-meta" id="github-meta">
-          上次执行 · 昨天 09:00<br>
-          抓取 32 项 · 写入 Wiki
+          尚未执行<br>
+          配置好凭证后由调度器自动执行
         </div>
         <div class="btn-row">
-          <button class="small flex" onclick="callAction('run-github')">执行</button>
+          <button class="small flex" onclick="callAction('run-github')">立即执行</button>
           <button class="small" onclick="callAction('view-github-log')">日志</button>
         </div>
       </div>
@@ -350,14 +350,14 @@ button.flex { flex: 1; }
       <div class="card-compact">
         <div class="card-compact-header">
           <span class="card-compact-title">Reddit AI 日报</span>
-          <span class="badge success" id="reddit-status">完成</span>
+          <span class="badge warning" id="reddit-status">待开发</span>
         </div>
         <div class="card-compact-meta" id="reddit-meta">
-          刚刚执行 · 2 小时前<br>
-          抓取 47 条 · 6 个子版块
+          模块尚未实现（步骤 B）<br>
+          调度器会调用，但目前仅记录日志
         </div>
         <div class="btn-row">
-          <button class="small flex" onclick="callAction('run-reddit')">重新执行</button>
+          <button class="small flex" onclick="callAction('run-reddit')">立即执行</button>
           <button class="small" onclick="callAction('view-reddit-result')">查看</button>
         </div>
       </div>
@@ -375,11 +375,11 @@ button.flex { flex: 1; }
         <span style="font-size: 11px; color: var(--text-tertiary);" id="wiki-categories">7 个分类</span>
       </div>
       <div class="stats-strip">
-        <span id="wiki-personal">个人 142 篇</span>
+        <span id="wiki-personal">个人 — 篇</span>
         <span class="sep">·</span>
-        <span id="wiki-enterprise">企业 38 篇</span>
+        <span id="wiki-enterprise">企业 — 篇</span>
         <span class="sep">·</span>
-        <span id="wiki-pending">待整理 23 篇</span>
+        <span id="wiki-pending">待整理 — 篇</span>
       </div>
       <div class="btn-row">
         <button class="flex" onclick="callAction('preview-wiki')">预览分类结果</button>
@@ -394,11 +394,11 @@ button.flex { flex: 1; }
       <div class="card-row">
         <div>
           <div class="card-title" style="font-size: 13px;">每日定时任务</div>
-          <div class="card-desc" style="font-size: 11px;" id="schedule-desc">每天 09:00 · GitHub + Reddit + Wiki 整理</div>
+          <div class="card-desc" style="font-size: 11px;" id="schedule-desc">已停止 · 点击右侧开关启动</div>
         </div>
         <label class="toggle">
-          <span class="toggle-label on" id="schedule-label">运行中</span>
-          <input type="checkbox" id="schedule-toggle" checked>
+          <span class="toggle-label off" id="schedule-label">已停止</span>
+          <input type="checkbox" id="schedule-toggle">
           <span class="toggle-track">
             <span class="toggle-thumb"></span>
           </span>
