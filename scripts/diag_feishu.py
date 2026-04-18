@@ -28,14 +28,8 @@ def main():
     factory = FeishuClientFactory(creds["accounts"])
     client = factory.get_client("personal")
 
-    # 测试 1: 能不能拿到 tenant token（鉴权层）
-    print("[测试 1] 获取 tenant_access_token")
-    try:
-        token = client._config.tenant_access_token
-        print(f"  ✓ Client 已初始化（token 会延迟到第一次 API 调用时获取）")
-    except Exception as e:
-        print(f"  ✗ Client 初始化失败: {e}")
-        return
+    print("[测试 1] Client 初始化")
+    print(f"  ✓ Client 已初始化（token 在第一次 API 调用时自动获取）")
     print()
 
     # 测试 2: 列出应用能访问的所有 Wiki 空间（最基础的只读调用）
