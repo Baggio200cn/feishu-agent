@@ -143,6 +143,27 @@ def _write_run_stats(stats: Dict[str, Any]) -> None:
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
 
+def _load_trending_cache(path: str) -> List[Dict[str, Any]]:
+    """读取当日 trending 缓存（已摘要成功的仓库 + 失败占位），供续跑"""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_trending_cache(path: str, items: List[Dict[str, Any]]) -> None:
+    """增量保存 trending 缓存"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        logger.warning(f"保存 trending 缓存失败: {e}")
+
+
 def cmd_import_github(args):
     """
     GitHub Trending 日报：从 /trending 抓热门仓库 → 豆包 AI 中文摘要 →
@@ -265,10 +286,24 @@ def _run_trending_pipeline(
         run_stats["message"] = msg
         return
 
-    # 2. 对每个仓库：抓 README + 豆包摘要
-    items_with_summary: List[Dict[str, Any]] = []
+    # 2. 对每个仓库：抓 README + 豆包摘要，每次增量持久化到缓存文件
+    cache_path = f"logs/trending_cache_{date_str}.json"
+    items_with_summary: List[Dict[str, Any]] = _load_trending_cache(cache_path)
+    if items_with_summary and not force:
+        # 续跑：从缓存里恢复已摘要成功的仓库
+        done_names = {
+            it["repo"].get("full_name") for it in items_with_summary if it.get("summary_ok")
+        }
+        logger.info(f"从缓存恢复 {len(done_names)} 个已摘要仓库: {cache_path}")
+    else:
+        items_with_summary = []
+        done_names = set()
+
     for i, meta in enumerate(repos_meta, 1):
         full_name = meta.get("full_name", "")
+        if full_name in done_names:
+            logger.info(f"[{i}/{len(repos_meta)}] 跳过（缓存已有）: {full_name}")
+            continue
         logger.info(f"[{i}/{len(repos_meta)}] 处理 {full_name}")
 
         # 2a. 抓 README（复用 GitHubImporter）
@@ -284,16 +319,23 @@ def _run_trending_pipeline(
             stars_today=meta.get("stars_today", 0),
             readme=readme,
         )
-        if summary:
-            run_stats["summarized"] += 1
-        else:
-            run_stats["ai_failed"] += 1
+        summary_ok = summary is not None
+        if not summary:
             summary = {
                 "one_liner": meta.get("description", "") or "（AI 摘要失败）",
                 "detail": "AI 摘要失败，请查看原仓库 README。",
             }
 
-        items_with_summary.append({"repo": meta, "summary": summary})
+        items_with_summary.append({
+            "repo": meta,
+            "summary": summary,
+            "summary_ok": summary_ok,
+        })
+        # 增量保存
+        _save_trending_cache(cache_path, items_with_summary)
+
+    run_stats["summarized"] = sum(1 for it in items_with_summary if it.get("summary_ok"))
+    run_stats["ai_failed"] = len(items_with_summary) - run_stats["summarized"]
 
     # 3. 写飞书日报
     url = writer.write_daily_trending_report(

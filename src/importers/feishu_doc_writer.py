@@ -259,12 +259,17 @@ class FeishuDocWriter:
 
         - parent_node_token=None 时在空间根下查找
         - 遍历最多 5 页（250 个节点）
+        - 匹配规则：先精确匹配，再大小写 + 前后空格容错匹配
         """
         try:
             from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
         except ImportError as e:
             logger.warning(f"lark-oapi 缺少 ListSpaceNodeRequest: {e}")
             return None
+
+        target_normalized = (title or "").strip().lower()
+        exact_hit = None
+        fuzzy_hit = None
 
         page_token = None
         for _ in range(5):
@@ -279,13 +284,25 @@ class FeishuDocWriter:
                 return None
             items = getattr(resp.data, "items", None) or []
             for item in items:
-                if getattr(item, "title", None) == title:
-                    return item.node_token
+                item_title = getattr(item, "title", None) or ""
+                if item_title == title:
+                    exact_hit = item.node_token
+                    break
+                if item_title.strip().lower() == target_normalized and not fuzzy_hit:
+                    fuzzy_hit = (item.node_token, item_title)
+            if exact_hit:
+                break
             if not getattr(resp.data, "has_more", False):
                 break
             page_token = getattr(resp.data, "page_token", None)
             if not page_token:
                 break
+
+        if exact_hit:
+            return exact_hit
+        if fuzzy_hit:
+            logger.info(f"按'{title}'模糊匹配到节点: '{fuzzy_hit[1]}'")
+            return fuzzy_hit[0]
         return None
 
     def write_daily_trending_report(

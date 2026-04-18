@@ -68,7 +68,9 @@ class AISummarizer:
         stars_total: int,
         stars_today: int,
         readme: str,
-        readme_max_chars: int = 12000,
+        readme_max_chars: int = 8000,
+        timeout: int = 180,
+        retries: int = 1,
     ) -> Optional[Dict[str, str]]:
         """
         生成一个仓库的中文摘要。
@@ -104,43 +106,59 @@ class AISummarizer:
             "Content-Type": "application/json",
         }
 
-        try:
-            resp = self.session.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=90,
-            )
-        except requests.RequestException as e:
-            logger.warning(f"[AI] 请求异常 [{full_name}]: {e}")
-            return None
+        last_error = None
+        for attempt in range(retries + 1):
+            try:
+                resp = self.session.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout,
+                )
+            except requests.Timeout as e:
+                last_error = f"timeout {timeout}s"
+                logger.warning(
+                    f"[AI] 超时（第 {attempt + 1}/{retries + 1} 次）[{full_name}]: {e}"
+                )
+                continue
+            except requests.RequestException as e:
+                last_error = str(e)
+                logger.warning(f"[AI] 请求异常 [{full_name}]: {e}")
+                continue
 
-        if resp.status_code != 200:
-            logger.warning(
-                f"[AI] 摘要失败 [{full_name}]: HTTP {resp.status_code} {resp.text[:300]}"
-            )
-            return None
+            if resp.status_code != 200:
+                last_error = f"HTTP {resp.status_code}"
+                logger.warning(
+                    f"[AI] 摘要失败 [{full_name}]: HTTP {resp.status_code} {resp.text[:300]}"
+                )
+                continue
 
-        try:
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, ValueError) as e:
-            logger.warning(f"[AI] 响应结构异常 [{full_name}]: {e}")
-            return None
+            try:
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, ValueError) as e:
+                last_error = str(e)
+                logger.warning(f"[AI] 响应结构异常 [{full_name}]: {e}")
+                continue
 
-        parsed = self._parse_json(content)
-        if not parsed:
-            logger.warning(f"[AI] 返回内容不是合法 JSON [{full_name}]: {content[:200]}")
-            return None
+            parsed = self._parse_json(content)
+            if not parsed:
+                last_error = "JSON parse failed"
+                logger.warning(f"[AI] 返回内容不是合法 JSON [{full_name}]: {content[:200]}")
+                continue
 
-        one_liner = (parsed.get("one_liner") or "").strip()
-        detail = (parsed.get("detail") or "").strip()
-        if not one_liner or not detail:
-            logger.warning(f"[AI] 字段缺失 [{full_name}]: {parsed}")
-            return None
+            one_liner = (parsed.get("one_liner") or "").strip()
+            detail = (parsed.get("detail") or "").strip()
+            if not one_liner or not detail:
+                last_error = "missing fields"
+                logger.warning(f"[AI] 字段缺失 [{full_name}]: {parsed}")
+                continue
 
-        logger.info(f"[AI] 摘要完成 [{full_name}]: detail 长度 {len(detail)} 字")
-        return {"one_liner": one_liner, "detail": detail}
+            logger.info(f"[AI] 摘要完成 [{full_name}]: detail 长度 {len(detail)} 字")
+            return {"one_liner": one_liner, "detail": detail}
+
+        logger.warning(f"[AI] 最终失败 [{full_name}]: {last_error}")
+        return None
 
     @staticmethod
     def _parse_json(text: str) -> Optional[Dict]:
