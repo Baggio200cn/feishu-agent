@@ -253,23 +253,10 @@ def _run_trending_pipeline(
         run_stats["message"] = msg
         return
 
-    # 检查今日日报是否已存在（除非 --force）
     date_str = _dt.now().strftime("%Y-%m-%d")
     parent_folder = github_cfg.get("parent_folder", "github专区")
-    if not force:
-        parent_token = writer.find_node_by_title(parent_folder)
-        if parent_token:
-            existing = writer.find_node_by_title(
-                f"GitHub Trending 日报 {date_str}", parent_node_token=parent_token
-            )
-            if existing:
-                url = f"https://open.feishu.cn/wiki/{existing}"
-                msg = f"今日日报已存在，跳过（加 --force 可强刷）: {url}"
-                logger.info(msg)
-                run_stats["status"] = "skipped"
-                run_stats["wiki_url"] = url
-                run_stats["message"] = msg
-                return
+    # 不再做文件夹级早退：write_daily_trending_report 会做 per-page 去重，
+    # 已存在的子页面自动跳过，失败的子页面下次会补建
 
     # 1. 抓 Trending
     trending = GitHubTrending()
@@ -337,24 +324,40 @@ def _run_trending_pipeline(
     run_stats["summarized"] = sum(1 for it in items_with_summary if it.get("summary_ok"))
     run_stats["ai_failed"] = len(items_with_summary) - run_stats["summarized"]
 
-    # 3. 写飞书日报
-    url = writer.write_daily_trending_report(
+    # 3. 写飞书日报：文件夹 + N 个独立子页
+    result = writer.write_daily_trending_report(
         items_with_summary=items_with_summary,
         parent_folder_title=parent_folder,
         date_str=date_str,
     )
 
-    if url:
-        run_stats["wiki_url"] = url
-        run_stats["status"] = (
-            "success" if run_stats["ai_failed"] == 0 else "partial"
-        )
+    if result:
+        run_stats["wiki_url"] = result["folder_url"]
+        run_stats["wiki_folder_token"] = result["folder_token"]
+        run_stats["pages_created"] = result["created_count"]
+        run_stats["pages_skipped"] = result["skipped_count"]
+        run_stats["repo_pages"] = result["repo_pages"]
+
+        status_parts = []
+        if run_stats["ai_failed"] == 0 and result["created_count"] + result["skipped_count"] == len(items_with_summary):
+            run_stats["status"] = "success"
+        else:
+            run_stats["status"] = "partial"
+
         run_stats["message"] = (
-            f"抓取 {run_stats['fetched']} 个 · 摘要成功 {run_stats['summarized']}"
-            f" · AI 失败 {run_stats['ai_failed']}"
+            f"抓取 {run_stats['fetched']} · 摘要 {run_stats['summarized']}"
+            f" · AI失败 {run_stats['ai_failed']}"
+            f" · 新建页 {result['created_count']}"
+            f" · 跳过 {result['skipped_count']}"
         )
-        print(f"\n✅ GitHub Trending 日报已写入: {url}")
+        print(f"\n✅ 日报文件夹: {result['folder_url']}")
         print(f"   {run_stats['message']}")
+        print(f"\n子页面:")
+        for p in result["repo_pages"]:
+            marker = "🆕" if p["created"] else "  "
+            print(f"   {marker} {p['title']}")
+            if p["url"]:
+                print(f"        {p['url']}")
     else:
         run_stats["message"] = "日报写入失败，可能父节点不存在或 Wiki 权限问题"
         logger.error(run_stats["message"])

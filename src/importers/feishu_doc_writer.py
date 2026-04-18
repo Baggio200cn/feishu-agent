@@ -310,24 +310,32 @@ class FeishuDocWriter:
         items_with_summary: List[Dict[str, Any]],
         parent_folder_title: str = "github专区",
         date_str: Optional[str] = None,
-    ) -> Optional[str]:
+    ) -> Optional[Dict[str, Any]]:
         """
-        在 Wiki 空间的 parent_folder_title 父节点下创建一份"GitHub Trending 日报 YYYY-MM-DD"。
+        在 parent_folder_title 父节点下创建一个当日"文件夹"节点，
+        然后在该文件夹下为每个仓库创建一个独立页面。
 
         Args:
-            items_with_summary: [{"repo": {...trending 元数据...}, "summary": {one_liner, detail}}, ...]
+            items_with_summary: [{"repo": {...}, "summary": {one_liner, detail}}, ...]
             parent_folder_title: 父节点标题，默认 "github专区"
-            date_str: 日期字符串，默认为今天（YYYY-MM-DD）
+            date_str: 日期，默认为今天（YYYY-MM-DD）
 
         Returns:
-            成功返回 Wiki 页 URL；跳过（今日已存在）或失败返回 None。
+            {
+                "folder_url": str,         # 日报文件夹 URL
+                "folder_token": str,
+                "repo_pages": [{"title": str, "url": str, "created": bool}, ...],
+                "created_count": int,
+                "skipped_count": int,
+            }
+            失败返回 None。
         """
         if not items_with_summary:
             logger.warning("日报内容为空，跳过")
             return None
 
         date_str = date_str or datetime.now().strftime("%Y-%m-%d")
-        title = f"GitHub Trending 日报 {date_str}"
+        folder_title = f"GitHub Trending 日报 {date_str}"
 
         parent_token = self.find_node_by_title(parent_folder_title)
         if not parent_token:
@@ -336,16 +344,85 @@ class FeishuDocWriter:
             )
             return None
 
-        # 去重：今日日报已存在则跳过
-        existing = self.find_node_by_title(title, parent_node_token=parent_token)
-        if existing:
-            logger.info(f"今日日报已存在，跳过创建: {title} → {existing}")
-            return f"https://open.feishu.cn/wiki/{existing}"
+        # 找/建 当日日报文件夹
+        folder_token = self.find_node_by_title(folder_title, parent_node_token=parent_token)
+        folder_created = False
+        if folder_token:
+            logger.info(f"当日文件夹已存在，续跑: {folder_title} (token={folder_token})")
+        else:
+            folder_token, _ = self._create_wiki_node(
+                title=folder_title,
+                parent_node_token=parent_token,
+                blocks=self._build_folder_cover_blocks(items_with_summary, date_str),
+            )
+            if not folder_token:
+                logger.error(f"创建日报文件夹失败: {folder_title}")
+                return None
+            folder_created = True
+            logger.info(f"✅ 日报文件夹已创建: {folder_title}")
 
-        # 构建 blocks
-        blocks = self._build_daily_report_blocks(items_with_summary, date_str)
+        # 逐个仓库创建子页面（已存在则跳过）
+        repo_pages: List[Dict[str, Any]] = []
+        created_count = 0
+        skipped_count = 0
 
-        # 创建节点
+        for idx, item in enumerate(items_with_summary, 1):
+            repo = item.get("repo", {})
+            summary = item.get("summary") or {}
+            full_name = repo.get("full_name", f"unknown-{idx}")
+            page_title = f"{idx}. {full_name}"
+
+            # 去重：子节点中按标题查
+            existing = self.find_node_by_title(page_title, parent_node_token=folder_token)
+            if existing:
+                logger.info(f"  [{idx}/{len(items_with_summary)}] 跳过（已存在）: {page_title}")
+                repo_pages.append({
+                    "title": page_title,
+                    "url": f"https://open.feishu.cn/wiki/{existing}",
+                    "created": False,
+                })
+                skipped_count += 1
+                continue
+
+            child_token, _ = self._create_wiki_node(
+                title=page_title,
+                parent_node_token=folder_token,
+                blocks=self._build_single_repo_blocks(repo, summary),
+            )
+            if child_token:
+                repo_pages.append({
+                    "title": page_title,
+                    "url": f"https://open.feishu.cn/wiki/{child_token}",
+                    "created": True,
+                })
+                created_count += 1
+                logger.info(f"  [{idx}/{len(items_with_summary)}] 已创建: {page_title}")
+            else:
+                repo_pages.append({
+                    "title": page_title,
+                    "url": "",
+                    "created": False,
+                })
+                logger.warning(f"  [{idx}/{len(items_with_summary)}] 创建失败: {page_title}")
+
+        folder_url = f"https://open.feishu.cn/wiki/{folder_token}"
+        logger.info(
+            f"日报完成: 文件夹 {'新建' if folder_created else '续跑'} · "
+            f"新建 {created_count} 页 · 跳过 {skipped_count} 页"
+        )
+
+        return {
+            "folder_url": folder_url,
+            "folder_token": folder_token,
+            "repo_pages": repo_pages,
+            "created_count": created_count,
+            "skipped_count": skipped_count,
+        }
+
+    def _create_wiki_node(
+        self, title: str, parent_node_token: str, blocks: Optional[List[Dict]] = None
+    ) -> tuple:
+        """创建一个 Wiki 节点并可选写入内容块。返回 (node_token, obj_token) 或 (None, None)。"""
         try:
             from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, Node
 
@@ -354,7 +431,7 @@ class FeishuDocWriter:
                 .obj_type("docx")
                 .node_type("origin")
                 .title(title)
-                .parent_node_token(parent_token)
+                .parent_node_token(parent_node_token)
                 .build()
             )
             req = (
@@ -365,32 +442,30 @@ class FeishuDocWriter:
             )
             resp = self._client.wiki.v2.space_node.create(req)
             if not resp.success():
-                logger.error(f"创建日报节点失败: {resp.code} {resp.msg}")
-                return None
+                logger.error(f"创建节点 '{title}' 失败: {resp.code} {resp.msg}")
+                return None, None
 
             node_token = resp.data.node.node_token
             obj_token = resp.data.node.obj_token
-            self._populate_blocks(obj_token, blocks)
 
-            url = f"https://open.feishu.cn/wiki/{node_token}"
-            logger.info(f"✅ 日报已创建: {title} → {url}")
-            return url
+            if blocks:
+                self._populate_blocks(obj_token, blocks)
+
+            return node_token, obj_token
         except Exception as e:
-            logger.exception(f"创建日报异常: {e}")
-            return None
+            logger.exception(f"创建节点 '{title}' 异常: {e}")
+            return None, None
 
-    def _build_daily_report_blocks(
+    def _build_folder_cover_blocks(
         self, items_with_summary: List[Dict[str, Any]], date_str: str
     ) -> List[Dict]:
-        """把 Trending + AI 摘要组装成飞书 Block 列表（按截图格式）"""
+        """日报文件夹封面：概述 + 当日 N 个仓库的简短列表"""
         blocks: List[Dict] = []
-
-        # 顶部概述
         blocks.append(self._h1_block(f"GitHub Trending 日报 · {date_str}"))
         blocks.append(
             self._text_block(
-                f"自动抓取 https://github.com/trending 今日热门项目，"
-                f"豆包 AI 生成中文摘要。共 {len(items_with_summary)} 个仓库。"
+                f"自动抓取 https://github.com/trending 今日热门项目（共 {len(items_with_summary)} 个），"
+                f"每个项目详情见下方子页面。"
             )
         )
         blocks.append(self._divider())
@@ -398,38 +473,49 @@ class FeishuDocWriter:
         for idx, item in enumerate(items_with_summary, 1):
             repo = item.get("repo", {})
             summary = item.get("summary") or {}
-
             full_name = repo.get("full_name", "?")
-            url = repo.get("url", "")
-            stars_total = repo.get("stars_total", 0)
+            one_liner = summary.get("one_liner") or repo.get("description") or "（无摘要）"
             stars_today = repo.get("stars_today", 0)
-            language = repo.get("language", "未知")
+            stars_total = repo.get("stars_total", 0)
+            language = repo.get("language", "N/A")
 
-            # Heading 2: "N. owner/repo"
-            blocks.append(self._h2_block(f"{idx}. {full_name}"))
-
-            # 仓库链接
-            blocks.append(self._text_block(f"🔗 仓库链接: {url}"))
-
-            # Stars / 语言
+            blocks.append(self._h3_block(f"{idx}. {full_name}"))
+            blocks.append(self._text_block(f"📌 {one_liner}"))
             blocks.append(
                 self._text_block(
-                    f"⭐ 今日 +{stars_today} stars · 共 {stars_total:,} stars · 语言: {language}"
+                    f"⭐ 今日 +{stars_today} · 共 {stars_total:,} · 语言: {language} · "
+                    f"🔗 {repo.get('url', '')}"
                 )
             )
 
-            # 一句话定位（带 📌 图标）
-            one_liner = summary.get("one_liner") or repo.get("description") or "（无摘要）"
-            blocks.append(self._text_block(f"📌 {one_liner}"))
+        return blocks
 
-            # 详细介绍 H3 + 正文段落
-            blocks.append(self._h3_block("详细介绍"))
-            detail = summary.get("detail") or "（AI 摘要失败，请查看原仓库 README）"
-            # 按空行拆段，每段一个 text block
-            for paragraph in self._split_paragraphs(detail):
-                blocks.append(self._text_block(paragraph))
+    def _build_single_repo_blocks(
+        self, repo: Dict[str, Any], summary: Dict[str, Any]
+    ) -> List[Dict]:
+        """单个仓库独立页面的内容块"""
+        blocks: List[Dict] = []
 
-            blocks.append(self._divider())
+        url = repo.get("url", "")
+        stars_total = repo.get("stars_total", 0)
+        stars_today = repo.get("stars_today", 0)
+        language = repo.get("language", "未知")
+
+        blocks.append(self._text_block(f"🔗 仓库链接: {url}"))
+        blocks.append(
+            self._text_block(
+                f"⭐ 今日 +{stars_today} stars · 共 {stars_total:,} stars · 语言: {language}"
+            )
+        )
+
+        one_liner = summary.get("one_liner") or repo.get("description") or "（无摘要）"
+        blocks.append(self._text_block(f"📌 {one_liner}"))
+        blocks.append(self._divider())
+
+        blocks.append(self._h2_block("详细介绍"))
+        detail = summary.get("detail") or "（AI 摘要失败，请查看原仓库 README）"
+        for paragraph in self._split_paragraphs(detail):
+            blocks.append(self._text_block(paragraph))
 
         return blocks
 
