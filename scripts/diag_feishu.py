@@ -62,9 +62,11 @@ def main():
         if resp.success():
             sp = resp.data.space
             print(f"  ✓ 成功！")
-            print(f"     空间名称: {sp.name}")
-            print(f"     拥有者:   {sp.owner}")
-            print(f"     类型:     {sp.space_type}")
+            print(f"     空间名称: {getattr(sp, 'name', '-')}")
+            # lark-oapi 1.5.3 Space 对象没有 .owner，有 .owner_id
+            owner = getattr(sp, "owner_id", None) or getattr(sp, "owner", "-")
+            print(f"     拥有者:   {owner}")
+            print(f"     类型:     {getattr(sp, 'space_type', '-')}")
         else:
             print(f"  ✗ 失败！code={resp.code}, msg={resp.msg}")
             if "99991672" in str(resp.msg):
