@@ -486,6 +486,154 @@ python main.py schedule-status
 
 ---
 
+## 十、步骤 A：GitHub 抓取真跑通（2026-04-18）
+
+### 背景
+
+步骤 C 把调度器架起来之后，每天 09:00 会触发 `import-github`。但原代码有
+几个问题使得"跑通"这件事很脆弱：
+
+1. **token 是占位值也会硬着头皮跑** —— `ghp_your_...` 的情况下匿名访问 GitHub，
+   每小时只有 60 次请求额度，多跑几个仓库就 403，而代码静默忽略
+2. **没有去重** —— 调度器每天跑一次，会把同样的仓库反复写入飞书 Wiki，
+   几天后 Wiki 里全是重复页面
+3. **限频无感知** —— 没看 `X-RateLimit-Remaining` 头，403 直接吃掉当错误
+4. **UI 看不到任何真实结果** —— 跑完没产出任何让 UI 能读的数据
+
+步骤 A 就解决这四点，**不重写** importer/writer。
+
+### 改动清单
+
+| 文件 | 改动 |
+|------|------|
+| `src/importers/github_importer.py` | 新增 `_request_with_retry()`，解析限频头，403/429 指数退避（最多 3 次，单次 ≤5min 则等待重试，超时直接放弃） |
+| `main.py` | `cmd_import_github` 重写：配置校验、去重索引、增量保存、统计文件、`--force` 开关 |
+| `ui/main.js` | `buildUiState` 增加读取 `logs/github_last_run.json` + `github_imported.json`，把新增/重复/累计数喂给前端 |
+| `README.md` | 新增"GitHub 导入的数据文件"章节 |
+
+### 配置校验
+
+三重前置检查：
+
+```python
+def _validate_github_config(github_cfg, wiki_space_id):
+    token = github_cfg.get("token", "")
+    if not token or token.startswith("ghp_your_"):
+        return "GitHub token 未配置..."
+    if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+        return "飞书 Wiki space_id 未配置..."
+    if not github_cfg.get("repo_list") and not github_cfg.get("search_topics"):
+        return "GitHub 任务列表为空..."
+    return None
+```
+
+返回错误字符串时同步写入 `github_last_run.json`，UI 卡片会显示红色"失败"徽章 +
+具体错误信息，不再让用户猜"为啥点了执行什么都没发生"。
+
+### 去重索引
+
+`logs/github_imported.json`：
+
+```json
+{
+  "openai/whisper": {
+    "wiki_url": "https://open.feishu.cn/wiki/abc123",
+    "imported_at": "2026-04-18T09:00:15"
+  },
+  "...": { ... }
+}
+```
+
+每导入成功一个就**立即**写回索引（不等全部完成），防止中途崩溃导致整批丢失。
+
+### 限频处理
+
+`_request_with_retry` 是所有 GitHub API 调用的统一入口：
+
+```python
+def _request_with_retry(self, method, url, **kwargs):
+    backoff = 2
+    for attempt in range(3):
+        resp = self.session.request(method, url, timeout=15, **kwargs)
+        # 记录 X-RateLimit-* 头
+        self.rate_limit_remaining = int(resp.headers.get("X-RateLimit-Remaining", "-1"))
+        # 403/429 → 等 reset 再试
+        if resp.status_code in (403, 429):
+            wait = (self.rate_limit_reset or 0) - int(time.time())
+            if wait > 300:  # 超过 5 分钟就放弃
+                return resp
+            time.sleep(wait + 1)
+            continue
+        return resp
+```
+
+关键判断：等待时间超过 5 分钟直接放弃，避免把调度器卡住 → 影响其他任务。
+
+### 统计文件 → UI
+
+`logs/github_last_run.json` 格式：
+
+```json
+{
+  "at": "2026-04-18T09:00:00",
+  "status": "success | partial | error",
+  "imported": 5,
+  "skipped_dup": 12,
+  "fetched": 17,
+  "failed": 0,
+  "urls": ["https://open.feishu.cn/wiki/..."],
+  "message": "新增 5 · 跳过重复 12 · 失败 0",
+  "rate_limit_remaining": 4521
+}
+```
+
+`ui/main.js buildUiState()` 读这个文件，按 status 给 badge 上色：
+- `success` → 绿 `成功`
+- `partial` → 黄 `部分完成`
+- `error` → 红 `失败`
+- 文件不存在 → 灰 `未执行`
+
+卡片 meta 文案：`上次 · 04-18 09:00<br>新增 5 · 重复跳过 12 · 累计已导入 17 个<br>下次 · 04-19 09:00`。
+累计数从 `github_imported.json` 的 key 数量拿，完全真实。
+
+### 测试验证
+
+沙箱里用占位凭证跑一次，确认配置校验生效：
+
+```bash
+$ cp config/credentials.json.example config/credentials.json
+$ python3 main.py import-github
+ERROR - GitHub token 未配置（占位值 ghp_your_...）。请在 config/credentials.json 填入真实 token
+
+$ cat logs/github_last_run.json
+{
+  "at": "2026-04-18T10:31:39",
+  "status": "error",
+  "message": "GitHub token 未配置..."
+}
+```
+
+UI 读到这个文件，卡片显示红色"失败"徽章 + 具体原因，用户立即能定位问题。
+
+### 未完成项
+
+- **Wiki 端反向校验** —— 当前用本地索引去重，如果用户手动删了 Wiki 页面但索引还在，
+  会错误跳过。需要定期拿索引里的 `wiki_url` 调飞书 API 核对。
+- **Writer 失败回滚** —— `write_github_repo` 返回 `None` 时（飞书 API 失败），仓库不写入索引，
+  下次会再尝试。但如果 Wiki 页面创建成功但内容块写入失败，会留一个空白页。暂不处理。
+- **Markdown 转换丢失** —— `_markdown_to_blocks` 不支持表格、嵌套列表、图片、内联 HTML，
+  复杂 README 会变形。够用即可，不改。
+
+### 下一步
+
+步骤 B：Reddit AI 日报模块（从零新建）。
+
+---
+
+*步骤 A 日志生成：2026-04-18*
+
+---
+
 ## 八、启动指南（给未来的自己）
 
 **从零启动：**

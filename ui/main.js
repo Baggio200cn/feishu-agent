@@ -7,6 +7,8 @@ const REPO_ROOT = path.join(__dirname, '..');
 const PY_CMD = process.platform === 'win32' ? 'python' : 'python3';
 const STATE_FILE = path.join(REPO_ROOT, 'logs', 'scheduler_state.json');
 const PID_FILE = path.join(REPO_ROOT, 'logs', 'scheduler.pid');
+const GITHUB_LAST_RUN = path.join(REPO_ROOT, 'logs', 'github_last_run.json');
+const GITHUB_INDEX = path.join(REPO_ROOT, 'logs', 'github_imported.json');
 
 let mainWindow;
 let stateWatchTimer = null;
@@ -129,35 +131,55 @@ function stopScheduler() {
   return { ok: true, message: '调度器已停止' };
 }
 
+function readJsonFile(file, fallback) {
+  if (!fs.existsSync(file)) return fallback;
+  try { return JSON.parse(fs.readFileSync(file, 'utf-8')); }
+  catch { return fallback; }
+}
+
+function fmtTime(iso) {
+  if (!iso) return '-';
+  return iso.replace('T', ' ').slice(0, 16);
+}
+
 function buildUiState() {
   const sched = readSchedulerState();
-  const meta = {};
-  for (const [job, info] of Object.entries(sched.last_runs || {})) {
-    meta[job] = info;
-  }
   const nextRuns = sched.next_runs || {};
 
-  const fmtMeta = (jobKey, defaultLabel) => {
-    const last = meta[jobKey];
-    const next = nextRuns[jobKey];
-    if (!last && !next) return `尚未执行<br>${defaultLabel}`;
-    const lastLine = last
-      ? `上次 · ${last.at || '-'}（${last.status}）`
-      : '尚未执行';
-    const nextLine = next ? `下次 · ${next.replace('T', ' ').slice(0, 16)}` : '未排期';
-    return `${lastLine}<br>${nextLine}`;
-  };
+  // GitHub: 优先读 github_last_run.json（真实运行数据），辅以调度器 next_run
+  const githubLast = readJsonFile(GITHUB_LAST_RUN, null);
+  const githubIndex = readJsonFile(GITHUB_INDEX, {});
+  const totalImported = Object.keys(githubIndex).length;
 
-  const statusLabel = (jobKey, fallback) => {
-    const last = meta[jobKey];
-    if (!last) return { label: fallback, type: 'idle' };
-    if (last.status === 'success') return { label: '成功', type: 'success' };
-    if (last.status === 'pending') return { label: '待开发', type: 'warning' };
-    return { label: '失败', type: 'danger' };
-  };
+  let githubMeta;
+  let githubStatus;
+  if (githubLast) {
+    const atLine = `上次 · ${fmtTime(githubLast.at)}`;
+    const countLine =
+      githubLast.status === 'error'
+        ? `失败：${githubLast.message || '未知错误'}`
+        : `新增 ${githubLast.imported} · 重复跳过 ${githubLast.skipped_dup} · 累计已导入 ${totalImported} 个`;
+    const nextLine = nextRuns.github ? `下次 · ${fmtTime(nextRuns.github)}` : '';
+    githubMeta = nextLine ? `${atLine}<br>${countLine}<br>${nextLine}` : `${atLine}<br>${countLine}`;
+    if (githubLast.status === 'success') githubStatus = { label: '成功', type: 'success' };
+    else if (githubLast.status === 'partial') githubStatus = { label: '部分完成', type: 'warning' };
+    else githubStatus = { label: '失败', type: 'danger' };
+  } else {
+    const nextLine = nextRuns.github ? `下次 · ${fmtTime(nextRuns.github)}` : '未排期';
+    githubMeta = `尚未执行<br>${nextLine}`;
+    githubStatus = { label: '未执行', type: 'idle' };
+  }
 
-  const githubStatus = statusLabel('github', '就绪');
-  const redditStatus = statusLabel('reddit', '待接入');
+  const redditLast = (sched.last_runs || {}).reddit;
+  const redditNext = nextRuns.reddit;
+  const redditMeta = redditLast
+    ? `上次 · ${fmtTime(redditLast.at)}<br>${redditLast.status === 'pending' ? '待开发（步骤 B）' : redditLast.status}`
+    : redditNext
+      ? `尚未执行<br>下次 · ${fmtTime(redditNext)}`
+      : `模块尚未实现（步骤 B）<br>调度器会调用，但目前仅记录日志`;
+  const redditStatus = redditLast && redditLast.status === 'pending'
+    ? { label: '待开发', type: 'warning' }
+    : { label: '待接入', type: 'idle' };
 
   return {
     scheduler: {
@@ -167,12 +189,12 @@ function buildUiState() {
         : '已停止 · 点击右侧开关启动',
     },
     github: {
-      meta: fmtMeta('github', '配置好凭证后由调度器自动执行'),
+      meta: githubMeta,
       statusLabel: githubStatus.label,
       statusType: githubStatus.type,
     },
     reddit: {
-      meta: fmtMeta('reddit', '模块尚未实现（步骤 B）'),
+      meta: redditMeta,
       statusLabel: redditStatus.label,
       statusType: redditStatus.type,
     },

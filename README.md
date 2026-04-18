@@ -58,8 +58,11 @@ python main.py organize --dry-run
 # 执行文档整理
 python main.py organize
 
-# 导入 GitHub 仓库
+# 导入 GitHub 仓库（增量，自动跳过已导入的仓库）
 python main.py import-github
+
+# 强制重新导入所有仓库（忽略去重索引）
+python main.py import-github --force
 
 # 查看邮件
 python main.py manage email
@@ -101,6 +104,16 @@ python main.py schedule-status
 - 调度器进程 PID 写入 `logs/scheduler.pid`
 
 桌面界面右下角的"每日定时任务"开关会调用 `python main.py schedule` 启动后台守护进程，关闭时通过 PID 信号终止。守护进程独立于 Electron，关闭 UI 不会停止调度。
+
+#### GitHub 导入的数据文件
+
+运行 `import-github` 后会在 `logs/` 下产生：
+
+- `logs/github_imported.json` — 已导入仓库索引（去重依据，下次跳过）
+- `logs/github_last_run.json` — 最近一次运行统计，UI 卡片从这里读真实数据
+- `logs/feishu_agent.log` — 完整日志（含限频警告、失败原因）
+
+去重策略：索引记录 `repo_full_name → wiki_url`，下次再跑时同名仓库自动跳过。想强刷就用 `--force`。
 
 ---
 

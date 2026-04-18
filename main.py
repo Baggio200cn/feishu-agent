@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+from typing import Any, Dict, List, Optional
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
@@ -103,44 +104,153 @@ def cmd_organize(args):
     logger.info("文档整理完成！")
 
 
+def _validate_github_config(github_cfg: dict, wiki_space_id: str) -> Optional[str]:
+    """返回 None 表示配置有效，否则返回错误信息"""
+    token = github_cfg.get("token", "")
+    if not token or token.startswith("ghp_your_"):
+        return "GitHub token 未配置（占位值 ghp_your_...）。请在 config/credentials.json 填入真实 token"
+    if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+        return "飞书 Wiki space_id 未配置。请在 config/credentials.json 的 accounts.personal.wiki_space_id 填入"
+    if not github_cfg.get("repo_list") and not github_cfg.get("search_topics"):
+        return "GitHub 任务列表为空：repo_list 和 search_topics 都没填"
+    return None
+
+
+def _load_import_index() -> Dict[str, Dict[str, Any]]:
+    """读取已导入索引（去重用）。格式: {repo_full_name: {"wiki_url": ..., "imported_at": ...}}"""
+    path = "logs/github_imported.json"
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_import_index(index: Dict[str, Dict[str, Any]]) -> None:
+    os.makedirs("logs", exist_ok=True)
+    with open("logs/github_imported.json", "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+
+
+def _write_run_stats(stats: Dict[str, Any]) -> None:
+    """写入最近一次运行统计，供 UI 展示"""
+    os.makedirs("logs", exist_ok=True)
+    with open("logs/github_last_run.json", "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
 def cmd_import_github(args):
     """将 GitHub 仓库内容导入飞书"""
+    from datetime import datetime
+
     from src.importers.github_importer import GitHubImporter
     from src.importers.feishu_doc_writer import FeishuDocWriter
 
-    creds = config_loader.load_credentials()
-    github_cfg = config_loader.get_github_config()
-    factory = FeishuClientFactory(creds["accounts"])
-    personal_client = factory.get_client("personal")
-    wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
+    run_stats: Dict[str, Any] = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "status": "error",
+        "imported": 0,
+        "skipped_dup": 0,
+        "fetched": 0,
+        "failed": 0,
+        "urls": [],
+        "message": "",
+    }
 
-    importer = GitHubImporter(token=github_cfg.get("token", ""))
-    writer = FeishuDocWriter(personal_client, wiki_space_id)
+    try:
+        creds = config_loader.load_credentials()
+        github_cfg = config_loader.get_github_config()
+        wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
 
-    all_repos = []
+        err = _validate_github_config(github_cfg, wiki_space_id)
+        if err:
+            logger.error(err)
+            run_stats["message"] = err
+            _write_run_stats(run_stats)
+            return
 
-    # 导入指定仓库列表
-    repo_list = github_cfg.get("repo_list", [])
-    if repo_list:
-        logger.info(f"导入指定仓库列表: {repo_list}")
-        all_repos.extend(importer.import_repo_list(repo_list))
+        factory = FeishuClientFactory(creds["accounts"])
+        personal_client = factory.get_client("personal")
 
-    # 按主题搜索
-    topics = github_cfg.get("search_topics", [])
-    if topics:
-        logger.info(f"搜索主题仓库: {topics}")
-        all_repos.extend(importer.search_by_topics(topics, per_topic=5))
+        importer = GitHubImporter(token=github_cfg.get("token", ""))
+        writer = FeishuDocWriter(personal_client, wiki_space_id)
 
-    if not all_repos:
-        logger.info("未获取到任何仓库，请检查 credentials.json 中的 github 配置")
-        return
+        index = _load_import_index()
+        force_reimport = getattr(args, "force", False)
 
-    logger.info(f"共获取 {len(all_repos)} 个仓库，开始写入飞书...")
-    urls = writer.write_github_repos_batch(all_repos)
+        all_repos: List[Dict[str, Any]] = []
 
-    print(f"\n✅ 已成功导入 {len(urls)} 个仓库到飞书 Wiki:")
-    for url in urls:
-        print(f"  {url}")
+        repo_list = github_cfg.get("repo_list", [])
+        if repo_list:
+            logger.info(f"导入指定仓库列表: {repo_list}")
+            all_repos.extend(importer.import_repo_list(repo_list))
+
+        topics = github_cfg.get("search_topics", [])
+        if topics:
+            logger.info(f"搜索主题仓库: {topics}")
+            all_repos.extend(importer.search_by_topics(topics, per_topic=5))
+
+        run_stats["fetched"] = len(all_repos)
+
+        if not all_repos:
+            msg = "未获取到任何仓库（可能被限频或配置有误）"
+            logger.warning(msg)
+            run_stats["message"] = msg
+            _write_run_stats(run_stats)
+            return
+
+        # 去重
+        to_import = []
+        for repo in all_repos:
+            full_name = repo.get("full_name")
+            if not full_name:
+                continue
+            if not force_reimport and full_name in index:
+                logger.info(f"跳过已导入: {full_name} → {index[full_name].get('wiki_url')}")
+                run_stats["skipped_dup"] += 1
+                continue
+            to_import.append(repo)
+
+        logger.info(
+            f"共获取 {len(all_repos)} 个仓库，跳过已导入 {run_stats['skipped_dup']} 个，"
+            f"即将写入 {len(to_import)} 个"
+        )
+
+        from datetime import datetime as _dt
+        for repo in to_import:
+            url = writer.write_github_repo(repo)
+            if url:
+                run_stats["imported"] += 1
+                run_stats["urls"].append(url)
+                index[repo["full_name"]] = {
+                    "wiki_url": url,
+                    "imported_at": _dt.now().isoformat(timespec="seconds"),
+                }
+                _save_import_index(index)  # 增量保存，防止中途崩溃丢失
+            else:
+                run_stats["failed"] += 1
+
+        run_stats["status"] = "success" if run_stats["failed"] == 0 else "partial"
+        run_stats["message"] = (
+            f"新增 {run_stats['imported']} · 跳过重复 {run_stats['skipped_dup']}"
+            f" · 失败 {run_stats['failed']}"
+        )
+        if importer.rate_limit_remaining is not None:
+            run_stats["rate_limit_remaining"] = importer.rate_limit_remaining
+
+        _write_run_stats(run_stats)
+
+        print(f"\n✅ 本次导入结果：{run_stats['message']}")
+        for url in run_stats["urls"]:
+            print(f"  {url}")
+
+    except Exception as e:
+        logger.exception("import-github 异常")
+        run_stats["message"] = f"异常终止: {e}"
+        _write_run_stats(run_stats)
+        raise
 
 
 def cmd_manage(args):
@@ -251,7 +361,8 @@ def main():
     p_organize.add_argument("--dry-run", action="store_true", help="仅预览，不实际移动文档")
 
     # import-github 子命令
-    subparsers.add_parser("import-github", help="将 GitHub 仓库导入飞书")
+    p_import_github = subparsers.add_parser("import-github", help="将 GitHub 仓库导入飞书")
+    p_import_github.add_argument("--force", action="store_true", help="忽略去重索引，强制重新导入所有仓库")
 
     # manage 子命令
     p_manage = subparsers.add_parser("manage", help="管理飞书资源")
