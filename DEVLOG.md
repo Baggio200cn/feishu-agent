@@ -790,6 +790,118 @@ github专区/
 
 ---
 
+## 十三、步骤 B：Reddit AI 日报（2026-04-19）
+
+### 背景
+
+GitHub 通路跑通后，用户需求镜像 Reddit 版：订阅 AI 相关 subreddit → 豆包
+摘要 → 同款"文件夹 + 子页"布局写入飞书 reddit专区。
+
+用户敲定的参数：
+- Subreddits：`r/MachineLearning` · `r/LocalLLaMA` · `r/ClaudeAI` · `r/LLMDevs`
+- 每日取 top 10 条
+- Self post 抓正文 + 前 3 条高赞评论
+- 调度时间和 GitHub 一致（09:00）
+- Reddit 在中国大陆被墙，必须挂 VPN
+
+### 数据流
+
+```
+Reddit 4 个 subreddit
+  ├─ /r/{sub}/top.json?t=day&limit=10    → 每个 sub 10 条
+  │
+  ▼
+  合并 + 按 score 降序 + 去重 + 取前 10 条
+  │
+  ▼  每条帖子
+  /r/{sub}/comments/{id}.json?sort=top   → 抓前 3 条高赞顶层评论
+  │
+  ▼
+  豆包 API (同模型 doubao-seed-2-0-mini-260215)
+  prompt 4 段式: 话题背景 / 核心观点 / 技术要点 / 讨论亮点
+  │
+  ▼
+  飞书 Wiki:
+  reddit专区/
+    Reddit AI 日报 YYYY-MM-DD/
+      1. [MachineLearning] <标题>
+      2. [LocalLLaMA] <标题>
+      ...
+```
+
+### 新增 / 修改文件
+
+| 文件 | 作用 |
+|------|------|
+| `src/importers/reddit_importer.py`（**新**） | `RedditImporter.fetch_daily()`：遍历 subreddits → `/top.json?t=day` → 合并去重 → 取 top N → 每条拉 `/comments/.json` 取顶层高赞评论。3 次重试，User-Agent 必带 |
+| `src/importers/ai_summarizer.py`（改） | 新增 `DEFAULT_REDDIT_PROMPT_TEMPLATE` 和 `summarize_reddit_post()`。抽出 `_chat_json()` 公共方法，两个摘要任务共用 |
+| `src/importers/feishu_doc_writer.py`（改） | 新增 `write_daily_reddit_report()` + `_build_reddit_folder_cover_blocks()` + `_build_single_reddit_post_blocks()`。镜像 GitHub 的 "文件夹 + 子页"，额外加"精选评论"分节 |
+| `main.py`（改） | 新增 `cmd_import_reddit()` 和 `import-reddit` 子命令。支持 `--force`；缓存文件 `logs/reddit_cache_YYYY-MM-DD.json`；统计 `logs/reddit_last_run.json` |
+| `src/scheduler.py`（改） | `_run_reddit()` 从 pending 占位改为真调 `cmd_import_reddit()` |
+| `config/credentials.json.example`（改） | 新增 `reddit` 配置块；`schedule.jobs` 里 reddit `enabled=true, hour=9` |
+
+### 关键设计决策
+
+**1. 用 JSON 端点 而非 RSS**
+
+用户提到老版本用 RSS。但 Reddit 的 `/top.json?t=day` 在 metadata 丰富度上碾压 RSS：
+
+| 字段 | RSS | JSON |
+|-----|-----|------|
+| title / link | ✓ | ✓ |
+| score | ❌ | ✓ |
+| num_comments | ❌ | ✓ |
+| selftext | 仅摘要 | 完整 |
+| is_self / flair | ❌ | ✓ |
+
+既然都不需要 OAuth、都用 User-Agent，选 JSON 零成本得到这些排序依据。
+
+**2. 按 score 全局排序**
+
+每个 sub 抓 10 条（共 40），去重合并后按 score 降序取前 10。结果偏向"有热度的帖子"
+而非"均匀分配给每个 sub"，对用户信息密度最友好。
+
+**3. 共享 AI 摘要缓存格式**
+
+`reddit_cache_YYYY-MM-DD.json` 复用 trending 缓存的加载/保存函数（`_load_trending_cache` /
+`_save_trending_cache`），格式相同 `[{..., summary_ok: bool}, ...]`。续跑时只补
+`summary_ok=false` 的条目，节省豆包成本。
+
+**4. 飞书页面标题清洗**
+
+Reddit 帖子标题常含 `/` `:` `*` `?` 等飞书不允许的字符，`write_daily_reddit_report` 里
+用 `re.sub(r"[\\/:*?\"<>|]", " ", ...)` 清洗；太长的标题截断到 80 字。
+
+**5. VPN / 代理**
+
+Python `requests` 库会自动使用 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量，所以代码
+无需显式设置。PowerShell 下：
+
+```powershell
+$env:HTTP_PROXY = "http://127.0.0.1:7890"
+$env:HTTPS_PROXY = "http://127.0.0.1:7890"
+python main.py import-reddit
+```
+
+### 成本估算
+
+- 4 个 sub × 10 帖 = 40 次 Reddit API 请求 + 10 次评论请求 = 50 次 HTTP
+- Reddit 匿名限 10 req/min，代码里每 sub 间隔 1s + 每帖 0.5s，约 1 分钟抓完
+- 豆包：每帖约 3-5K token（含 3 条评论），10 条 ≈ 40K token / 天
+- 每日成本 ≈ 40K × 0.2 / 100万 = **0.008 元**
+
+### 未完成 / 下一步
+
+- Link post（外链贴）目前只记录 URL，不抓外链正文。未来可加可选的网页抓取
+- 没有单测，靠沙箱 smoke test 保障基本结构
+- UI 卡片没对接 `reddit_last_run.json`，下次迭代补
+
+---
+
+*步骤 B 日志生成：2026-04-19*
+
+---
+
 ## 八、启动指南（给未来的自己）
 
 **从零启动：**

@@ -8,6 +8,7 @@
   python main.py manage messages   # IM 消息管理
   python main.py manage calendar   # 日历管理
   python main.py manage contacts   # 联系人管理
+  python main.py import-reddit     # Reddit AI 日报：订阅 subreddit → 豆包摘要 → 飞书
   python main.py schedule          # 启动定时任务调度器（守护进程）
   python main.py schedule-status   # 查询调度器状态（输出 JSON）
 """
@@ -363,6 +364,177 @@ def _run_trending_pipeline(
         logger.error(run_stats["message"])
 
 
+def cmd_import_reddit(args):
+    """
+    Reddit AI 日报：订阅 subreddit top-of-day → 豆包 AI 中文摘要 →
+    按日期汇总为文件夹写入飞书 Wiki 的 reddit专区。
+    """
+    from datetime import datetime
+
+    from src.importers.reddit_importer import RedditImporter
+    from src.importers.ai_summarizer import AISummarizer
+    from src.importers.feishu_doc_writer import FeishuDocWriter
+
+    run_stats: Dict[str, Any] = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "status": "error",
+        "fetched": 0,
+        "summarized": 0,
+        "ai_failed": 0,
+        "wiki_url": "",
+        "message": "",
+    }
+
+    try:
+        creds = config_loader.load_credentials()
+        reddit_cfg = creds.get("reddit", {}) or {}
+        ai_cfg = config_loader.get_ai_config()
+        wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
+
+        # 前置校验
+        if not reddit_cfg.get("enabled", True):
+            msg = "Reddit 抓取未启用（credentials.json 里 reddit.enabled=false）"
+            logger.info(msg)
+            run_stats["status"] = "disabled"
+            run_stats["message"] = msg
+            _write_reddit_stats(run_stats)
+            return
+
+        subs = reddit_cfg.get("subreddits") or []
+        if not subs:
+            msg = "Reddit subreddit 列表为空"
+            logger.error(msg)
+            run_stats["message"] = msg
+            _write_reddit_stats(run_stats)
+            return
+
+        if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+            msg = "飞书 Wiki space_id 未配置"
+            logger.error(msg)
+            run_stats["message"] = msg
+            _write_reddit_stats(run_stats)
+            return
+
+        summarizer = AISummarizer(ai_cfg)
+        if not summarizer.configured():
+            msg = "豆包 AI 未配置，Reddit 摘要需要 AI"
+            logger.error(msg)
+            run_stats["message"] = msg
+            _write_reddit_stats(run_stats)
+            return
+
+        factory = FeishuClientFactory(creds["accounts"])
+        personal_client = factory.get_client("personal")
+        writer = FeishuDocWriter(personal_client, wiki_space_id)
+
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        parent_folder = reddit_cfg.get("parent_folder", "reddit专区")
+        force = getattr(args, "force", False)
+
+        # 1. 抓 Reddit
+        importer = RedditImporter(
+            subreddits=subs,
+            user_agent=reddit_cfg.get("user_agent", "feishu-agent/0.1"),
+        )
+        posts = importer.fetch_daily(
+            period=reddit_cfg.get("period", "day"),
+            per_sub_fetch=int(reddit_cfg.get("per_sub_fetch", 10)),
+            limit_total=int(reddit_cfg.get("limit_total", 10)),
+            top_comments=int(reddit_cfg.get("top_comments", 3)),
+        )
+        run_stats["fetched"] = len(posts)
+        if not posts:
+            msg = "Reddit 返回为空（可能 VPN 断了 / 限频 / subreddit 名写错）"
+            logger.warning(msg)
+            run_stats["message"] = msg
+            _write_reddit_stats(run_stats)
+            return
+
+        # 2. 对每个帖子做 AI 摘要，缓存增量保存
+        cache_path = f"logs/reddit_cache_{date_str}.json"
+        cached = _load_trending_cache(cache_path)  # 格式同 trending 缓存，通用
+        if cached and not force:
+            done_ids = {
+                it["post"].get("id") for it in cached if it.get("summary_ok")
+            }
+            items_with_summary = cached
+            logger.info(f"从缓存恢复 {len(done_ids)} 条已摘要 Reddit 帖子: {cache_path}")
+        else:
+            items_with_summary = []
+            done_ids = set()
+
+        for i, post in enumerate(posts, 1):
+            pid = post.get("id", "")
+            if pid in done_ids:
+                logger.info(f"[{i}/{len(posts)}] 跳过（缓存已有）: r/{post['subreddit']}/{pid}")
+                continue
+            logger.info(f"[{i}/{len(posts)}] 摘要 r/{post['subreddit']}/{pid} {post['title'][:40]}")
+            summary = summarizer.summarize_reddit_post(post)
+            summary_ok = summary is not None
+            if not summary:
+                summary = {
+                    "one_liner": post.get("title", "")[:30] or "（AI 摘要失败）",
+                    "detail": "AI 摘要失败，请点击原帖查看。",
+                }
+            items_with_summary.append({
+                "post": post,
+                "summary": summary,
+                "summary_ok": summary_ok,
+            })
+            _save_trending_cache(cache_path, items_with_summary)
+
+        run_stats["summarized"] = sum(1 for it in items_with_summary if it.get("summary_ok"))
+        run_stats["ai_failed"] = len(items_with_summary) - run_stats["summarized"]
+
+        # 3. 写飞书日报（文件夹 + 子页）
+        result = writer.write_daily_reddit_report(
+            items_with_summary=items_with_summary,
+            parent_folder_title=parent_folder,
+            date_str=date_str,
+        )
+
+        if result:
+            run_stats["wiki_url"] = result["folder_url"]
+            run_stats["wiki_folder_token"] = result["folder_token"]
+            run_stats["pages_created"] = result["created_count"]
+            run_stats["pages_skipped"] = result["skipped_count"]
+            run_stats["repo_pages"] = result["repo_pages"]
+            if run_stats["ai_failed"] == 0 and result["created_count"] + result["skipped_count"] == len(items_with_summary):
+                run_stats["status"] = "success"
+            else:
+                run_stats["status"] = "partial"
+            run_stats["message"] = (
+                f"抓取 {run_stats['fetched']} · 摘要 {run_stats['summarized']}"
+                f" · AI失败 {run_stats['ai_failed']}"
+                f" · 新建页 {result['created_count']} · 跳过 {result['skipped_count']}"
+            )
+            print(f"\n✅ Reddit 日报文件夹: {result['folder_url']}")
+            print(f"   {run_stats['message']}")
+            print(f"\n子页面:")
+            for p in result["repo_pages"]:
+                marker = "🆕" if p["created"] else "  "
+                print(f"   {marker} {p['title'][:70]}")
+                if p["url"]:
+                    print(f"        {p['url']}")
+        else:
+            run_stats["message"] = "Reddit 日报写入失败，可能飞书权限或节点问题"
+            logger.error(run_stats["message"])
+
+        _write_reddit_stats(run_stats)
+
+    except Exception as e:
+        logger.exception("import-reddit 异常")
+        run_stats["message"] = f"异常终止: {e}"
+        _write_reddit_stats(run_stats)
+        raise
+
+
+def _write_reddit_stats(stats: Dict[str, Any]) -> None:
+    os.makedirs("logs", exist_ok=True)
+    with open("logs/reddit_last_run.json", "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
 def _run_legacy_pipeline(
     github_cfg: Dict, importer, writer, run_stats: Dict, force: bool
 ) -> None:
@@ -538,6 +710,10 @@ def main():
     p_import_github = subparsers.add_parser("import-github", help="将 GitHub 仓库导入飞书")
     p_import_github.add_argument("--force", action="store_true", help="忽略去重索引，强制重新导入所有仓库")
 
+    # import-reddit 子命令
+    p_import_reddit = subparsers.add_parser("import-reddit", help="Reddit AI 日报 → 飞书")
+    p_import_reddit.add_argument("--force", action="store_true", help="忽略缓存，重新调用豆包摘要")
+
     # manage 子命令
     p_manage = subparsers.add_parser("manage", help="管理飞书资源")
     p_manage.add_argument("resource", choices=["email", "messages", "calendar", "contacts"])
@@ -554,6 +730,8 @@ def main():
         cmd_organize(args)
     elif args.command == "import-github":
         cmd_import_github(args)
+    elif args.command == "import-reddit":
+        cmd_import_reddit(args)
     elif args.command == "manage":
         cmd_manage(args)
     elif args.command == "schedule":

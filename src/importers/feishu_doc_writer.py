@@ -582,3 +582,212 @@ class FeishuDocWriter:
             if p:
                 result.append(p)
         return result or [text]
+
+    # =========================================================
+    # Reddit AI 日报写入
+    # =========================================================
+
+    def write_daily_reddit_report(
+        self,
+        items_with_summary: List[Dict[str, Any]],
+        parent_folder_title: str = "reddit专区",
+        date_str: Optional[str] = None,
+        auto_create_parent: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Reddit 日报镜像 GitHub 结构：
+        reddit专区/
+          Reddit AI 日报 YYYY-MM-DD/
+            1. [subreddit] <title>
+            2. [subreddit] <title>
+            ...
+
+        Args:
+            items_with_summary: [{"post": {...reddit 元数据...}, "summary": {one_liner, detail}}, ...]
+        """
+        if not items_with_summary:
+            logger.warning("Reddit 日报内容为空，跳过")
+            return None
+
+        date_str = date_str or datetime.now().strftime("%Y-%m-%d")
+        folder_title = f"Reddit AI 日报 {date_str}"
+
+        parent_token = self.find_node_by_title(parent_folder_title)
+        if not parent_token:
+            if not auto_create_parent:
+                logger.error(f"父节点 '{parent_folder_title}' 不存在")
+                return None
+            logger.warning(f"父节点 '{parent_folder_title}' 不存在，自动在空间根下创建")
+            parent_token, _ = self._create_wiki_node(
+                title=parent_folder_title,
+                parent_node_token=None,
+                blocks=[
+                    self._h1_block(parent_folder_title),
+                    self._text_block(
+                        "自动生成的 Reddit AI 相关讨论归档。"
+                        "每天在本节点下创建一个日期文件夹，文件夹内每个帖子独立成页。"
+                    ),
+                ],
+            )
+            if not parent_token:
+                logger.error(f"自动创建父节点 '{parent_folder_title}' 失败")
+                return None
+            logger.info(f"✅ 自动创建父节点: {parent_folder_title}")
+
+        folder_token = self.find_node_by_title(folder_title, parent_node_token=parent_token)
+        folder_created = False
+        if folder_token:
+            logger.info(f"当日文件夹已存在，续跑: {folder_title}")
+        else:
+            folder_token, _ = self._create_wiki_node(
+                title=folder_title,
+                parent_node_token=parent_token,
+                blocks=self._build_reddit_folder_cover_blocks(items_with_summary, date_str),
+            )
+            if not folder_token:
+                logger.error(f"创建 Reddit 日报文件夹失败: {folder_title}")
+                return None
+            folder_created = True
+            logger.info(f"✅ Reddit 日报文件夹已创建: {folder_title}")
+
+        repo_pages: List[Dict[str, Any]] = []
+        created_count = 0
+        skipped_count = 0
+
+        for idx, item in enumerate(items_with_summary, 1):
+            post = item.get("post", {})
+            summary = item.get("summary") or {}
+            subreddit = post.get("subreddit", "?")
+            raw_title = post.get("title", f"unknown-{idx}")
+            # 页面标题用 "{idx}. [sub] {title}"，截断防过长
+            truncated_title = raw_title if len(raw_title) <= 80 else raw_title[:77] + "..."
+            page_title = f"{idx}. [{subreddit}] {truncated_title}"
+            # 飞书标题不能有 / \\ 等特殊字符
+            page_title = re.sub(r"[\\/:*?\"<>|]", " ", page_title)
+
+            existing = self.find_node_by_title(page_title, parent_node_token=folder_token)
+            if existing:
+                logger.info(f"  [{idx}/{len(items_with_summary)}] 跳过（已存在）: {page_title[:50]}")
+                repo_pages.append({
+                    "title": page_title,
+                    "url": f"https://open.feishu.cn/wiki/{existing}",
+                    "created": False,
+                })
+                skipped_count += 1
+                continue
+
+            child_token, _ = self._create_wiki_node(
+                title=page_title,
+                parent_node_token=folder_token,
+                blocks=self._build_single_reddit_post_blocks(post, summary),
+            )
+            if child_token:
+                repo_pages.append({
+                    "title": page_title,
+                    "url": f"https://open.feishu.cn/wiki/{child_token}",
+                    "created": True,
+                })
+                created_count += 1
+                logger.info(f"  [{idx}/{len(items_with_summary)}] 已创建: {page_title[:50]}")
+            else:
+                repo_pages.append({
+                    "title": page_title,
+                    "url": "",
+                    "created": False,
+                })
+                logger.warning(f"  [{idx}/{len(items_with_summary)}] 创建失败: {page_title[:50]}")
+
+        folder_url = f"https://open.feishu.cn/wiki/{folder_token}"
+        logger.info(
+            f"Reddit 日报完成: 文件夹 {'新建' if folder_created else '续跑'} · "
+            f"新建 {created_count} 页 · 跳过 {skipped_count} 页"
+        )
+
+        return {
+            "folder_url": folder_url,
+            "folder_token": folder_token,
+            "repo_pages": repo_pages,
+            "created_count": created_count,
+            "skipped_count": skipped_count,
+        }
+
+    def _build_reddit_folder_cover_blocks(
+        self, items_with_summary: List[Dict[str, Any]], date_str: str
+    ) -> List:
+        blocks: List = []
+        blocks.append(self._h1_block(f"Reddit AI 日报 · {date_str}"))
+        blocks.append(
+            self._text_block(
+                f"每日从订阅的 AI 相关 subreddit 抓取 top of day 帖子"
+                f"（共 {len(items_with_summary)} 条），每条详情见下方子页面。"
+            )
+        )
+        blocks.append(self._divider())
+
+        for idx, item in enumerate(items_with_summary, 1):
+            post = item.get("post", {})
+            summary = item.get("summary") or {}
+            subreddit = post.get("subreddit", "?")
+            title = post.get("title", "")
+            one_liner = summary.get("one_liner") or "（无摘要）"
+            score = post.get("score", 0)
+            num_comments = post.get("num_comments", 0)
+            permalink = post.get("permalink", "")
+
+            blocks.append(self._h3_block(f"{idx}. [{subreddit}] {title[:70]}"))
+            blocks.append(self._text_block(f"📌 {one_liner}"))
+            blocks.append(
+                self._text_block(
+                    f"⬆️ {score} · 💬 {num_comments} · 🔗 {permalink}"
+                )
+            )
+
+        return blocks
+
+    def _build_single_reddit_post_blocks(
+        self, post: Dict[str, Any], summary: Dict[str, Any]
+    ) -> List:
+        blocks: List = []
+
+        subreddit = post.get("subreddit", "")
+        author = post.get("author", "")
+        score = post.get("score", 0)
+        num_comments = post.get("num_comments", 0)
+        permalink = post.get("permalink", "")
+        external_url = post.get("url", "")
+        is_self = post.get("is_self", False)
+        flair = post.get("link_flair_text", "")
+        top_comments = post.get("top_comments", []) or []
+
+        # 元信息
+        blocks.append(self._text_block(f"🔗 原帖链接: {permalink}"))
+        meta_line = f"🏛️ r/{subreddit} · 👤 u/{author} · ⬆️ {score} · 💬 {num_comments}"
+        if flair:
+            meta_line += f" · 🏷 {flair}"
+        blocks.append(self._text_block(meta_line))
+        if not is_self and external_url and external_url != permalink:
+            blocks.append(self._text_block(f"🌐 外链: {external_url}"))
+
+        one_liner = summary.get("one_liner") or "（无摘要）"
+        blocks.append(self._text_block(f"📌 {one_liner}"))
+        blocks.append(self._divider())
+
+        # 详细介绍
+        blocks.append(self._h2_block("详细介绍"))
+        detail = summary.get("detail") or "（AI 摘要失败，请点击原帖查看）"
+        for paragraph in self._split_paragraphs(detail):
+            blocks.append(self._text_block(paragraph))
+
+        # 精选评论
+        if top_comments:
+            blocks.append(self._divider())
+            blocks.append(self._h2_block(f"精选评论（Top {len(top_comments)}）"))
+            for c in top_comments:
+                author_c = c.get("author", "?")
+                score_c = c.get("score", 0)
+                body = (c.get("body") or "").strip()
+                blocks.append(self._h3_block(f"⬆️ {score_c} · u/{author_c}"))
+                for paragraph in self._split_paragraphs(body):
+                    blocks.append(self._text_block(paragraph))
+
+        return blocks

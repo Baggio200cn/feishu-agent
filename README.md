@@ -67,6 +67,13 @@ python main.py import-github
 # 强刷（忽略当日去重）
 python main.py import-github --force
 
+# Reddit AI 日报：订阅的 subreddit → 豆包摘要 → 飞书 reddit专区
+# 注意：Reddit 在中国大陆被墙，必须先挂 VPN；代码会识别 HTTP_PROXY / HTTPS_PROXY
+python main.py import-reddit
+
+# 强刷（忽略缓存，重新调豆包）
+python main.py import-reddit --force
+
 # 查看邮件
 python main.py manage email
 
