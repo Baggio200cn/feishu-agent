@@ -3,6 +3,7 @@
 """
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -153,34 +154,52 @@ class FeishuDocWriter:
                 return lang
         return "PlainText"
 
-    # --- Block 构造器 ---
+    # --- Block 构造器（使用 lark-oapi 的 typed builder，避免 dict 格式歧义） ---
 
-    def _text_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_TEXT, "text": {"elements": [{"text_run": {"content": text}}]}}
+    @staticmethod
+    def _make_text(content: str):
+        """构造一个 Text 对象（elements 里一个 TextRun）"""
+        from lark_oapi.api.docx.v1 import Text, TextElement, TextRun
+        run = TextRun.builder().content(content or "").build()
+        el = TextElement.builder().text_run(run).build()
+        return Text.builder().elements([el]).build()
 
-    def _h1_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_H1, "heading1": {"elements": [{"text_run": {"content": text}}]}}
+    def _text_block(self, text: str):
+        from lark_oapi.api.docx.v1 import Block
+        return Block.builder().block_type(BLOCK_TEXT).text(self._make_text(text)).build()
 
-    def _h2_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_H2, "heading2": {"elements": [{"text_run": {"content": text}}]}}
+    def _h1_block(self, text: str):
+        from lark_oapi.api.docx.v1 import Block
+        return Block.builder().block_type(BLOCK_H1).heading1(self._make_text(text)).build()
 
-    def _h3_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_H3, "heading3": {"elements": [{"text_run": {"content": text}}]}}
+    def _h2_block(self, text: str):
+        from lark_oapi.api.docx.v1 import Block
+        return Block.builder().block_type(BLOCK_H2).heading2(self._make_text(text)).build()
 
-    def _h4_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_H4, "heading4": {"elements": [{"text_run": {"content": text}}]}}
+    def _h3_block(self, text: str):
+        from lark_oapi.api.docx.v1 import Block
+        return Block.builder().block_type(BLOCK_H3).heading3(self._make_text(text)).build()
 
-    def _bullet_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_BULLET, "bullet": {"elements": [{"text_run": {"content": text}}]}}
+    def _h4_block(self, text: str):
+        from lark_oapi.api.docx.v1 import Block
+        return Block.builder().block_type(BLOCK_H4).heading4(self._make_text(text)).build()
 
-    def _ordered_block(self, text: str) -> Dict:
-        return {"block_type": BLOCK_ORDERED_LIST, "ordered": {"elements": [{"text_run": {"content": text}}]}}
+    def _bullet_block(self, text: str):
+        from lark_oapi.api.docx.v1 import Block
+        return Block.builder().block_type(BLOCK_BULLET).bullet(self._make_text(text)).build()
 
-    def _code_block(self, code: str, language: str = "PlainText") -> Dict:
-        return {"block_type": BLOCK_CODE, "code": {"language": language, "elements": [{"text_run": {"content": code}}]}}
+    def _ordered_block(self, text: str):
+        from lark_oapi.api.docx.v1 import Block
+        return Block.builder().block_type(BLOCK_ORDERED_LIST).ordered(self._make_text(text)).build()
 
-    def _divider(self) -> Dict:
-        return {"block_type": BLOCK_DIVIDER}
+    def _code_block(self, code: str, language: str = "PlainText"):
+        from lark_oapi.api.docx.v1 import Block
+        # 代码块的 Text 结构一致，语言样式另行设置省略
+        return Block.builder().block_type(BLOCK_CODE).code(self._make_text(code)).build()
+
+    def _divider(self):
+        from lark_oapi.api.docx.v1 import Block, Divider
+        return Block.builder().block_type(BLOCK_DIVIDER).divider(Divider.builder().build()).build()
 
     def _create_wiki_page(self, title: str, blocks: List[Dict]) -> Optional[str]:
         """创建 Wiki 页面节点并写入内容，返回 node_token"""
@@ -220,20 +239,23 @@ class FeishuDocWriter:
             logger.warning(f"创建 Wiki 页面异常: {e}")
             return None
 
-    def _populate_blocks(self, document_id: str, blocks: List[Dict]) -> None:
-        """批量写入文档内容块（分批，每批最多 50 个）"""
+    def _populate_blocks(self, document_id: str, blocks: List) -> None:
+        """批量写入文档内容块（分批，每批最多 30 个 Block）"""
         try:
             from lark_oapi.api.docx.v1 import (
                 CreateDocumentBlockChildrenRequest,
                 CreateDocumentBlockChildrenRequestBody,
             )
-            batch_size = 50
+            # 新建的 docx 有时需要短暂等待才能写入
+            time.sleep(0.8)
+
+            batch_size = 30
             for i in range(0, len(blocks), batch_size):
                 batch = blocks[i:i + batch_size]
                 body = (
                     CreateDocumentBlockChildrenRequestBody.builder()
                     .children(batch)
-                    .index(-1)
+                    .index(0)
                     .build()
                 )
                 req = (
@@ -245,7 +267,6 @@ class FeishuDocWriter:
                 )
                 resp = self._client.docx.v1.document_block_children.create(req)
                 if not resp.success():
-                    # 打印完整响应体，便于诊断 invalid param 到底嫌弃哪个字段
                     raw_body = ""
                     try:
                         raw_body = resp.raw.content.decode("utf-8", errors="replace")[:800]
