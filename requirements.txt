@@ -4,6 +4,9 @@ lark-oapi>=1.3.0
 # HTTP 请求（GitHub API、豆包 AI API）
 requests==2.31.0
 
+# HTML 解析（GitHub Trending 抓取）
+beautifulsoup4>=4.12.0
+
 # 环境变量支持
 python-dotenv==1.0.0
 

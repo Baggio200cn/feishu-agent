@@ -292,6 +292,106 @@ button.flex { flex: 1; }
     -webkit-font-smoothing: subpixel-antialiased;
   }
 }
+
+/* ============ 弹层 Modal ============ */
+.modal-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.45);
+  display: none;
+  align-items: center; justify-content: center;
+  z-index: 2000;
+  -webkit-app-region: no-drag;
+}
+.modal-backdrop.show { display: flex; }
+.modal {
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  width: min(92%, 480px);
+  max-height: 88vh;
+  display: flex; flex-direction: column;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.25);
+  overflow: hidden;
+}
+.modal-header {
+  padding: 14px 16px;
+  display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+.modal-title { font-size: 14px; font-weight: 500; }
+.modal-close {
+  background: transparent; border: none; cursor: pointer;
+  color: var(--text-tertiary); font-size: 18px; padding: 0 4px;
+}
+.modal-close:hover { color: var(--text-primary); background: transparent; }
+.modal-body {
+  padding: 16px;
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.modal-footer {
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  display: flex; justify-content: flex-end; gap: 8px;
+}
+
+input[type="text"].text-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  -webkit-app-region: no-drag;
+}
+input[type="text"].text-input:focus { border-color: var(--accent); }
+
+.chat-answer {
+  background: var(--bg-subtle);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  margin: 10px 0;
+  white-space: pre-wrap;
+}
+.chat-source {
+  display: block;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 12px;
+}
+.chat-source:hover { background: var(--accent-bg); }
+
+.cleanup-item {
+  padding: 6px 8px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+  word-break: break-all;
+}
+.cleanup-item:last-child { border-bottom: none; }
+.cleanup-item.ok::before { content: "✅ "; }
+.cleanup-item.fail::before { content: "❌ "; color: var(--danger); }
+
+.inline-hint {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin: 6px 0 10px;
+  line-height: 1.5;
+}
+
+.spinner {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -321,10 +421,10 @@ button.flex { flex: 1; }
           </div>
           <div>
             <div class="card-title">对话助手</div>
-            <div class="card-desc">检索 Wiki · 调用 Agent · 跨账号查询</div>
+            <div class="card-desc">关键词检索 Wiki · 豆包 AI 中文回答</div>
           </div>
         </div>
-        <button class="primary" onclick="callAction('open-chat')">打开</button>
+        <button class="primary" onclick="openChatModal()">打开</button>
       </div>
     </div>
   </section>
@@ -342,7 +442,8 @@ button.flex { flex: 1; }
           配置好凭证后由调度器自动执行
         </div>
         <div class="btn-row">
-          <button class="small flex" onclick="callAction('run-github')">立即执行</button>
+          <button class="small flex" onclick="runWithSpinner(this, 'run-github')">立即执行</button>
+          <button class="small" onclick="callAction('view-github-wiki')">Wiki</button>
           <button class="small" onclick="callAction('view-github-log')">日志</button>
         </div>
       </div>
@@ -350,15 +451,16 @@ button.flex { flex: 1; }
       <div class="card-compact">
         <div class="card-compact-header">
           <span class="card-compact-title">Reddit AI 日报</span>
-          <span class="badge warning" id="reddit-status">待开发</span>
+          <span class="badge idle" id="reddit-status">未执行</span>
         </div>
         <div class="card-compact-meta" id="reddit-meta">
-          模块尚未实现（步骤 B）<br>
-          调度器会调用，但目前仅记录日志
+          尚未执行<br>
+          需先挂 VPN 并在启动终端里设 HTTP_PROXY
         </div>
         <div class="btn-row">
-          <button class="small flex" onclick="callAction('run-reddit')">立即执行</button>
-          <button class="small" onclick="callAction('view-reddit-result')">查看</button>
+          <button class="small flex" onclick="runWithSpinner(this, 'run-reddit')">立即执行</button>
+          <button class="small" onclick="callAction('view-reddit-result')">Wiki</button>
+          <button class="small" onclick="callAction('view-github-log')">日志</button>
         </div>
       </div>
     </div>
@@ -389,6 +491,26 @@ button.flex { flex: 1; }
   </section>
 
   <section>
+    <div class="section-label">Wiki 清理</div>
+    <div class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title">按标题前缀批量删除</div>
+          <div class="card-desc">先预览匹配列表，确认后再执行；不可撤销</div>
+        </div>
+      </div>
+      <div style="margin-top:10px;">
+        <input type="text" id="cleanup-prefix" class="text-input" placeholder="例如：[诊断]  或  GitHub Trending 日报 2025">
+        <div class="inline-hint">⚠️ 前缀必填，严格大小写；匹配到的所有顶层节点及其子树都会被删除</div>
+      </div>
+      <div class="btn-row" style="margin-top:6px;">
+        <button class="flex" onclick="previewCleanup()">预览匹配项</button>
+        <button class="primary flex" id="cleanup-execute-btn" onclick="executeCleanup()" disabled>执行删除</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
     <div class="section-label">调度</div>
     <div class="card">
       <div class="card-row">
@@ -411,16 +533,65 @@ button.flex { flex: 1; }
 
 <div class="toast" id="toast"></div>
 
+<!-- ============ 对话助手弹层 ============ -->
+<div class="modal-backdrop" id="chat-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title">对话助手 · 搜 Wiki</span>
+      <button class="modal-close" onclick="closeModal('chat-modal')">×</button>
+    </div>
+    <div class="modal-body">
+      <input type="text" id="chat-query" class="text-input" placeholder='输入关键词，例如"Trending 日报"或"Claude Opus 4.7"' />
+      <div class="inline-hint">豆包 AI 会基于飞书 Wiki 里的命中页面给一段中文回答</div>
+      <div id="chat-result"></div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeModal('chat-modal')">关闭</button>
+      <button class="primary" id="chat-submit-btn" onclick="submitChat()">提问</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Wiki 清理预览弹层 ============ -->
+<div class="modal-backdrop" id="cleanup-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title">Wiki 清理 · 预览</span>
+      <button class="modal-close" onclick="closeModal('cleanup-modal')">×</button>
+    </div>
+    <div class="modal-body">
+      <div id="cleanup-result"></div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeModal('cleanup-modal')">关闭</button>
+    </div>
+  </div>
+</div>
+
 <script>
+// ============ 通用工具 ============
 function callAction(action, params = {}) {
   if (window.feishuAgent && window.feishuAgent.invoke) {
-    window.feishuAgent.invoke(action, params)
-      .then(result => { if (result && result.message) toast(result.message); })
-      .catch(err => toast('错误: ' + err.message));
-  } else {
-    console.log('[Action]', action, params);
-    toast('已触发: ' + action);
+    return window.feishuAgent.invoke(action, params)
+      .then(result => {
+        if (result && result.message) toast(result.message);
+        return result;
+      })
+      .catch(err => { toast('错误: ' + err.message); return { ok: false, message: err.message }; });
   }
+  console.log('[Action]', action, params);
+  toast('已触发: ' + action);
+  return Promise.resolve({ ok: true });
+}
+
+function runWithSpinner(btn, action, params = {}) {
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>执行中…';
+  callAction(action, params).finally(() => {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  });
 }
 
 function setBadge(id, label, type) {
@@ -444,11 +615,6 @@ document.getElementById('schedule-toggle').addEventListener('change', (e) => {
 
 function updateState(state) {
   if (!state) return;
-  if (state.connection) {
-    if (state.connection.text) document.getElementById('conn-text').textContent = state.connection.text;
-    if (state.connection.status) document.getElementById('conn-dot').className = 'dot ' + state.connection.status;
-    if (state.connection.accounts) document.getElementById('conn-accounts').textContent = state.connection.accounts;
-  }
   if (state.github) {
     if (state.github.meta) document.getElementById('github-meta').innerHTML = state.github.meta;
     if (state.github.statusLabel) setBadge('github-status', state.github.statusLabel, state.github.statusType);
@@ -456,12 +622,6 @@ function updateState(state) {
   if (state.reddit) {
     if (state.reddit.meta) document.getElementById('reddit-meta').innerHTML = state.reddit.meta;
     if (state.reddit.statusLabel) setBadge('reddit-status', state.reddit.statusLabel, state.reddit.statusType);
-  }
-  if (state.wiki) {
-    if (state.wiki.personal !== undefined) document.getElementById('wiki-personal').textContent = `个人 ${state.wiki.personal} 篇`;
-    if (state.wiki.enterprise !== undefined) document.getElementById('wiki-enterprise').textContent = `企业 ${state.wiki.enterprise} 篇`;
-    if (state.wiki.pending !== undefined) document.getElementById('wiki-pending').textContent = `待整理 ${state.wiki.pending} 篇`;
-    if (state.wiki.categories !== undefined) document.getElementById('wiki-categories').textContent = `${state.wiki.categories} 个分类`;
   }
   if (state.scheduler) {
     if (state.scheduler.enabled !== undefined) updateScheduleUI(state.scheduler.enabled);
@@ -480,6 +640,127 @@ function toast(msg) {
   el.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+}
+
+// ============ 弹层 ============
+function openModal(id) { document.getElementById(id).classList.add('show'); }
+function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+
+// ============ 对话助手 ============
+function openChatModal() {
+  document.getElementById('chat-result').innerHTML = '';
+  document.getElementById('chat-query').value = '';
+  openModal('chat-modal');
+  setTimeout(() => document.getElementById('chat-query').focus(), 100);
+}
+
+document.getElementById('chat-query').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') submitChat();
+});
+
+function submitChat() {
+  const q = document.getElementById('chat-query').value.trim();
+  if (!q) { toast('请输入关键词'); return; }
+  const btn = document.getElementById('chat-submit-btn');
+  const resultEl = document.getElementById('chat-result');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>思考中…';
+  resultEl.innerHTML = '<div class="inline-hint">调用豆包中，约需 5-30 秒…</div>';
+
+  callAction('open-chat', { query: q }).then(result => {
+    btn.disabled = false;
+    btn.innerHTML = '提问';
+    if (!result || !result.chat) {
+      resultEl.innerHTML = `<div class="chat-answer">⚠️ ${result && result.message || '调用失败'}</div>`;
+      return;
+    }
+    const c = result.chat;
+    let html = '';
+    if (c.answer) html += `<div class="chat-answer">${escapeHtml(c.answer)}</div>`;
+    if (c.sources && c.sources.length) {
+      html += '<div style="margin-top:8px;font-size:12px;color:var(--text-tertiary)">相关 Wiki 页面：</div>';
+      c.sources.forEach(s => {
+        html += `<a class="chat-source" href="${s.url}" onclick="event.preventDefault(); openInBrowser('${s.url}')">📄 ${escapeHtml(s.title)}</a>`;
+      });
+    }
+    if (c.message && c.status === 'error') {
+      html += `<div class="chat-answer" style="color:var(--danger)">⚠️ ${escapeHtml(c.message)}</div>`;
+    }
+    resultEl.innerHTML = html;
+  });
+}
+
+function openInBrowser(url) { callAction('view-url', { url: url }); toast('请在浏览器中打开：' + url); }
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, ch => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[ch]));
+}
+
+// ============ Wiki 清理 ============
+let cleanupPendingPrefix = '';
+
+function previewCleanup() {
+  const prefix = document.getElementById('cleanup-prefix').value.trim();
+  if (!prefix) { toast('请输入要匹配的标题前缀'); return; }
+  const execBtn = document.getElementById('cleanup-execute-btn');
+  execBtn.disabled = true;
+  document.getElementById('cleanup-result').innerHTML = '<div class="inline-hint"><span class="spinner"></span>扫描中…</div>';
+  openModal('cleanup-modal');
+
+  callAction('cleanup-wiki-preview', { prefix }).then(result => {
+    const resultEl = document.getElementById('cleanup-result');
+    if (!result || !result.cleanup) {
+      resultEl.innerHTML = `<div class="chat-answer">⚠️ ${(result && result.message) || '预览失败'}</div>`;
+      return;
+    }
+    const matched = result.cleanup.matched || [];
+    if (!matched.length) {
+      resultEl.innerHTML = `<div class="chat-answer">没有标题以 "<b>${escapeHtml(prefix)}</b>" 开头的节点</div>`;
+      return;
+    }
+    cleanupPendingPrefix = prefix;
+    let html = `<div class="chat-answer" style="color:var(--warning)">⚠️ 匹配到 <b>${matched.length}</b> 个节点，确认后将<b>连同子页一起删除</b>，不可恢复：</div>`;
+    matched.forEach(n => {
+      html += `<div class="cleanup-item">${escapeHtml(n.title)}</div>`;
+    });
+    html += `<div class="inline-hint">关闭此窗口，回到主界面点"执行删除"按钮生效。</div>`;
+    resultEl.innerHTML = html;
+    execBtn.disabled = false;
+  });
+}
+
+function executeCleanup() {
+  const prefix = document.getElementById('cleanup-prefix').value.trim();
+  if (!prefix) { toast('请先输入前缀并预览'); return; }
+  if (prefix !== cleanupPendingPrefix) {
+    toast('请先点预览匹配项，确认列表后再执行');
+    return;
+  }
+  if (!confirm(`确认删除所有以 "${prefix}" 开头的 Wiki 节点？此操作不可恢复。`)) return;
+
+  const execBtn = document.getElementById('cleanup-execute-btn');
+  execBtn.disabled = true;
+  execBtn.innerHTML = '<span class="spinner"></span>删除中…';
+  document.getElementById('cleanup-result').innerHTML = '<div class="inline-hint"><span class="spinner"></span>正在删除，请勿关闭…</div>';
+  openModal('cleanup-modal');
+
+  callAction('cleanup-wiki-execute', { prefix }).then(result => {
+    execBtn.disabled = false;
+    execBtn.innerHTML = '执行删除';
+    const resultEl = document.getElementById('cleanup-result');
+    if (!result || !result.cleanup) {
+      resultEl.innerHTML = `<div class="chat-answer" style="color:var(--danger)">⚠️ ${(result && result.message) || '删除失败'}</div>`;
+      return;
+    }
+    const c = result.cleanup;
+    let html = `<div class="chat-answer">${escapeHtml(c.message || '')}</div>`;
+    (c.deleted || []).forEach(n => { html += `<div class="cleanup-item ok">${escapeHtml(n.title)}</div>`; });
+    (c.failed || []).forEach(n => { html += `<div class="cleanup-item fail">${escapeHtml(n.title)} — ${escapeHtml(n.error || '')}</div>`; });
+    resultEl.innerHTML = html;
+    cleanupPendingPrefix = '';
+  });
 }
 </script>
 

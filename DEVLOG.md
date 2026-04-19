@@ -634,6 +634,358 @@ UI 读到这个文件，卡片显示红色"失败"徽章 + 具体原因，用户
 
 ---
 
+## 十一、步骤 A.2：Trending + 豆包 AI 日报（2026-04-18）
+
+### 背景
+
+用户给出了飞书 Wiki 里一份参考格式的截图 —— 按日期汇总的 GitHub Trending 日报，
+每个仓库含：编号标题 / 仓库链接 / stars 数据 / 一句话定位 / 500 字详细介绍。
+原有 `import-github` 流程（静态 repo_list + 搜索 topic）完全不符合这个格式。
+
+### 新数据流
+
+```
+GitHub /trending HTML       
+        ↓ BeautifulSoup 解析      
+   [10 条仓库元数据]      
+        ↓ 逐个调 fetch_repo()      
+   [+ README 内容]      
+        ↓ 豆包 AI（doubao-seed-2-0-mini-260215）      
+   [+ one_liner, detail]      
+        ↓ 按日期聚合      
+  飞书 Wiki "github专区" 下      
+  「GitHub Trending 日报 YYYY-MM-DD」一页      
+```
+
+### 新增/改动文件
+
+| 文件 | 角色 |
+|------|------|
+| `src/importers/github_trending.py`（**新**） | `GitHubTrending.fetch()`：爬 `/trending/{language}?since={period}` HTML，BeautifulSoup 解析 `article.Box-row`，提取 full_name / url / description / language / stars_total / stars_today / forks，带 3 次重试 |
+| `src/importers/ai_summarizer.py`（**新**） | `AISummarizer.summarize_repo()`：调豆包 REST API，`response_format={"type":"json_object"}` 强制 JSON 输出，解析 `{one_liner, detail}`。带占位检测 `configured()` |
+| `src/importers/feishu_doc_writer.py`（改） | 新增 `find_node_by_title()`：分页扫 `ListSpaceNode` 按标题匹配；新增 `write_daily_trending_report()`：找到 `github专区` 父节点 → 当日已存在则跳过 → 否则创建一页按截图格式排版；`_build_daily_report_blocks()` 构造 H1 概述 + (H2 编号标题 → 链接 → ⭐ → 📌 一句话 → H3 详细介绍 → 段落 → 分割线) × N |
+| `main.py` | `cmd_import_github` 重写为 dispatcher：`trending.enabled=true` 走新流程（`_run_trending_pipeline`），否则走老流程（`_run_legacy_pipeline`）。老流程保留不删，用作兼容 |
+| `config/credentials.json.example` | github 下新增 `trending` 配置块（enabled / period / language / limit） + `parent_folder`；`repo_list` / `search_topics` 默认空数组 |
+| `requirements.txt` | 新增 `beautifulsoup4>=4.12.0` |
+
+### 关键设计
+
+**1. HTML 结构解析**
+
+GitHub 无官方 Trending API。在沙箱实测确认了 DOM 结构：
+
+| 字段 | CSS 选择器 |
+|------|-----------|
+| 仓库 full_name | `article.Box-row h2 a[href]` （去掉开头的 `/`） |
+| 描述 | `article p` |
+| 主要语言 | `span[itemprop='programmingLanguage']` |
+| 总 stars | `a.Link--muted[href$='/stargazers']` |
+| Forks | `a.Link--muted[href$='/forks']` |
+| 今日新增 | `span.d-inline-block.float-sm-right`（文本 "458 stars today"） |
+
+`_parse_number()` 容错处理 `1,280` / `45.2k` / `458 stars today` 三种格式。
+
+**2. 豆包 Prompt 设计**
+
+system 设定为"资深中文技术分析师"，user 要求严格 4 段式：
+
+- 项目背景：解决什么痛点
+- 核心功能：能做什么
+- 技术亮点：技术栈 + 先进性（技术术语首次出现加括号注释）
+- 适用场景：哪些团队 / 业务会用
+
+使用豆包的 `response_format: {"type":"json_object"}` 约束输出为 JSON。
+兜底：`_parse_json()` 剥掉 `​`​`​`json 围栏，找不到合法 JSON 就取首尾 `{}`。
+
+**3. 飞书 Wiki 节点定位**
+
+截图里用户的 Wiki 是：`巴老师AI知识库一匹黑马 → github专区 → 今日日报`。
+代码不能硬编码节点 token（每个用户不同），改用 `find_node_by_title`
+扫描 Wiki 顶层节点匹配"github专区"拿 node_token，再以它为
+`parent_node_token` 创建日报页。
+
+**4. 去重策略变化**
+
+老流程按 `repo_full_name` 去重（`github_imported.json`）；新流程**按日期**去重 ——
+同一天已有日报就跳过，除非 `--force`。不再每仓库一页，所以旧索引不再使用（保留代码兼容）。
+
+### 统计文件变化
+
+`logs/github_last_run.json` 新字段（trending 模式）：
+
+```json
+{
+  "at": "...",
+  "status": "success | partial | skipped | error",
+  "mode": "trending",
+  "fetched": 10,
+  "summarized": 10,
+  "ai_failed": 0,
+  "wiki_url": "https://open.feishu.cn/wiki/xxxx",
+  "message": "抓取 10 个 · 摘要成功 10 · AI 失败 0"
+}
+```
+
+老字段 `imported / skipped_dup / failed / urls` 仅在 legacy 模式下填充。
+
+### 成本评估
+
+- Doubao-Seed-2.0-mini：**0.2 元 / 百万 token（输入）**
+- 每个 README 截断到 12K 字符 ≈ 4K token，10 个仓库 ≈ 40K token / 天
+- **每日成本 ≈ 0.008 元，一个月 ≈ 0.25 元**
+
+Pro 模型如果效果不够再切，几乎零成本迁移（改一个模型 ID）。
+
+### 未完成 / 下一步
+
+- 图片支持：Trending 页面有项目预览 OG image，当前不抓
+- 多语言 Trending 轮询：目前只抓"全部语言"，可以按配置轮询 `python` / `typescript` 分别生成分类日报
+- Token 使用量统计：`logs/doubao_usage.json` 记录每日 token 消耗
+- UI 卡片展示：目前 UI 只读 `github_last_run.json` 的老字段，需扩展以展示 `wiki_url`
+
+---
+
+*步骤 A.2 日志生成：2026-04-18*
+
+---
+
+## 十二、步骤 A.2.1：改为"文件夹 + 子页面"布局（2026-04-18 晚）
+
+### 背景
+
+步骤 A.2 首轮跑通后，用户反馈：目前的日报是**一页塞 10 个仓库**，阅读/检索不友好。
+新需求：
+
+```
+github专区/
+└── GitHub Trending 日报 2026-04-18/      ← 文件夹（封面页）
+    ├── 1. thunderbird/thunderbolt        ← 独立一页
+    ├── 2. BasedHardware/omi              ← 独立一页
+    └── ...
+```
+
+### 改动
+
+`src/importers/feishu_doc_writer.py::write_daily_trending_report` 重写：
+
+1. 找父节点 `github专区` → 找/建当日文件夹 → 逐个仓库建子页
+2. 封面页（文件夹本身）：H1 + 概述 + 每个仓库 H3 标题 + 📌 一句话 + ⭐ 数据+链接
+3. 子页面：🔗 链接 + ⭐ 数据 + 📌 一句话 + H2 详细介绍 + 4 段正文
+4. 每个子页面按标题去重，失败/中断可续跑
+5. 返回结构变为 `{folder_url, folder_token, repo_pages: [...], created_count, skipped_count}`
+
+`main.py cmd_import_github` 同步：
+
+- 取消文件夹级早退（有部分子页丢失时也要补建）
+- 控制台输出每个子页的 URL + 🆕 新建标记
+
+### 收益
+
+- Wiki 目录结构与用户原截图一致（每个仓库独立一页）
+- 续跑能力：`trending_cache_*.json` 管 AI 成本，`find_node_by_title` 管 Wiki 去重，
+  部分失败后重跑只补差异，不重复烧豆包、不重复建节点
+- 搜索体验：飞书搜"openai/whisper"能直接命中一页，而不是在长页里翻章节
+
+*步骤 A.2.1 日志生成：2026-04-18*
+
+---
+
+## 十三、步骤 B：Reddit AI 日报（2026-04-19）
+
+### 背景
+
+GitHub 通路跑通后，用户需求镜像 Reddit 版：订阅 AI 相关 subreddit → 豆包
+摘要 → 同款"文件夹 + 子页"布局写入飞书 reddit专区。
+
+用户敲定的参数：
+- Subreddits：`r/MachineLearning` · `r/LocalLLaMA` · `r/ClaudeAI` · `r/LLMDevs`
+- 每日取 top 10 条
+- Self post 抓正文 + 前 3 条高赞评论
+- 调度时间和 GitHub 一致（09:00）
+- Reddit 在中国大陆被墙，必须挂 VPN
+
+### 数据流
+
+```
+Reddit 4 个 subreddit
+  ├─ /r/{sub}/top.json?t=day&limit=10    → 每个 sub 10 条
+  │
+  ▼
+  合并 + 按 score 降序 + 去重 + 取前 10 条
+  │
+  ▼  每条帖子
+  /r/{sub}/comments/{id}.json?sort=top   → 抓前 3 条高赞顶层评论
+  │
+  ▼
+  豆包 API (同模型 doubao-seed-2-0-mini-260215)
+  prompt 4 段式: 话题背景 / 核心观点 / 技术要点 / 讨论亮点
+  │
+  ▼
+  飞书 Wiki:
+  reddit专区/
+    Reddit AI 日报 YYYY-MM-DD/
+      1. [MachineLearning] <标题>
+      2. [LocalLLaMA] <标题>
+      ...
+```
+
+### 新增 / 修改文件
+
+| 文件 | 作用 |
+|------|------|
+| `src/importers/reddit_importer.py`（**新**） | `RedditImporter.fetch_daily()`：遍历 subreddits → `/top.json?t=day` → 合并去重 → 取 top N → 每条拉 `/comments/.json` 取顶层高赞评论。3 次重试，User-Agent 必带 |
+| `src/importers/ai_summarizer.py`（改） | 新增 `DEFAULT_REDDIT_PROMPT_TEMPLATE` 和 `summarize_reddit_post()`。抽出 `_chat_json()` 公共方法，两个摘要任务共用 |
+| `src/importers/feishu_doc_writer.py`（改） | 新增 `write_daily_reddit_report()` + `_build_reddit_folder_cover_blocks()` + `_build_single_reddit_post_blocks()`。镜像 GitHub 的 "文件夹 + 子页"，额外加"精选评论"分节 |
+| `main.py`（改） | 新增 `cmd_import_reddit()` 和 `import-reddit` 子命令。支持 `--force`；缓存文件 `logs/reddit_cache_YYYY-MM-DD.json`；统计 `logs/reddit_last_run.json` |
+| `src/scheduler.py`（改） | `_run_reddit()` 从 pending 占位改为真调 `cmd_import_reddit()` |
+| `config/credentials.json.example`（改） | 新增 `reddit` 配置块；`schedule.jobs` 里 reddit `enabled=true, hour=9` |
+
+### 关键设计决策
+
+**1. 用 JSON 端点 而非 RSS**
+
+用户提到老版本用 RSS。但 Reddit 的 `/top.json?t=day` 在 metadata 丰富度上碾压 RSS：
+
+| 字段 | RSS | JSON |
+|-----|-----|------|
+| title / link | ✓ | ✓ |
+| score | ❌ | ✓ |
+| num_comments | ❌ | ✓ |
+| selftext | 仅摘要 | 完整 |
+| is_self / flair | ❌ | ✓ |
+
+既然都不需要 OAuth、都用 User-Agent，选 JSON 零成本得到这些排序依据。
+
+**2. 按 score 全局排序**
+
+每个 sub 抓 10 条（共 40），去重合并后按 score 降序取前 10。结果偏向"有热度的帖子"
+而非"均匀分配给每个 sub"，对用户信息密度最友好。
+
+**3. 共享 AI 摘要缓存格式**
+
+`reddit_cache_YYYY-MM-DD.json` 复用 trending 缓存的加载/保存函数（`_load_trending_cache` /
+`_save_trending_cache`），格式相同 `[{..., summary_ok: bool}, ...]`。续跑时只补
+`summary_ok=false` 的条目，节省豆包成本。
+
+**4. 飞书页面标题清洗**
+
+Reddit 帖子标题常含 `/` `:` `*` `?` 等飞书不允许的字符，`write_daily_reddit_report` 里
+用 `re.sub(r"[\\/:*?\"<>|]", " ", ...)` 清洗；太长的标题截断到 80 字。
+
+**5. VPN / 代理**
+
+Python `requests` 库会自动使用 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量，所以代码
+无需显式设置。PowerShell 下：
+
+```powershell
+$env:HTTP_PROXY = "http://127.0.0.1:7890"
+$env:HTTPS_PROXY = "http://127.0.0.1:7890"
+python main.py import-reddit
+```
+
+### 成本估算
+
+- 4 个 sub × 10 帖 = 40 次 Reddit API 请求 + 10 次评论请求 = 50 次 HTTP
+- Reddit 匿名限 10 req/min，代码里每 sub 间隔 1s + 每帖 0.5s，约 1 分钟抓完
+- 豆包：每帖约 3-5K token（含 3 条评论），10 条 ≈ 40K token / 天
+- 每日成本 ≈ 40K × 0.2 / 100万 = **0.008 元**
+
+### 未完成 / 下一步
+
+- Link post（外链贴）目前只记录 URL，不抓外链正文。未来可加可选的网页抓取
+- 没有单测，靠沙箱 smoke test 保障基本结构
+- UI 卡片没对接 `reddit_last_run.json`，下次迭代补
+
+---
+
+*步骤 B 日志生成：2026-04-19*
+
+---
+
+## 十四、生产化冲刺（2026-04-19 晚）
+
+### 背景
+
+步骤 B 跑通后用户下令"今天必须正式可以生产上线"。按 Phase A/B/C
+分三次 commit 完成了：UI 全按钮连真后端、新增对话助手、新增 Wiki 清理、
+AI 缓存续跑优化、自动化诊断。
+
+### Phase A：后端补齐（commit `8208962`）
+
+| 改动 | 文件 |
+|------|------|
+| AI 缓存过滤 `summary_ok=false`，失败项自动重试（不用 --force） | `main.py::_run_trending_pipeline` / `cmd_import_reddit` |
+| README 截断 8K → 4K，Reddit selftext 6K → 3K，评论 2400 → 1500，重试 1 次 → 2 次 | `src/importers/ai_summarizer.py` |
+| `cmd_chat`：飞书 Wiki v1 SearchNode 搜关键词 → 豆包总结 → `--json` 供 UI | `main.py` |
+| `cmd_cleanup_wiki`：按标题前缀删节点，默认 dry-run，`--confirm` 才真删；lark-oapi 没包 DeleteSpaceNode，raw REST 直调 | `main.py` |
+
+### Phase B：UI 全按钮打通（commit `50b2707`）
+
+**按钮 → 后端 对照**：
+
+| UI 按钮 | 后端 |
+|--------|------|
+| 对话助手「打开」| `chat --json` → modal 展示答案 + 相关 Wiki |
+| GitHub「立即执行」| `import-github`（带 spinner） |
+| GitHub「Wiki」| `shell.openExternal(github_last_run.wiki_url)` |
+| GitHub「日志」| `shell.openPath(logs/feishu_agent.log)` |
+| Reddit「立即执行」| `import-reddit`（改为真调） |
+| Reddit「Wiki」| `shell.openExternal(reddit_last_run.wiki_url)` |
+| Wiki 整理「预览分类结果」| `organize --dry-run` |
+| Wiki 整理「执行整理」| `organize` |
+| Wiki 清理「预览匹配项」| `cleanup-wiki --prefix X --json` → modal 列表 |
+| Wiki 清理「执行删除」| `cleanup-wiki --prefix X --confirm --json` + confirm() 二次确认 |
+| 调度开关 | spawn `schedule` / taskkill |
+
+**前端新增**：
+- 对话 modal（带 spinner，Enter 提交，相关页面链接可点开）
+- Wiki 清理 modal（预览匹配列表，警告文案，confirm 二次确认）
+- `runWithSpinner()` 包装所有长耗时按钮
+- `extractJsonFromStdout()` 从 Python 输出末尾拎 JSON
+
+**兼容老字段**：`buildUiState` 在 GitHub 卡片里同时支持新 trending 字段
+(`mode/fetched/summarized/pages_created`) 和老 legacy 字段（`imported/skipped_dup`）。
+
+### Phase C：自动化诊断（commit `待`）
+
+`scripts/diag_ui.py` 逐个验证 10 个 UI 按钮对应的 CLI 动作是否通：
+
+```
+⏳ schedule-status    调度器状态                ...
+⏳ chat               对话助手（豆包调用）      ...
+⏳ github-wiki        GitHub Wiki URL           ...
+⏳ reddit-wiki        Reddit Wiki URL           ...
+⏳ github-log         日志文件存在性            ...
+⏳ cleanup-preview    Wiki 清理预览 (空匹配)    ...
+⏳ github             GitHub 抓取真跑 [slow]    ...
+⏳ reddit             Reddit 抓取真跑 [slow]    ...
+⏳ wiki-preview       Wiki 整理预览 (dry-run)   ...
+⏭  wiki-execute      Wiki 整理执行 (跳过)
+```
+
+命令行：
+- `python scripts/diag_ui.py` —— 全部跑
+- `python scripts/diag_ui.py --fast` —— 跳过慢任务（github/reddit/organize）
+- `python scripts/diag_ui.py --only chat,schedule-status` —— 只跑指定的
+
+### 安全设计
+
+`cmd_cleanup_wiki` 的三重防误删：
+1. `--prefix` 必填（空前缀拒绝）
+2. 默认 dry-run，`--confirm` 才真删
+3. UI 端再加 `confirm()` 二次弹窗
+
+对话助手的优雅降级：
+- 豆包未配置 → 降级为只列搜索结果，不报错
+- 豆包超时 → 返回 `partial` 状态 + 降级文案
+- Wiki 搜索失败 → 错误信息上报到 UI 的 modal 而非 toast
+
+---
+
+*生产化冲刺日志生成：2026-04-19*
+
+---
+
 ## 八、启动指南（给未来的自己）
 
 **从零启动：**

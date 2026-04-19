@@ -127,12 +127,15 @@ class FeishuScheduler:
             self._record_run("github", "error", message=str(e))
 
     def _run_reddit(self) -> None:
-        logger.info("[scheduler] 触发任务: reddit (尚未实现，等待步骤 B)")
-        self._record_run(
-            "reddit",
-            "pending",
-            message="Reddit 模块尚未实现，将在步骤 B 中开发",
-        )
+        logger.info("[scheduler] 触发任务: reddit")
+        try:
+            import argparse
+            from main import cmd_import_reddit
+            cmd_import_reddit(argparse.Namespace(force=False))
+            self._record_run("reddit", "success")
+        except Exception as e:
+            logger.exception("reddit 任务失败")
+            self._record_run("reddit", "error", message=str(e))
 
     def _write_pid(self) -> None:
         os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)

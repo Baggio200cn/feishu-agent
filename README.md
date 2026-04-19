@@ -58,11 +58,21 @@ python main.py organize --dry-run
 # 执行文档整理
 python main.py organize
 
-# 导入 GitHub 仓库（增量，自动跳过已导入的仓库）
+# GitHub Trending 日报：抓取 /trending → 豆包 AI 中文摘要 → 写入飞书 Wiki
+# 默认模式（credentials.json 里 github.trending.enabled=true 时）：
+#   - 按日期生成一页「GitHub Trending 日报 YYYY-MM-DD」，放在 github专区 子节点下
+#   - 当日已存在则跳过（加 --force 强刷）
 python main.py import-github
 
-# 强制重新导入所有仓库（忽略去重索引）
+# 强刷（忽略当日去重）
 python main.py import-github --force
+
+# Reddit AI 日报：订阅的 subreddit → 豆包摘要 → 飞书 reddit专区
+# 注意：Reddit 在中国大陆被墙，必须先挂 VPN；代码会识别 HTTP_PROXY / HTTPS_PROXY
+python main.py import-reddit
+
+# 强刷（忽略缓存，重新调豆包）
+python main.py import-reddit --force
 
 # 查看邮件
 python main.py manage email
