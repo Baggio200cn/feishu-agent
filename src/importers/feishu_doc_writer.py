@@ -714,12 +714,14 @@ class FeishuDocWriter:
     def _build_reddit_folder_cover_blocks(
         self, items_with_summary: List[Dict[str, Any]], date_str: str
     ) -> List:
+        """Reddit 日报封面页：每个帖子显示完整中文摘要（one_liner + detail 4 段）"""
         blocks: List = []
         blocks.append(self._h1_block(f"Reddit AI 日报 · {date_str}"))
         blocks.append(
             self._text_block(
                 f"每日从订阅的 AI 相关 subreddit 抓取 top of day 帖子"
-                f"（共 {len(items_with_summary)} 条），每条详情见下方子页面。"
+                f"（共 {len(items_with_summary)} 条），每条下方是豆包 AI 生成的"
+                f"中文详细摘要；点击每条标题可进入独立子页查看精选评论。"
             )
         )
         blocks.append(self._divider())
@@ -727,20 +729,44 @@ class FeishuDocWriter:
         for idx, item in enumerate(items_with_summary, 1):
             post = item.get("post", {})
             summary = item.get("summary") or {}
+            summary_ok = item.get("summary_ok", True)
+
             subreddit = post.get("subreddit", "?")
             title = post.get("title", "")
             one_liner = summary.get("one_liner") or "（无摘要）"
+            detail = summary.get("detail") or ""
             score = post.get("score", 0)
             num_comments = post.get("num_comments", 0)
             permalink = post.get("permalink", "")
 
-            blocks.append(self._h3_block(f"{idx}. [{subreddit}] {title[:70]}"))
-            blocks.append(self._text_block(f"📌 {one_liner}"))
+            # H2 标题：编号 + [sub] + 英文原标题
+            blocks.append(self._h2_block(f"{idx}. [{subreddit}] {title[:100]}"))
+
+            # 元信息
             blocks.append(
                 self._text_block(
-                    f"⬆️ {score} · 💬 {num_comments} · 🔗 {permalink}"
+                    f"⬆️ {score} points · 💬 {num_comments} comments · 🔗 {permalink}"
                 )
             )
+
+            if summary_ok:
+                # 📌 一句话中文定位
+                blocks.append(self._text_block(f"📌 {one_liner}"))
+                # H3 + 4 段中文详情
+                blocks.append(self._h3_block("详细介绍"))
+                for paragraph in self._split_paragraphs(detail):
+                    blocks.append(self._text_block(paragraph))
+            else:
+                # AI 失败时的明确提示
+                blocks.append(
+                    self._text_block(
+                        "⚠️ 豆包 AI 摘要失败（常见原因：超时 / 帖子内容过长）。"
+                        "请点击上方 🔗 原帖链接直接阅读英文原文，或运行 "
+                        "`python main.py import-reddit --force` 重新生成。"
+                    )
+                )
+
+            blocks.append(self._divider())
 
         return blocks
 
