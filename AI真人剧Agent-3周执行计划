@@ -1,0 +1,109 @@
+cat > AI真人剧Agent-3周执行计划.md <<'EOF'
+# AI真人剧创作辅助 Agent：3周执行计划（覆盖 A→E 架构并可 Demo）
+> 适用仓库：`Baggio200cn/feishu-agent`  
+> 当前日期：2026-04-19  
+> 目标：3 周内完成 A→E 五层能力最小闭环，并可进行 Demo 演示与基础评测。
+
+## 0. 项目目标与范围
+### 0.1 总目标（3周）
+在现有平台基础（TikTok 导演级工具流 + Seedance 4.0）上，完成一个可运行的“AI真人剧创作辅助 Agent”系统，具备：
+- A. Orchestrator（总编排层）
+- B. Specialist Agents（专业子代理层）
+- C. Memory & Knowledge（记忆知识层）
+- D. Tool Runtime（工具执行层）
+- E. Evaluation Harness（评测回归层）
+
+并可完成端到端 Demo：
+输入一句创意需求 → 输出剧情梗概/分场剧本/分镜计划/生成任务清单/发布草案 + 评测报告。
+
+## 1. 总体架构（A→E 映射）
+- A 编排层：需求解析、任务拆解、质量 Gate
+- B 专业 Agent：Story/Script/Directing/Performance/Continuity/Publishing
+- C 记忆层：Project/Episode/Asset/Feedback 四层记忆
+- D 工具执行层：模型路由、异步任务、外部连接器
+- E 评测层：规则评测 + LLM 评测 + 回归对比
+
+## 2. 三周执行计划（按天粒度）
+
+### 第1周：A/C 骨架
+目标：跑通“需求输入���任务拆解→状态流转”，完成 DSL + Schema
+- Day1-2：流程图、核心实体、Pydantic Schema
+- Day3-4：Orchestrator 状态机、Memory Service（Postgres/Redis）
+- Day5-6：可观测性（OpenTelemetry）、重试/超时/幂等/回放
+- Day7：周验收
+DoD：结构化执行计划可生成；失败可重试；链路可追踪
+
+### 第2周：B/D 打通
+目标：6 个 Agents 全量可用，接入工具链，完成质量 Gate
+- Day8-10：6 个 Agent 完成（结构化输出）
+- Day11-12：Agent Router、Tool Runtime、至少1个真实外部通道
+- Day13：一致性/连贯性/可执行性 Gate
+- Day14：端到端联调验收
+DoD：全链路不中断，失败可回退/降级
+
+### 第3周：E 闭环 + Demo
+目标：评测回归体系 + 演示交付
+- Day15-17：Benchmark（20条）+ 规则评测 + LLM Judge
+- Day18-19：版本对比、成本性能看板
+- Day20-21：彩排、失败注入、最终验收
+DoD：版本改动可自动评测并产出报告；Demo 稳定跑通 3 次以上
+
+## 3. 技术栈详细分析（含术语科普）
+
+### 3.1 后端
+- Python 3.11+ / FastAPI / Pydantic v2
+- 解释：Schema=数据结构规范；Contract=服务输入输出协议
+
+### 3.2 编排
+- 首选自研状态机（可控、可回放、易审计）
+- 解释：Orchestrator=“总导演”；HITL=关键节点人工确认
+
+### 3.3 异步工作流
+- 首选 Temporal（长任务友好），备选 Celery
+- 解释：Retry=重试；Timeout=超时；Compensation=补偿动作
+
+### 3.4 存储与记忆
+- Postgres（主数据）+ Redis（缓存/锁）+ 对象存储（素材）+ pgvector/Milvus（语义检索）
+- 解释：RAG=先检索再生成，减少胡编
+
+### 3.5 模型网关
+- 统一鉴权、路由、熔断、计费统计、Prompt版本管理
+- 解释：Circuit Breaker=连续失败自动“断路”保护系统；A/B=策略对比实验
+
+### 3.6 可观测与评测
+- OpenTelemetry + Prometheus/Grafana +（可选）Langfuse
+- 指标：质量、延迟（P95）、成本、稳定性
+- 解释：P95=95%请求都快于该时延
+
+## 4. 目录结构建议
+- apps/: api/orchestrator/agent-runtime/evaluator/web-console
+- services/: memory/model-gateway/tool-connectors/asset-service
+- libs/: schemas/prompts/quality-gates/telemetry
+- benchmarks/: datasets/rubrics/reports
+- infra/: docker/k8s/terraform
+- docs/: architecture/runbook/demo-script
+
+## 5. Demo 设计
+输入：90秒都市悬疑短剧，3角色，反转结尾，适配TikTok  
+输出：Outline、Script、ShotPlan、RenderTasks、PublishPack、评测报告
+
+## 6. 风险与应对
+- 外部工具不稳：超时+重试+熔断+降级
+- 风格漂移：角色圣经 + Continuity Gate
+- 成本超预算：模型分层路由
+- 协作冲突：版本锁 + 审批流 + 回滚
+
+## 7. 上线最低标准
+- 端到端成功率 ≥ 85%
+- 关键质量指标较基线提升 ≥ 20%
+- Demo 平均耗时可控（建议 ≤ 10 分钟）
+- 失败任务可定位并重放
+
+## 8. 今日开工清单
+- 冻结 schemas V1
+- 搭建状态机骨架
+- 先做 Story/Script/Directing 三 Agent
+- 打通 Postgres+Redis+对象存储
+- 接入最小可观测
+- 先跑 5 条 benchmark，再扩到 20 条
+EOF
