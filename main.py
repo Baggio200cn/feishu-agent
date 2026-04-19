@@ -825,17 +825,28 @@ def _agent_stage_plan(args, client, wiki_space_id, brain, result, json_output):
         result["preview"] = {
             "type": "empty_nodes",
             "scanned": res["scanned"],
+            "checked": res.get("checked", 0),
+            "skipped_unreadable": res.get("skipped_unreadable", 0),
             "count": len(empty),
-            "items": [{"title": e["title"], "node_token": e["node_token"], "block_count": e["block_count"]} for e in empty],
+            "items": [
+                {"title": e["title"], "node_token": e["node_token"], "text_length": e.get("text_length", 0)}
+                for e in empty
+            ],
         }
         if intent == "find_empty" or not empty:
             result["action_spec"] = None
             result["status"] = "success"
-            result["message"] = f"扫 {res['scanned']} 个节点，{len(empty)} 个空"
+            result["message"] = (
+                f"扫 {res['scanned']} 个节点，读到正文 {res.get('checked', 0)} 个，"
+                f"读不到（权限/类型不支持）{res.get('skipped_unreadable', 0)} 个，"
+                f"真正为空 {len(empty)} 个"
+            )
         else:
             result["action_spec"] = {
                 "action": "delete_nodes",
                 "tokens": [e["node_token"] for e in empty],
+                "obj_tokens": [e["obj_token"] for e in empty],
+                "obj_types": [e["obj_type"] for e in empty],
                 "descriptions": [e["title"] for e in empty],
             }
             result["status"] = "success"
@@ -848,7 +859,6 @@ def _agent_stage_plan(args, client, wiki_space_id, brain, result, json_output):
             result["message"] = "AI 没提取出前缀，请改说得更具体"
             _emit_chat_result(result, json_output)
             return
-        # 复用 cleanup-wiki 的 dry-run 预览路径
         matched = wiki_tools.list_all_nodes(client, wiki_space_id, max_nodes=500)
         matched = [n for n in matched if n["title"].startswith(prefix)]
         result["preview"] = {
@@ -865,6 +875,8 @@ def _agent_stage_plan(args, client, wiki_space_id, brain, result, json_output):
             result["action_spec"] = {
                 "action": "delete_nodes",
                 "tokens": [n["node_token"] for n in matched],
+                "obj_tokens": [n["obj_token"] for n in matched],
+                "obj_types": [n["obj_type"] for n in matched],
                 "descriptions": [n["title"] for n in matched],
             }
             result["status"] = "success"
@@ -918,14 +930,22 @@ def _agent_stage_execute(args, client, wiki_space_id, app_id, app_secret, brain,
 
     if action == "delete_nodes":
         tokens = spec.get("tokens") or []
+        obj_tokens = spec.get("obj_tokens") or []
+        obj_types = spec.get("obj_types") or []
         descs = spec.get("descriptions") or [""] * len(tokens)
         if not tokens:
             result["message"] = "tokens 为空"
             _emit_chat_result(result, json_output)
             return
+        if len(obj_tokens) != len(tokens) or len(obj_types) != len(tokens):
+            result["message"] = "obj_tokens / obj_types 数量必须和 tokens 一致（底层文件删除需要）"
+            _emit_chat_result(result, json_output)
+            return
         for i, tk in enumerate(tokens):
             title = descs[i] if i < len(descs) else ""
-            r = wiki_tools.delete_wiki_node(app_id, app_secret, wiki_space_id, tk)
+            ot = obj_tokens[i]
+            otype = obj_types[i] or "docx"
+            r = wiki_tools.delete_wiki_node(client, wiki_space_id, tk, ot, otype)
             if r["ok"]:
                 deleted.append({"title": title, "node_token": tk})
                 logger.info(f"✅ Agent 删除: {title}")
@@ -1049,6 +1069,8 @@ def cmd_cleanup_wiki(args):
                     matched_nodes.append({
                         "title": title,
                         "node_token": it.node_token,
+                        "obj_token": getattr(it, "obj_token", "") or "",
+                        "obj_type": getattr(it, "obj_type", "") or "docx",
                     })
             if not getattr(resp.data, "has_more", False):
                 break
@@ -1073,43 +1095,23 @@ def cmd_cleanup_wiki(args):
             _emit_cleanup_result(result, json_output)
             return
 
-        # 2. 真删 —— lark-oapi 1.5.3 没包 DeleteSpaceNode，用 raw REST
-        import requests as _requests
+        # 2. 真删 —— 飞书 Wiki v2 无公开 DeleteNode API，通过 drive.v1 删除底层 docx
+        from src.agent.wiki_tools import delete_wiki_node as _del_node
 
-        personal_cfg = creds["accounts"]["personal"]
-        auth_resp = _requests.post(
-            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-            json={
-                "app_id": personal_cfg.get("app_id", ""),
-                "app_secret": personal_cfg.get("app_secret", ""),
-            },
-            timeout=10,
-        )
-        auth_json = auth_resp.json() if auth_resp.status_code == 200 else {}
-        tenant_token = auth_json.get("tenant_access_token", "")
-        if not tenant_token:
-            result["message"] = f"获取 tenant_access_token 失败: {auth_json}"
-            _emit_cleanup_result(result, json_output)
-            return
-
-        headers = {"Authorization": f"Bearer {tenant_token}"}
         for node in matched_nodes:
-            url = (
-                f"https://open.feishu.cn/open-apis/wiki/v2/spaces/"
-                f"{wiki_space_id}/nodes/{node['node_token']}"
+            r = _del_node(
+                client,
+                wiki_space_id,
+                node["node_token"],
+                node.get("obj_token", ""),
+                node.get("obj_type", "docx"),
             )
-            try:
-                r = _requests.delete(url, headers=headers, timeout=15)
-                if r.status_code == 200 and r.json().get("code", -1) == 0:
-                    result["deleted"].append(node)
-                    logger.info(f"✅ 已删除: {node['title']}")
-                else:
-                    err = f"HTTP {r.status_code} {r.text[:200]}"
-                    result["failed"].append({**node, "error": err})
-                    logger.warning(f"删除失败 [{node['title']}]: {err}")
-            except Exception as e:
-                result["failed"].append({**node, "error": str(e)})
-                logger.exception(f"删除异常 [{node['title']}]")
+            if r["ok"]:
+                result["deleted"].append(node)
+                logger.info(f"✅ 已删除 docx: {node['title']}")
+            else:
+                result["failed"].append({**node, "error": r["error"]})
+                logger.warning(f"删除失败 [{node['title']}]: {r['error']}")
 
         result["status"] = "success" if not result["failed"] else "partial"
         result["message"] = f"删除 {len(result['deleted'])} 个，失败 {len(result['failed'])} 个"

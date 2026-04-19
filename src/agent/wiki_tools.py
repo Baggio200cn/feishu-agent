@@ -123,10 +123,7 @@ def list_all_nodes(
 
 
 def count_document_blocks(client, document_id: str, timeout_sec: int = 5) -> Optional[int]:
-    """
-    查一个 docx 文档的 block 数。返回 None 表示调用失败（节点被误判前略过，不冒险）。
-    空文档通常只有 1 个 root page block。
-    """
+    """查一个 docx 文档的 block 数。返回 None 表示调用失败。"""
     try:
         from lark_oapi.api.docx.v1 import ListDocumentBlockRequest
         req = (
@@ -146,70 +143,113 @@ def count_document_blocks(client, document_id: str, timeout_sec: int = 5) -> Opt
         return None
 
 
+def get_document_text_length(client, document_id: str) -> Optional[int]:
+    """
+    用 RawContent API 拿文档正文纯文本长度。返回 None 表示调用失败/权限不足
+    （重要：None 绝不能被判定为"空"，否则会删光所有读不到的文档！）
+
+    纯文本含义：不包含 block 结构、不包含标题，只是正文文字。
+    真正的"空文档"应该返回 0 或少数几个空白字符。
+    """
+    try:
+        from lark_oapi.api.docx.v1 import RawContentDocumentRequest
+        req = RawContentDocumentRequest.builder().document_id(document_id).build()
+        resp = client.docx.v1.document.raw_content(req)
+        if not resp.success():
+            logger.debug(f"get_document_text_length({document_id}): {resp.code} {resp.msg}")
+            return None
+        content = getattr(resp.data, "content", "") or ""
+        return len(content.strip())
+    except Exception as e:
+        logger.debug(f"get_document_text_length 异常 {document_id}: {e}")
+        return None
+
+
 def find_empty_nodes(
     client,
     space_id: str,
     skip_prefixes: tuple = (),
     max_scan: int = 200,
+    min_text_chars: int = 5,
 ) -> Dict[str, Any]:
     """
-    扫描 Wiki 找"空节点"。定义：
-      - docx 节点：block 数 <= 1（只有 root page，没有实际内容）
-      - 非 docx 但 has_child=False 的节点也算（保守跳过，后期扩展）
+    扫描 Wiki 找"空节点"。严格判定（宁漏不误杀）：
+      - obj_type 必须是 docx（其他类型的"空"定义不同，保守跳过）
+      - has_child 必须为 False（有子节点的一律非空）
+      - RawContent API 必须成功返回（失败 = None = 不当空）
+      - 纯文本长度 < min_text_chars（默认 5 字符）才算空
 
-    返回：
+    关键安全: 任何一步读取失败都**不**当作空。
+
+    Returns:
       {
-        "scanned": int,
-        "empty": [{title, node_token, obj_type}, ...]
+        "scanned": int,          # 扫描节点数
+        "checked": int,          # 实际检查了正文的节点数
+        "skipped_unreadable": int,  # 读不到正文的节点数（权限或API问题）
+        "empty": [{title, node_token, obj_token, text_length}, ...]
       }
     """
     nodes = list_all_nodes(client, space_id, skip_prefixes=skip_prefixes, max_nodes=max_scan)
     empty: List[Dict[str, Any]] = []
+    checked = 0
+    skipped_unreadable = 0
+
     for n in nodes:
         obj_type = n.get("obj_type") or ""
         if obj_type != "docx":
-            # 非 docx 暂不判断（sheet/mindnote/bitable 的"空"定义不同）
             continue
-        # 有子节点的直接视为非空（它至少是个目录壳）
         if n.get("has_child"):
             continue
-        block_count = count_document_blocks(client, n["obj_token"])
-        # block_count None = 读取失败，保守不当空
-        if block_count is not None and block_count <= 1:
+
+        text_len = get_document_text_length(client, n["obj_token"])
+        if text_len is None:
+            skipped_unreadable += 1
+            continue  # 读不到，绝不判定为空
+        checked += 1
+        if text_len < min_text_chars:
             empty.append({
                 "title": n["title"],
                 "node_token": n["node_token"],
                 "obj_token": n["obj_token"],
                 "obj_type": obj_type,
-                "block_count": block_count,
+                "text_length": text_len,
             })
-    return {"scanned": len(nodes), "empty": empty}
+
+    return {
+        "scanned": len(nodes),
+        "checked": checked,
+        "skipped_unreadable": skipped_unreadable,
+        "empty": empty,
+    }
 
 
-def delete_wiki_node(app_id: str, app_secret: str, space_id: str, node_token: str) -> Dict[str, Any]:
+def delete_wiki_node(client, space_id: str, node_token: str, obj_token: str, obj_type: str = "docx") -> Dict[str, Any]:
     """
-    真删 Wiki 节点 —— 用 raw REST（lark-oapi 没包 DeleteSpaceNode）。
-    返回 {ok: bool, error: str}
+    删除 Wiki 节点 —— 飞书 Wiki v2 没有公开的 DeleteNode API（2024+），
+    通过删除底层 docx/sheet 文件实现：
+      DELETE /open-apis/drive/v1/files/{obj_token}?type={obj_type}
+
+    注意：obj_token 不等于 node_token。必须传底层文件的 token。
+    删除后 Wiki 节点会显示"文档已被删除"，该 Wiki 节点本身需要用户在 UI 手动清理。
+    被删的 docx 进飞书回收站，30 天内可恢复。
+
+    Returns: {ok, error, ui_residual}
     """
-    import requests
-
-    auth_resp = requests.post(
-        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        json={"app_id": app_id, "app_secret": app_secret},
-        timeout=10,
-    )
-    auth_json = auth_resp.json() if auth_resp.status_code == 200 else {}
-    token = auth_json.get("tenant_access_token", "")
-    if not token:
-        return {"ok": False, "error": f"获取 tenant_access_token 失败: {auth_json}"}
-
-    url = f"https://open.feishu.cn/open-apis/wiki/v2/spaces/{space_id}/nodes/{node_token}"
     try:
-        r = requests.delete(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
-        body = r.json() if r.status_code == 200 else {}
-        if r.status_code == 200 and body.get("code", -1) == 0:
-            return {"ok": True, "error": ""}
-        return {"ok": False, "error": f"HTTP {r.status_code} {r.text[:200]}"}
+        from lark_oapi.api.drive.v1 import DeleteFileRequest
+        req = (
+            DeleteFileRequest.builder()
+            .file_token(obj_token)
+            .type(obj_type)
+            .build()
+        )
+        resp = client.drive.v1.file.delete(req)
+        if resp.success():
+            return {
+                "ok": True, "error": "",
+                "ui_residual": "docx 已入回收站（30 天可恢复）；Wiki 节点壳需用户在飞书 UI 手动清理",
+            }
+        return {"ok": False, "error": f"{resp.code} {resp.msg}"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
