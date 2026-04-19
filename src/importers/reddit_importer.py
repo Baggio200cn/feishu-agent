@@ -16,7 +16,10 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_USER_AGENT = "feishu-agent/0.1 (by zhaoliang)"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
 
 
 class RedditImporter:
@@ -31,7 +34,12 @@ class RedditImporter:
         self.subreddits = subreddits
         self.timeout = timeout
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": user_agent})
+        # 浏览器风格 UA + 明确要 JSON，绕过 Reddit 对"简陋 UA"的反爬
+        self.session.headers.update({
+            "User-Agent": user_agent,
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
 
     def fetch_daily(
         self,
