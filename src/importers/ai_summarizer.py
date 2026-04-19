@@ -97,9 +97,9 @@ class AISummarizer:
         stars_total: int,
         stars_today: int,
         readme: str,
-        readme_max_chars: int = 8000,
+        readme_max_chars: int = 4000,
         timeout: int = 180,
-        retries: int = 1,
+        retries: int = 2,
     ) -> Optional[Dict[str, str]]:
         """
         生成一个仓库的中文摘要。
@@ -192,10 +192,10 @@ class AISummarizer:
     def summarize_reddit_post(
         self,
         post: Dict,
-        selftext_max_chars: int = 6000,
-        comments_max_chars: int = 2400,
+        selftext_max_chars: int = 3000,
+        comments_max_chars: int = 1500,
         timeout: int = 180,
-        retries: int = 1,
+        retries: int = 2,
     ) -> Optional[Dict[str, str]]:
         """
         Reddit 帖子 → {one_liner, detail} 中文摘要。

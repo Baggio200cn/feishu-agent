@@ -9,6 +9,9 @@
   python main.py manage calendar   # 日历管理
   python main.py manage contacts   # 联系人管理
   python main.py import-reddit     # Reddit AI 日报：订阅 subreddit → 豆包摘要 → 飞书
+  python main.py chat "关键词"       # 对话助手：搜 Wiki + 豆包回答
+  python main.py cleanup-wiki --prefix "xxx"           # 预览批量删（DRY RUN）
+  python main.py cleanup-wiki --prefix "xxx" --confirm # 真删
   python main.py schedule          # 启动定时任务调度器（守护进程）
   python main.py schedule-status   # 查询调度器状态（输出 JSON）
 """
@@ -276,15 +279,22 @@ def _run_trending_pipeline(
 
     # 2. 对每个仓库：抓 README + 豆包摘要，每次增量持久化到缓存文件
     cache_path = f"logs/trending_cache_{date_str}.json"
-    items_with_summary: List[Dict[str, Any]] = _load_trending_cache(cache_path)
-    if items_with_summary and not force:
-        # 续跑：从缓存里恢复已摘要成功的仓库
-        done_names = {
-            it["repo"].get("full_name") for it in items_with_summary if it.get("summary_ok")
-        }
-        logger.info(f"从缓存恢复 {len(done_names)} 个已摘要仓库: {cache_path}")
+    cached = _load_trending_cache(cache_path)
+    # 续跑策略：只保留成功的，失败的丢掉（这样 --force 或者自动重试都能重跑失败项）
+    items_with_summary: List[Dict[str, Any]] = []
+    if cached and not force:
+        items_with_summary = [it for it in cached if it.get("summary_ok")]
+        done_names = {it["repo"].get("full_name") for it in items_with_summary}
+        retried = len(cached) - len(items_with_summary)
+        if retried:
+            logger.info(
+                f"缓存命中 {len(done_names)} 个成功项；"
+                f"{retried} 个失败项将在本次重试（丢弃旧 fallback）"
+            )
+        else:
+            logger.info(f"从缓存恢复 {len(done_names)} 个已摘要仓库: {cache_path}")
     else:
-        items_with_summary = []
+        done_names = set()
         done_names = set()
 
     for i, meta in enumerate(repos_meta, 1):
@@ -451,17 +461,22 @@ def cmd_import_reddit(args):
             return
 
         # 2. 对每个帖子做 AI 摘要，缓存增量保存
+        # 续跑策略：只留成功的；失败项自动重试（丢弃旧 fallback）
         cache_path = f"logs/reddit_cache_{date_str}.json"
-        cached = _load_trending_cache(cache_path)  # 格式同 trending 缓存，通用
+        cached = _load_trending_cache(cache_path)
+        items_with_summary = []
+        done_ids: set = set()
         if cached and not force:
-            done_ids = {
-                it["post"].get("id") for it in cached if it.get("summary_ok")
-            }
-            items_with_summary = cached
-            logger.info(f"从缓存恢复 {len(done_ids)} 条已摘要 Reddit 帖子: {cache_path}")
-        else:
-            items_with_summary = []
-            done_ids = set()
+            items_with_summary = [it for it in cached if it.get("summary_ok")]
+            done_ids = {it["post"].get("id") for it in items_with_summary}
+            retried = len(cached) - len(items_with_summary)
+            if retried:
+                logger.info(
+                    f"缓存命中 {len(done_ids)} 条成功项；"
+                    f"{retried} 条失败项将在本次重试"
+                )
+            else:
+                logger.info(f"从缓存恢复 {len(done_ids)} 条已摘要 Reddit 帖子")
 
         for i, post in enumerate(posts, 1):
             pid = post.get("id", "")
@@ -671,6 +686,290 @@ def _manage_contacts(client, args):
         print(f"  {c.get('name', '')} — {c.get('email', '')} {c.get('job_title', '')}")
 
 
+def cmd_chat(args):
+    """
+    对话助手 MVP：关键词搜飞书 Wiki → 豆包 AI 基于搜索结果给中文回答。
+
+    用法:
+      python main.py chat "关键词"
+      python main.py chat "关键词" --limit 5 --json   # 输出 JSON 格式供 UI 调用
+    """
+    query = (getattr(args, "query", "") or "").strip()
+    if not query:
+        print("请传入查询关键词: python main.py chat \"你的问题\"")
+        sys.exit(1)
+
+    limit = int(getattr(args, "limit", 5) or 5)
+    json_output = bool(getattr(args, "json", False))
+
+    result: Dict[str, Any] = {
+        "query": query,
+        "answer": "",
+        "sources": [],
+        "status": "error",
+        "message": "",
+    }
+
+    try:
+        creds = config_loader.load_credentials()
+        wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
+        if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+            result["message"] = "飞书 Wiki space_id 未配置"
+            _emit_chat_result(result, json_output)
+            return
+
+        factory = FeishuClientFactory(creds["accounts"])
+        client = factory.get_client("personal")
+
+        # 1. 搜 Wiki
+        from lark_oapi.api.wiki.v1 import SearchNodeRequest, SearchNodeRequestBody
+
+        body = SearchNodeRequestBody.builder().query(query).space_id(wiki_space_id).build()
+        req = SearchNodeRequest.builder().page_size(limit).request_body(body).build()
+        resp = client.wiki.v1.node.search(req)
+
+        if not resp.success():
+            result["message"] = f"Wiki 搜索失败: {resp.code} {resp.msg}"
+            _emit_chat_result(result, json_output)
+            return
+
+        items = getattr(resp.data, "items", None) or []
+        for it in items[:limit]:
+            title = getattr(it, "title", "") or ""
+            node_token = getattr(it, "node_token", "") or ""
+            result["sources"].append({
+                "title": title,
+                "url": f"https://open.feishu.cn/wiki/{node_token}" if node_token else "",
+                "node_token": node_token,
+            })
+
+        if not result["sources"]:
+            result["status"] = "success"
+            result["answer"] = f"在飞书 Wiki 里没找到与「{query}」相关的页面。"
+            _emit_chat_result(result, json_output)
+            return
+
+        # 2. 豆包基于搜索结果写回答
+        from src.importers.ai_summarizer import AISummarizer
+
+        ai_cfg = config_loader.get_ai_config()
+        summarizer = AISummarizer(ai_cfg)
+        if not summarizer.configured():
+            # 没配 AI 时降级为"只列搜索结果"
+            result["status"] = "partial"
+            result["answer"] = (
+                f"找到 {len(result['sources'])} 个相关 Wiki 页面（未配置豆包 AI，"
+                f"仅列出标题；配置 ai.api_key 后能自动总结）："
+            )
+            _emit_chat_result(result, json_output)
+            return
+
+        sources_lines = "\n".join(
+            f"- {s['title']}  {s['url']}" for s in result["sources"]
+        )
+        prompt = (
+            f"用户询问: {query}\n\n"
+            f"根据以下飞书 Wiki 里检索到的相关页面标题和链接，用中文给出一个简短的"
+            f"帮助回答（200 字以内），引用具体页面名，不要编造页面中没有的内容。"
+            f"如果信息不足以回答，直接说\"建议直接点击下方链接查看\"。\n\n"
+            f"检索结果:\n{sources_lines}"
+        )
+        ai_answer = summarizer._chat_json(
+            tag=f"chat[{query[:20]}]",
+            user_prompt=(
+                prompt + "\n\n返回 JSON: "
+                + '{"one_liner": "一句话答复（必填）", "detail": "展开说明（必填）"}'
+            ),
+            timeout=60,
+            retries=1,
+        )
+        if ai_answer:
+            result["answer"] = ai_answer.get("detail") or ai_answer.get("one_liner") or ""
+            result["status"] = "success"
+        else:
+            result["answer"] = f"AI 回答生成失败，以下是找到的 {len(result['sources'])} 个相关页面："
+            result["status"] = "partial"
+
+        _emit_chat_result(result, json_output)
+
+    except Exception as e:
+        logger.exception("chat 异常")
+        result["message"] = f"异常: {e}"
+        _emit_chat_result(result, json_output)
+        if not json_output:
+            raise
+
+
+def _emit_chat_result(result: Dict[str, Any], json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    print(f"\n问：{result['query']}")
+    if result.get("answer"):
+        print(f"\n{result['answer']}")
+    if result.get("sources"):
+        print("\n相关 Wiki 页面：")
+        for s in result["sources"]:
+            print(f"  • {s['title']}  {s['url']}")
+    if result.get("message"):
+        print(f"\n⚠️ {result['message']}")
+
+
+def cmd_cleanup_wiki(args):
+    """
+    Wiki 清理：按标题前缀匹配批量删除空间下的节点。
+    **危险操作**：默认 --dry-run，只有显式加 --confirm 才真删。
+
+    用法:
+      python main.py cleanup-wiki --prefix "[诊断]"                    # 预览（安全）
+      python main.py cleanup-wiki --prefix "[诊断]" --confirm          # 真删
+      python main.py cleanup-wiki --prefix "GitHub Trending 日报 2025" --confirm
+      python main.py cleanup-wiki --json                                # UI 调用
+    """
+    import argparse as _argparse
+
+    prefix = (getattr(args, "prefix", "") or "").strip()
+    confirm = bool(getattr(args, "confirm", False))
+    json_output = bool(getattr(args, "json", False))
+
+    result: Dict[str, Any] = {
+        "prefix": prefix,
+        "dry_run": not confirm,
+        "matched": [],
+        "deleted": [],
+        "failed": [],
+        "status": "error",
+        "message": "",
+    }
+
+    if not prefix:
+        result["message"] = "必须指定 --prefix，否则拒绝（避免误删整个空间）"
+        _emit_cleanup_result(result, json_output)
+        return
+
+    try:
+        creds = config_loader.load_credentials()
+        wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
+        if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+            result["message"] = "飞书 Wiki space_id 未配置"
+            _emit_cleanup_result(result, json_output)
+            return
+
+        factory = FeishuClientFactory(creds["accounts"])
+        client = factory.get_client("personal")
+
+        # 1. 扫顶层节点，按 title 前缀匹配
+        from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+
+        matched_nodes: List[Dict[str, str]] = []
+        page_token = None
+        for _ in range(10):
+            builder = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50)
+            if page_token:
+                builder.page_token(page_token)
+            resp = client.wiki.v2.space_node.list(builder.build())
+            if not resp.success():
+                result["message"] = f"列节点失败: {resp.code} {resp.msg}"
+                _emit_cleanup_result(result, json_output)
+                return
+            for it in (getattr(resp.data, "items", None) or []):
+                title = getattr(it, "title", "") or ""
+                if title.startswith(prefix):
+                    matched_nodes.append({
+                        "title": title,
+                        "node_token": it.node_token,
+                    })
+            if not getattr(resp.data, "has_more", False):
+                break
+            page_token = getattr(resp.data, "page_token", None)
+            if not page_token:
+                break
+
+        result["matched"] = matched_nodes
+
+        if not matched_nodes:
+            result["status"] = "success"
+            result["message"] = f"没有标题以 '{prefix}' 开头的节点"
+            _emit_cleanup_result(result, json_output)
+            return
+
+        if not confirm:
+            result["status"] = "dry_run"
+            result["message"] = (
+                f"预览模式：匹配到 {len(matched_nodes)} 个节点。"
+                f"加 --confirm 才会真删。"
+            )
+            _emit_cleanup_result(result, json_output)
+            return
+
+        # 2. 真删 —— lark-oapi 1.5.3 没包 DeleteSpaceNode，用 raw REST
+        import requests as _requests
+
+        personal_cfg = creds["accounts"]["personal"]
+        auth_resp = _requests.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json={
+                "app_id": personal_cfg.get("app_id", ""),
+                "app_secret": personal_cfg.get("app_secret", ""),
+            },
+            timeout=10,
+        )
+        auth_json = auth_resp.json() if auth_resp.status_code == 200 else {}
+        tenant_token = auth_json.get("tenant_access_token", "")
+        if not tenant_token:
+            result["message"] = f"获取 tenant_access_token 失败: {auth_json}"
+            _emit_cleanup_result(result, json_output)
+            return
+
+        headers = {"Authorization": f"Bearer {tenant_token}"}
+        for node in matched_nodes:
+            url = (
+                f"https://open.feishu.cn/open-apis/wiki/v2/spaces/"
+                f"{wiki_space_id}/nodes/{node['node_token']}"
+            )
+            try:
+                r = _requests.delete(url, headers=headers, timeout=15)
+                if r.status_code == 200 and r.json().get("code", -1) == 0:
+                    result["deleted"].append(node)
+                    logger.info(f"✅ 已删除: {node['title']}")
+                else:
+                    err = f"HTTP {r.status_code} {r.text[:200]}"
+                    result["failed"].append({**node, "error": err})
+                    logger.warning(f"删除失败 [{node['title']}]: {err}")
+            except Exception as e:
+                result["failed"].append({**node, "error": str(e)})
+                logger.exception(f"删除异常 [{node['title']}]")
+
+        result["status"] = "success" if not result["failed"] else "partial"
+        result["message"] = f"删除 {len(result['deleted'])} 个，失败 {len(result['failed'])} 个"
+        _emit_cleanup_result(result, json_output)
+
+    except Exception as e:
+        logger.exception("cleanup-wiki 异常")
+        result["message"] = f"异常: {e}"
+        _emit_cleanup_result(result, json_output)
+        if not json_output:
+            raise
+
+
+def _emit_cleanup_result(result: Dict[str, Any], json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    prefix = result["prefix"]
+    print(f"\n清理目标前缀：'{prefix}'")
+    print(f"匹配到 {len(result['matched'])} 个节点:")
+    for n in result["matched"]:
+        marker = "✅" if n in result.get("deleted", []) else (
+            "❌" if any(f["node_token"] == n["node_token"] for f in result.get("failed", [])) else "·"
+        )
+        print(f"  {marker} {n['title']}  (token={n['node_token']})")
+    if result["dry_run"]:
+        print(f"\n[DRY-RUN] {result['message']}")
+    else:
+        print(f"\n{result['message']}")
+
+
 def cmd_schedule(args):
     """启动定时任务调度器（前台守护进程）"""
     from src.scheduler import FeishuScheduler, default_schedule_config
@@ -720,6 +1019,18 @@ def main():
     p_manage.add_argument("--chat-id", dest="chat_id", help="IM 群聊 ID（管理消息时必填）")
     p_manage.add_argument("--query", help="搜索关键词（管理联系人时可用）")
 
+    # chat 子命令：对话助手 MVP
+    p_chat = subparsers.add_parser("chat", help="对话助手：关键词搜 Wiki → 豆包回答")
+    p_chat.add_argument("query", nargs="?", default="", help="查询关键词")
+    p_chat.add_argument("--limit", type=int, default=5, help="搜多少个相关页面")
+    p_chat.add_argument("--json", action="store_true", help="输出 JSON 供 UI 调用")
+
+    # cleanup-wiki 子命令：批量删除 Wiki 节点
+    p_cleanup = subparsers.add_parser("cleanup-wiki", help="按前缀批量删 Wiki 节点（默认 dry-run）")
+    p_cleanup.add_argument("--prefix", required=False, default="", help="要匹配的节点标题前缀")
+    p_cleanup.add_argument("--confirm", action="store_true", help="真删（不加则仅预览）")
+    p_cleanup.add_argument("--json", action="store_true", help="输出 JSON 供 UI 调用")
+
     # schedule 子命令（守护进程）
     subparsers.add_parser("schedule", help="启动定时任务调度器")
     subparsers.add_parser("schedule-status", help="查询调度器状态（输出 JSON）")
@@ -738,6 +1049,10 @@ def main():
         cmd_schedule(args)
     elif args.command == "schedule-status":
         cmd_schedule_status(args)
+    elif args.command == "chat":
+        cmd_chat(args)
+    elif args.command == "cleanup-wiki":
+        cmd_cleanup_wiki(args)
     else:
         parser.print_help()
 
