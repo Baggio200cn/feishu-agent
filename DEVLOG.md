@@ -902,6 +902,90 @@ python main.py import-reddit
 
 ---
 
+## 十四、生产化冲刺（2026-04-19 晚）
+
+### 背景
+
+步骤 B 跑通后用户下令"今天必须正式可以生产上线"。按 Phase A/B/C
+分三次 commit 完成了：UI 全按钮连真后端、新增对话助手、新增 Wiki 清理、
+AI 缓存续跑优化、自动化诊断。
+
+### Phase A：后端补齐（commit `8208962`）
+
+| 改动 | 文件 |
+|------|------|
+| AI 缓存过滤 `summary_ok=false`，失败项自动重试（不用 --force） | `main.py::_run_trending_pipeline` / `cmd_import_reddit` |
+| README 截断 8K → 4K，Reddit selftext 6K → 3K，评论 2400 → 1500，重试 1 次 → 2 次 | `src/importers/ai_summarizer.py` |
+| `cmd_chat`：飞书 Wiki v1 SearchNode 搜关键词 → 豆包总结 → `--json` 供 UI | `main.py` |
+| `cmd_cleanup_wiki`：按标题前缀删节点，默认 dry-run，`--confirm` 才真删；lark-oapi 没包 DeleteSpaceNode，raw REST 直调 | `main.py` |
+
+### Phase B：UI 全按钮打通（commit `50b2707`）
+
+**按钮 → 后端 对照**：
+
+| UI 按钮 | 后端 |
+|--------|------|
+| 对话助手「打开」| `chat --json` → modal 展示答案 + 相关 Wiki |
+| GitHub「立即执行」| `import-github`（带 spinner） |
+| GitHub「Wiki」| `shell.openExternal(github_last_run.wiki_url)` |
+| GitHub「日志」| `shell.openPath(logs/feishu_agent.log)` |
+| Reddit「立即执行」| `import-reddit`（改为真调） |
+| Reddit「Wiki」| `shell.openExternal(reddit_last_run.wiki_url)` |
+| Wiki 整理「预览分类结果」| `organize --dry-run` |
+| Wiki 整理「执行整理」| `organize` |
+| Wiki 清理「预览匹配项」| `cleanup-wiki --prefix X --json` → modal 列表 |
+| Wiki 清理「执行删除」| `cleanup-wiki --prefix X --confirm --json` + confirm() 二次确认 |
+| 调度开关 | spawn `schedule` / taskkill |
+
+**前端新增**：
+- 对话 modal（带 spinner，Enter 提交，相关页面链接可点开）
+- Wiki 清理 modal（预览匹配列表，警告文案，confirm 二次确认）
+- `runWithSpinner()` 包装所有长耗时按钮
+- `extractJsonFromStdout()` 从 Python 输出末尾拎 JSON
+
+**兼容老字段**：`buildUiState` 在 GitHub 卡片里同时支持新 trending 字段
+(`mode/fetched/summarized/pages_created`) 和老 legacy 字段（`imported/skipped_dup`）。
+
+### Phase C：自动化诊断（commit `待`）
+
+`scripts/diag_ui.py` 逐个验证 10 个 UI 按钮对应的 CLI 动作是否通：
+
+```
+⏳ schedule-status    调度器状态                ...
+⏳ chat               对话助手（豆包调用）      ...
+⏳ github-wiki        GitHub Wiki URL           ...
+⏳ reddit-wiki        Reddit Wiki URL           ...
+⏳ github-log         日志文件存在性            ...
+⏳ cleanup-preview    Wiki 清理预览 (空匹配)    ...
+⏳ github             GitHub 抓取真跑 [slow]    ...
+⏳ reddit             Reddit 抓取真跑 [slow]    ...
+⏳ wiki-preview       Wiki 整理预览 (dry-run)   ...
+⏭  wiki-execute      Wiki 整理执行 (跳过)
+```
+
+命令行：
+- `python scripts/diag_ui.py` —— 全部跑
+- `python scripts/diag_ui.py --fast` —— 跳过慢任务（github/reddit/organize）
+- `python scripts/diag_ui.py --only chat,schedule-status` —— 只跑指定的
+
+### 安全设计
+
+`cmd_cleanup_wiki` 的三重防误删：
+1. `--prefix` 必填（空前缀拒绝）
+2. 默认 dry-run，`--confirm` 才真删
+3. UI 端再加 `confirm()` 二次弹窗
+
+对话助手的优雅降级：
+- 豆包未配置 → 降级为只列搜索结果，不报错
+- 豆包超时 → 返回 `partial` 状态 + 降级文案
+- Wiki 搜索失败 → 错误信息上报到 UI 的 modal 而非 toast
+
+---
+
+*生产化冲刺日志生成：2026-04-19*
+
+---
+
 ## 八、启动指南（给未来的自己）
 
 **从零启动：**

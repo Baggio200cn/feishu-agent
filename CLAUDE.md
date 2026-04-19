@@ -49,44 +49,67 @@
 
 # 当前进度
 
-**最后更新**：2026-04-19
+**最后更新**：2026-04-19 晚
 
 ## ✅ 已完成
 
-- Electron 桌面 UI（`ui/`）含 6 个功能卡片、高 DPI 文字渲染、自定义头像图标、`start-ui.bat` 桌面快捷方式
-- 定时调度器（步骤 C，`src/scheduler.py`）：BlockingScheduler + cron，PID 文件、跨平台存活检查、graceful shutdown
-- GitHub Trending 日报（步骤 A.2 + A.2.1）：
-  - HTML 爬取（`src/importers/github_trending.py`）
-  - 豆包摘要（`src/importers/ai_summarizer.py::summarize_repo`）
-  - 飞书"文件夹 + 子页"布局（`feishu_doc_writer.py::write_daily_trending_report`）
-  - 当日缓存续跑（`logs/trending_cache_YYYY-MM-DD.json`）
-  - 父节点不存在自动创建
-  - 用户已在飞书验证生效，格式 OK
-- Reddit AI 日报（步骤 B，`src/importers/reddit_importer.py` + 配套 summarizer/writer）：
-  - 4 个 subreddit（MachineLearning / LocalLLaMA / ClaudeAI / LLMDevs）
-  - Top-of-day 合并去重，按 score 降序取 10
-  - 每帖抓前 3 条高赞顶层评论
-  - 豆包摘要 4 段式（话题背景 / 核心观点 / 技术要点 / 讨论亮点）
-  - `reddit专区/Reddit AI 日报 YYYY-MM-DD/` 文件夹 + 子页
-- 诊断脚本三件套：`scripts/diag_feishu.py`（权限）、`scripts/diag_doubao.py`（AI Key）、`scripts/diag_wiki_tree.py`（Wiki 节点）
-- DEVLOG.md 按步骤记录了从 UI 到步骤 B 的完整过程，含踩坑清单
+### 核心日报流（步骤 A + B）
+- GitHub Trending 日报：`/trending` HTML → 豆包摘要 → 飞书 `github专区/日期/仓库子页`
+- Reddit AI 日报：4 subreddits top-of-day → 豆包 4 段式摘要 → 飞书 `reddit专区/日期/帖子子页`
+- 封面页显示每个帖子完整中文摘要（不止一句话标题）
+- 缓存续跑：`logs/{trending,reddit}_cache_YYYY-MM-DD.json`，失败项自动重试（不用 `--force`）
+- 父节点 `github专区` / `reddit专区` 不存在自动在空间根下创建
+
+### 调度器（步骤 C）
+- APScheduler BlockingScheduler + cron（Asia/Shanghai）
+- 守护进程独立于 UI，关 UI 不停调度
+- `logs/scheduler_state.json` 实时状态 + PID 文件
+
+### UI 全按钮真联通（生产化冲刺）
+| 按钮 | 状态 |
+|-----|-----|
+| 对话助手「打开」| ✅ modal 弹层，Wiki 搜索 + 豆包回答 |
+| GitHub 立即执行 / Wiki / 日志 | ✅ 三按钮全真调 |
+| Reddit 立即执行 / Wiki / 日志 | ✅ 三按钮全真调 |
+| Wiki 整理 预览 / 执行 | ✅ dry-run 路径真通 |
+| Wiki 清理 预览 / 执行 | ✅ 新加：前缀搜 + 二次确认删除 |
+| 调度开关 | ✅ spawn/taskkill |
+
+### 对话助手（MVP）
+- `python main.py chat "关键词" --json` → Wiki v1 SearchNode + 豆包 200 字回答
+- UI 弹层带 spinner + 相关页面链接
+- 豆包未配置时降级为仅列搜索结果
+
+### Wiki 清理（新）
+- `python main.py cleanup-wiki --prefix X [--confirm] [--json]`
+- lark-oapi 没包 DeleteSpaceNode，用 raw REST `DELETE /wiki/v2/spaces/:sid/nodes/:tk`
+- 三重防误删：prefix 必填 · 默认 dry-run · UI confirm() 二次弹窗
+
+### 诊断脚本四件套
+- `scripts/diag_feishu.py` — Wiki 权限分 4 步测
+- `scripts/diag_doubao.py` — 豆包 API Key / 模型名
+- `scripts/diag_wiki_tree.py` — 列 Wiki 顶层节点
+- `scripts/diag_proxy.py` — 扫 VPN 本地代理端口
+- `scripts/diag_ui.py`（新）— 不开 UI 逐个验证 10 个按钮对应的 CLI 动作
+
+### 已在用户本地端到端验证
+- GitHub 日报（2026-04-18, 2026-04-19 各一次，格式 OK）
+- Reddit 日报（2026-04-19，Veee VPN 15236 端口 + 换节点 + 浏览器 UA 后成功，10 条帖子 + 中文摘要全部写入飞书）
 
 ## 🚧 进行中
 
-- **Reddit 未在用户本地真跑通**：用户尝试 `import-reddit` 时代理端口 7890 被拒（`WinError 10061 目标计算机积极拒绝`），代码路径未验证过端到端。需要他确认 VPN 客户端实际监听的端口再试（他提到 12536，待验证）。
+生产化冲刺已全部 commit 推送，代码层面无遗留。用户本地需要：
+1. `git pull` 最新代码（commits `8208962` / `50b2707` / 含 Phase C 的待推）
+2. 如要 UI 里跑 Reddit：必须在**启动 UI 前**的终端里设 `$env:HTTP_PROXY = "http://127.0.0.1:15236"`，否则 UI spawn 出来的 python 继承不到代理
+3. 测试 UI 所有按钮，确认无回归
 
-## 📋 待办
+## 📋 待办（低优先级，生产后再推）
 
-- Reddit 端到端跑通（代理问题解决后一条命令的事）
-- UI 卡片对接 `logs/reddit_last_run.json`（现在 Reddit 卡片还是"待开发"占位）
-- UI 卡片对接新的 `github_last_run.json` 结构（`wiki_folder_token` / `pages_created` / `pages_skipped`）
-- 豆包超时率优化：Seed 2.0 reasoning 模式慢，首批 10 次约 2 次超时 180s。考虑：
-  - 换 `doubao-seed-2-0-pro`（更快但更贵）
-  - 或检查 API 是否支持关 reasoning
-  - 或 README 进一步截短（8K → 4K）
-- 打包 `.exe`（electron-builder），免去用户装 Node
-- Wiki 反向校验去重（目前本地索引，用户手删 Wiki 后索引不同步）
-- 对话助手入口（`open-chat`）目前是占位文案，未来接豆包或 Claude 实现 Wiki 检索 + 跨账号查询
+- 打包 `.exe`（electron-builder），免用户装 Node
+- Wiki 反向校验去重（手删 Wiki 后同步本地索引）
+- 对话助手升级为"对话历史"模式（现在是单轮）
+- Reddit 改为接入 Reddit OAuth 提升限频配额（目前匿名 10 req/min）
+- 企业账号文档 organize 暂以"引用说明页"兜底，跨租户复制需额外授权
 
 ---
 
@@ -108,6 +131,11 @@
 | 2026-04-19 | Reddit 每 sub 抓 10 条再按 score 降序取 top 10 | 保信息密度 + 全局热度排序（不均匀分配给每个 sub） |
 | 2026-04-19 | Reddit 抓评论只取 t1 顶层前 3 条 | 深度 1 + limit 3，评论体截断 800 字，防 token 炸 |
 | 2026-04-19 | `reddit_cache` 和 `trending_cache` 共用加载/保存函数 | 格式同构（`[{item, summary_ok: bool}, ...]`），续跑逻辑可复用 |
+| 2026-04-19 | Reddit UA 从 `feishu-agent/0.1` 改为 Chrome 120 浏览器 UA + `Accept: application/json` | 简陋 UA 被 Reddit 重定向到反爬 HTML 页（status 200 但 content-type=text/html）|
+| 2026-04-19 | AI 缓存读取时过滤 `summary_ok=false` | 失败项原本会被当"已缓存"永久跳过，现改为自动重试 |
+| 2026-04-19 | Wiki 清理用 raw REST 而非 SDK | lark-oapi 1.5.3 未包 `DeleteSpaceNode`；飞书 REST 的 `DELETE /wiki/v2/spaces/:sid/nodes/:tk` 存在且工作 |
+| 2026-04-19 | Wiki 清理的三重防误删（prefix 必填 / dry-run 默认 / UI confirm 弹窗）| 删 Wiki 节点不可恢复；单一保障不够 |
+| 2026-04-19 | 对话助手 MVP 先做"搜+总结"单轮，不做对话历史 | 多轮需要状态持久化，目前 JSON 单次调用够用 |
 
 ---
 
@@ -127,6 +155,10 @@
 12. **豆包 Seed 2.0 响应慢**：reasoning 模式下响应常超 90 秒，默认 timeout 已调到 180s + 1 次重试，仍有 10% 左右超时率。
 13. **Reddit 中国大陆被墙**：必须挂 VPN，代码依赖 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量。用户首次试时代理端口写错（7890 vs 实际 12536），`WinError 10061 目标计算机积极拒绝`。
 14. **飞书 Wiki 节点标题含特殊字符**：Reddit 帖子标题常含 `/` `:` `*` `?`，直接用作 Wiki 节点标题会被拒；已在 `write_daily_reddit_report` 里 `re.sub(r"[\\/:*?\"<>|]", " ", ...)` 清洗，且截断到 80 字。
+15. **Reddit 反爬**：2026-04-19 日实测 `User-Agent: test/0.1` 或 `feishu-agent/0.1` 触发 Reddit 反爬，响应变成 HTML（`<body class=theme-beta>...`），code 仍是 200 但不是 JSON。必须用浏览器 UA + `Accept: application/json` 才拿得到正常 JSON。
+16. **Veee VPN 的诡异端口**：用户的 VPN 客户端（Veee）监听在 `15235` / `15236`，不在常见代理端口列表里。`scripts/diag_proxy.py` 扫 14 个常见端口全空时，让用户跑 `Get-NetTCPConnection -State Listen` 按进程名定位（找到 `Veee` 进程名）。
+17. **Reddit 节点 IP 被拉黑**：即使 UA 对了，部分 VPN 节点的出口 IP 在 Reddit 黑名单，返回 403 + HTML。换 Veee 里的节点（美国/日本/新加坡）即可。
+18. **`open-chat` IPC 要异步返回 JSON**：UI 里对话助手的 modal 期待 `result.chat = {answer, sources, status, message}`，`ui/main.js::actionDispatch['open-chat']` 用 `extractJsonFromStdout` 从 Python 的 `--json` 输出尾部拎 JSON 对象。Python 日志（开头的 INFO 行）不影响解析。
 
 ---
 
