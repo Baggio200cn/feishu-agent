@@ -292,15 +292,15 @@ function openLocalFile(filePath) {
  * 会自动继承。UI 不再强制任何值，让用户在启动前控制即可。
  */
 const actionDispatch = {
-  // 对话助手：把 query 发给 Python，等 JSON 回来
+  // Agent plan 阶段：把 query 发给 Python，等 JSON 回来（含 action_spec）
   'open-chat': async (params) => {
     const query = (params && params.query) ? String(params.query) : '';
     if (!query.trim()) {
-      return { ok: false, message: '请输入查询关键词' };
+      return { ok: false, message: '请输入自然语言指令' };
     }
-    const res = await runPython(['chat', query, '--limit', '5', '--json']);
+    const res = await runPython(['chat', query, '--stage', 'plan', '--limit', '5', '--json']);
     if (!res.ok) {
-      return { ok: false, message: `对话助手调用失败（退出码 ${res.code}）`, stderr: res.stderr };
+      return { ok: false, message: `Agent 调用失败（退出码 ${res.code}）`, stderr: res.stderr };
     }
     const data = extractJsonFromStdout(res.stdout);
     if (!data) {
@@ -308,7 +308,28 @@ const actionDispatch = {
     }
     return {
       ok: data.status === 'success' || data.status === 'partial',
-      message: data.status === 'success' ? '回答已生成' : (data.message || '部分完成'),
+      message: data.message || '计划已生成',
+      chat: data,
+    };
+  },
+
+  // Agent execute 阶段：用户在 UI 里点"确认执行"后触发
+  'agent-execute': async (params) => {
+    const spec = params && params.action_spec;
+    if (!spec) return { ok: false, message: '缺少 action_spec' };
+    const res = await runPython([
+      'chat', '--stage', 'execute', '--action', JSON.stringify(spec), '--json'
+    ]);
+    if (!res.ok) {
+      return { ok: false, message: `执行失败（退出码 ${res.code}）`, stderr: res.stderr };
+    }
+    const data = extractJsonFromStdout(res.stdout);
+    if (!data) {
+      return { ok: false, message: '未解析到 JSON 输出', stdout: res.stdout };
+    }
+    return {
+      ok: data.status === 'success' || data.status === 'partial',
+      message: data.message || '执行完成',
       chat: data,
     };
   },

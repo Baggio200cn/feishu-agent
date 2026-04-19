@@ -727,167 +727,263 @@ def _manage_contacts(client, args):
 
 def cmd_chat(args):
     """
-    对话助手 MVP：关键词搜飞书 Wiki → 豆包 AI 基于搜索结果给中文回答。
+    对话助手升级版 = Agent 模式。
+
+    两阶段:
+      stage=plan     输入自然语言，返回 {intent, params, preview, action_spec}
+      stage=execute  输入 action_spec（从 plan 阶段拿），真执行
 
     用法:
-      python main.py chat "关键词"
-      python main.py chat "关键词" --limit 5 --json   # 输出 JSON 格式供 UI 调用
+      python main.py chat "删除空文件"                     # 等价 --stage plan
+      python main.py chat "..." --stage plan --json
+      python main.py chat --stage execute --action '{...}' --json
     """
-    query = (getattr(args, "query", "") or "").strip()
-    if not query:
-        print("请传入查询关键词: python main.py chat \"你的问题\"")
-        sys.exit(1)
+    from src.agent.agent_brain import AgentBrain
+    from src.agent import wiki_tools
 
-    limit = int(getattr(args, "limit", 5) or 5)
+    stage = getattr(args, "stage", None) or "plan"
     json_output = bool(getattr(args, "json", False))
 
-    result: Dict[str, Any] = {
-        "query": query,
-        "answer": "",
-        "sources": [],
-        "status": "error",
-        "message": "",
-    }
+    creds = config_loader.load_credentials()
+    personal = creds["accounts"]["personal"]
+    wiki_space_id = personal.get("wiki_space_id", "")
+    app_id = personal.get("app_id", "")
+    app_secret = personal.get("app_secret", "")
+
+    result: Dict[str, Any] = {"stage": stage, "status": "error", "message": ""}
+
+    if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+        result["message"] = "飞书 Wiki space_id 未配置"
+        _emit_chat_result(result, json_output)
+        return
+
+    factory = FeishuClientFactory(creds["accounts"])
+    client = factory.get_client("personal")
+    ai_cfg = config_loader.get_ai_config()
+    brain = AgentBrain(ai_cfg)
+
+    if stage == "plan":
+        _agent_stage_plan(args, client, wiki_space_id, brain, result, json_output)
+    elif stage == "execute":
+        _agent_stage_execute(args, client, wiki_space_id, app_id, app_secret, brain, result, json_output)
+    else:
+        result["message"] = f"未知 stage={stage}（plan|execute）"
+        _emit_chat_result(result, json_output)
+
+
+def _agent_stage_plan(args, client, wiki_space_id, brain, result, json_output):
+    """Plan 阶段：识别意图 + dry-run 拿到预览列表，返回计划给 UI"""
+    from src.agent import wiki_tools
+
+    query = (getattr(args, "query", "") or "").strip()
+    if not query:
+        result["message"] = "请传入自然语言指令"
+        _emit_chat_result(result, json_output)
+        return
+
+    # 1. 拿顶层节点标题作上下文（让 AI 判断更准）
+    top_titles: List[str] = []
+    try:
+        from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+        r = client.wiki.v2.space_node.list(
+            ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(20).build()
+        )
+        if r.success():
+            top_titles = [getattr(it, "title", "") or "" for it in (getattr(r.data, "items", None) or [])]
+    except Exception:
+        pass
+
+    # 2. 豆包识别意图
+    plan = brain.parse_intent(query, context_titles=top_titles)
+    result["query"] = query
+    result["intent"] = plan["intent"]
+    result["reasoning"] = plan["reasoning"]
+    result["dangerous"] = plan["dangerous"]
+    result["user_facing_plan"] = plan["user_facing_plan"]
+    params = plan["params"] or {}
+
+    # 3. 根据 intent 做 dry-run 预览
+    intent = plan["intent"]
+    SKIP = ("github专区", "reddit专区", "GitHub Trending 日报", "Reddit AI 日报", "[诊断]")
+
+    if intent == "search":
+        q = (params.get("query") or query).strip()
+        matches = wiki_tools.search_wiki_by_title(client, wiki_space_id, q, limit=5)
+        result["preview"] = {
+            "type": "search",
+            "count": len(matches),
+            "items": [{"title": m["title"], "url": f"https://open.feishu.cn/wiki/{m['node_token']}"} for m in matches],
+        }
+        # search 无需确认
+        result["action_spec"] = None
+        result["status"] = "success"
+        result["message"] = f"搜到 {len(matches)} 个相关页面"
+
+    elif intent in ("find_empty", "delete_empty"):
+        res = wiki_tools.find_empty_nodes(client, wiki_space_id, skip_prefixes=SKIP, max_scan=200)
+        empty = res["empty"]
+        result["preview"] = {
+            "type": "empty_nodes",
+            "scanned": res["scanned"],
+            "count": len(empty),
+            "items": [{"title": e["title"], "node_token": e["node_token"], "block_count": e["block_count"]} for e in empty],
+        }
+        if intent == "find_empty" or not empty:
+            result["action_spec"] = None
+            result["status"] = "success"
+            result["message"] = f"扫 {res['scanned']} 个节点，{len(empty)} 个空"
+        else:
+            result["action_spec"] = {
+                "action": "delete_nodes",
+                "tokens": [e["node_token"] for e in empty],
+                "descriptions": [e["title"] for e in empty],
+            }
+            result["status"] = "success"
+            result["message"] = f"找到 {len(empty)} 个空节点待删除，请确认"
+
+    elif intent == "delete_by_prefix":
+        prefix = (params.get("prefix") or "").strip()
+        if not prefix:
+            result["status"] = "error"
+            result["message"] = "AI 没提取出前缀，请改说得更具体"
+            _emit_chat_result(result, json_output)
+            return
+        # 复用 cleanup-wiki 的 dry-run 预览路径
+        matched = wiki_tools.list_all_nodes(client, wiki_space_id, max_nodes=500)
+        matched = [n for n in matched if n["title"].startswith(prefix)]
+        result["preview"] = {
+            "type": "prefix_match",
+            "prefix": prefix,
+            "count": len(matched),
+            "items": [{"title": n["title"], "node_token": n["node_token"]} for n in matched],
+        }
+        if not matched:
+            result["action_spec"] = None
+            result["status"] = "success"
+            result["message"] = f"没有标题以 '{prefix}' 开头的节点"
+        else:
+            result["action_spec"] = {
+                "action": "delete_nodes",
+                "tokens": [n["node_token"] for n in matched],
+                "descriptions": [n["title"] for n in matched],
+            }
+            result["status"] = "success"
+            result["message"] = f"匹配到 {len(matched)} 个节点，确认后删除"
+
+    elif intent == "organize_preview":
+        result["preview"] = {
+            "type": "hint",
+            "text": "建议直接在主界面点「Wiki 整理工作流 → 预览分类结果」，会生成分类报告到 logs/organize_report_*.json。Agent 暂不直接触发 organize（扫描 + AI 分类较慢，放在独立按钮更合适）。",
+        }
+        result["action_spec"] = None
+        result["status"] = "success"
+        result["message"] = "已给出操作建议"
+
+    else:
+        # unknown → 降级搜索
+        matches = wiki_tools.search_wiki_by_title(client, wiki_space_id, query, limit=5)
+        result["preview"] = {
+            "type": "search",
+            "count": len(matches),
+            "items": [{"title": m["title"], "url": f"https://open.feishu.cn/wiki/{m['node_token']}"} for m in matches],
+        }
+        result["action_spec"] = None
+        result["status"] = "partial"
+        result["message"] = "未精确识别意图，按关键词搜索处理"
+
+    _emit_chat_result(result, json_output)
+
+
+def _agent_stage_execute(args, client, wiki_space_id, app_id, app_secret, brain, result, json_output):
+    """Execute 阶段：拿到 action_spec 真执行"""
+    from src.agent import wiki_tools
+
+    spec_raw = getattr(args, "action", "") or ""
+    if not spec_raw:
+        result["message"] = "execute 阶段需 --action '{JSON}'"
+        _emit_chat_result(result, json_output)
+        return
 
     try:
-        creds = config_loader.load_credentials()
-        wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
-        if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
-            result["message"] = "飞书 Wiki space_id 未配置"
-            _emit_chat_result(result, json_output)
-            return
-
-        factory = FeishuClientFactory(creds["accounts"])
-        client = factory.get_client("personal")
-
-        # 1. 搜 Wiki — 用 ListSpaceNode + 递归标题匹配（tenant_access_token 兼容）
-        # Wiki v1 SearchNode 需要 user_access_token (99991668)，tenant 过不了
-        from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
-
-        query_lower = query.lower()
-        matches: List[Dict[str, Any]] = []
-
-        def _scan(parent_token: Optional[str], depth: int):
-            if len(matches) >= limit * 3 or depth > 4:
-                return
-            page_token = None
-            for _ in range(5):
-                b = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50)
-                if parent_token:
-                    b.parent_node_token(parent_token)
-                if page_token:
-                    b.page_token(page_token)
-                r = client.wiki.v2.space_node.list(b.build())
-                if not r.success():
-                    return
-                for it in (getattr(r.data, "items", None) or []):
-                    title = getattr(it, "title", "") or ""
-                    if query_lower in title.lower():
-                        matches.append({
-                            "title": title,
-                            "node_token": it.node_token,
-                            "has_child": bool(getattr(it, "has_child", False)),
-                        })
-                        if len(matches) >= limit * 3:
-                            return
-                    # 递归向下（限深度）
-                    if getattr(it, "has_child", False) and depth < 4:
-                        _scan(it.node_token, depth + 1)
-                        if len(matches) >= limit * 3:
-                            return
-                if not getattr(r.data, "has_more", False):
-                    break
-                page_token = getattr(r.data, "page_token", None)
-                if not page_token:
-                    break
-
-        _scan(None, 0)
-
-        # 按匹配度简单排序：完全包含 > 前缀 > 任意位置
-        def _score(title: str) -> int:
-            t = title.lower()
-            if t == query_lower: return 100
-            if t.startswith(query_lower): return 50
-            return 10
-        matches.sort(key=lambda m: _score(m["title"]), reverse=True)
-
-        for m in matches[:limit]:
-            result["sources"].append({
-                "title": m["title"],
-                "url": f"https://open.feishu.cn/wiki/{m['node_token']}",
-                "node_token": m["node_token"],
-            })
-
-        if not result["sources"]:
-            result["status"] = "success"
-            result["answer"] = f"在飞书 Wiki 里没找到与「{query}」相关的页面。"
-            _emit_chat_result(result, json_output)
-            return
-
-        # 2. 豆包基于搜索结果写回答
-        from src.importers.ai_summarizer import AISummarizer
-
-        ai_cfg = config_loader.get_ai_config()
-        summarizer = AISummarizer(ai_cfg)
-        if not summarizer.configured():
-            # 没配 AI 时降级为"只列搜索结果"
-            result["status"] = "partial"
-            result["answer"] = (
-                f"找到 {len(result['sources'])} 个相关 Wiki 页面（未配置豆包 AI，"
-                f"仅列出标题；配置 ai.api_key 后能自动总结）："
-            )
-            _emit_chat_result(result, json_output)
-            return
-
-        sources_lines = "\n".join(
-            f"- {s['title']}  {s['url']}" for s in result["sources"]
-        )
-        prompt = (
-            f"用户询问: {query}\n\n"
-            f"根据以下飞书 Wiki 里检索到的相关页面标题和链接，用中文给出一个简短的"
-            f"帮助回答（200 字以内），引用具体页面名，不要编造页面中没有的内容。"
-            f"如果信息不足以回答，直接说\"建议直接点击下方链接查看\"。\n\n"
-            f"检索结果:\n{sources_lines}"
-        )
-        ai_answer = summarizer._chat_json(
-            tag=f"chat[{query[:20]}]",
-            user_prompt=(
-                prompt + "\n\n返回 JSON: "
-                + '{"one_liner": "一句话答复（必填）", "detail": "展开说明（必填）"}'
-            ),
-            timeout=60,
-            retries=1,
-        )
-        if ai_answer:
-            result["answer"] = ai_answer.get("detail") or ai_answer.get("one_liner") or ""
-            result["status"] = "success"
-        else:
-            result["answer"] = f"AI 回答生成失败，以下是找到的 {len(result['sources'])} 个相关页面："
-            result["status"] = "partial"
-
+        spec = json.loads(spec_raw)
+    except json.JSONDecodeError as e:
+        result["message"] = f"--action 不是合法 JSON: {e}"
         _emit_chat_result(result, json_output)
+        return
 
-    except Exception as e:
-        logger.exception("chat 异常")
-        result["message"] = f"异常: {e}"
-        _emit_chat_result(result, json_output)
-        if not json_output:
-            raise
+    action = spec.get("action")
+    result["executed_action"] = action
+    deleted: List[Dict[str, str]] = []
+    failed: List[Dict[str, str]] = []
+
+    if action == "delete_nodes":
+        tokens = spec.get("tokens") or []
+        descs = spec.get("descriptions") or [""] * len(tokens)
+        if not tokens:
+            result["message"] = "tokens 为空"
+            _emit_chat_result(result, json_output)
+            return
+        for i, tk in enumerate(tokens):
+            title = descs[i] if i < len(descs) else ""
+            r = wiki_tools.delete_wiki_node(app_id, app_secret, wiki_space_id, tk)
+            if r["ok"]:
+                deleted.append({"title": title, "node_token": tk})
+                logger.info(f"✅ Agent 删除: {title}")
+            else:
+                failed.append({"title": title, "node_token": tk, "error": r["error"]})
+                logger.warning(f"❌ Agent 删除失败: {title} — {r['error']}")
+
+        result["deleted"] = deleted
+        result["failed"] = failed
+        result["status"] = "success" if not failed else "partial"
+        raw_msg = f"成功删除 {len(deleted)} 个，失败 {len(failed)} 个"
+        # 让豆包写个友好版
+        result["message"] = brain.summarize_result("delete_nodes", {
+            "deleted": len(deleted),
+            "failed": len(failed),
+            "titles_sample": [d["title"] for d in deleted[:5]],
+        }) or raw_msg
+    else:
+        result["message"] = f"暂不支持的 action: {action}"
+
+    _emit_chat_result(result, json_output)
 
 
 def _emit_chat_result(result: Dict[str, Any], json_output: bool) -> None:
     if json_output:
         print(json.dumps(result, ensure_ascii=False))
         return
-    print(f"\n问：{result['query']}")
-    if result.get("answer"):
-        print(f"\n{result['answer']}")
-    if result.get("sources"):
-        print("\n相关 Wiki 页面：")
-        for s in result["sources"]:
-            print(f"  • {s['title']}  {s['url']}")
+    print(f"\n[Agent {result.get('stage','?')}] status={result.get('status')}")
+    if result.get("intent"):
+        print(f"  意图: {result['intent']}  ({result.get('reasoning','')})")
+    if result.get("user_facing_plan"):
+        print(f"  计划: {result['user_facing_plan']}")
+    if result.get("preview"):
+        p = result["preview"]
+        if p.get("type") == "search":
+            print(f"\n  搜到 {p.get('count', 0)} 个相关页面：")
+            for it in p.get("items", []):
+                print(f"    • {it['title']}  {it.get('url','')}")
+        elif p.get("type") in ("empty_nodes", "prefix_match"):
+            n = p.get("count", 0)
+            label = "空节点" if p["type"] == "empty_nodes" else f"前缀 '{p.get('prefix')}' 匹配"
+            print(f"\n  {label}：{n} 个")
+            for it in p.get("items", [])[:20]:
+                extra = f" (blocks={it.get('block_count')})" if "block_count" in it else ""
+                print(f"    - {it['title']}{extra}")
+        elif p.get("type") == "hint":
+            print(f"\n  {p.get('text', '')}")
+    if result.get("action_spec"):
+        print(f"\n  待确认执行的动作: {result['action_spec'].get('action')}")
+        print(f"  执行命令: python main.py chat --stage execute --action '<json>' --json")
+    if result.get("deleted") is not None:
+        print(f"\n  已删除 {len(result['deleted'])} 个，失败 {len(result['failed'])} 个")
+        for d in result["deleted"][:10]:
+            print(f"    ✅ {d['title']}")
+        for f in result["failed"][:10]:
+            print(f"    ❌ {f['title']} — {f['error']}")
     if result.get("message"):
-        print(f"\n⚠️ {result['message']}")
+        print(f"\n  {result['message']}")
 
 
 def cmd_cleanup_wiki(args):
@@ -1098,10 +1194,13 @@ def main():
     p_manage.add_argument("--chat-id", dest="chat_id", help="IM 群聊 ID（管理消息时必填）")
     p_manage.add_argument("--query", help="搜索关键词（管理联系人时可用）")
 
-    # chat 子命令：对话助手 MVP
-    p_chat = subparsers.add_parser("chat", help="对话助手：关键词搜 Wiki → 豆包回答")
-    p_chat.add_argument("query", nargs="?", default="", help="查询关键词")
-    p_chat.add_argument("--limit", type=int, default=5, help="搜多少个相关页面")
+    # chat 子命令：Agent 两阶段（plan → execute）
+    p_chat = subparsers.add_parser("chat", help="对话 Agent：识别意图 → 预览计划 → 确认后执行")
+    p_chat.add_argument("query", nargs="?", default="", help="自然语言指令（plan 阶段需要）")
+    p_chat.add_argument("--stage", choices=["plan", "execute"], default="plan",
+                        help="plan=出计划（默认），execute=拿计划真执行")
+    p_chat.add_argument("--action", default="", help="execute 阶段的 action_spec JSON 字符串")
+    p_chat.add_argument("--limit", type=int, default=5, help="搜索/预览条目上限")
     p_chat.add_argument("--json", action="store_true", help="输出 JSON 供 UI 调用")
 
     # cleanup-wiki 子命令：批量删除 Wiki 节点

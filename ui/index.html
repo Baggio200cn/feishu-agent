@@ -533,20 +533,21 @@ input[type="text"].text-input:focus { border-color: var(--accent); }
 
 <div class="toast" id="toast"></div>
 
-<!-- ============ 对话助手弹层 ============ -->
+<!-- ============ 对话 Agent 弹层 ============ -->
 <div class="modal-backdrop" id="chat-modal">
   <div class="modal">
     <div class="modal-header">
-      <span class="modal-title">对话助手 · 搜 Wiki</span>
+      <span class="modal-title">对话 Agent · Wiki 管家</span>
       <button class="modal-close" onclick="closeModal('chat-modal')">×</button>
     </div>
     <div class="modal-body">
-      <input type="text" id="chat-query" class="text-input" placeholder='输入关键词，例如"Trending 日报"或"Claude Opus 4.7"' />
-      <div class="inline-hint">豆包 AI 会基于飞书 Wiki 里的命中页面给一段中文回答</div>
+      <input type="text" id="chat-query" class="text-input" placeholder='用中文说指令：如"删除空文件"、"找一下 Claude 的资料"、"删除 2026-04-17 的日报"' />
+      <div class="inline-hint">🤖 Agent 能做：搜 Wiki · 找空文档 · 删空文档 · 按前缀删除 · 整理建议</div>
       <div id="chat-result"></div>
     </div>
     <div class="modal-footer">
       <button onclick="closeModal('chat-modal')">关闭</button>
+      <button id="chat-execute-btn" style="display:none;" onclick="confirmExecute()">确认执行</button>
       <button class="primary" id="chat-submit-btn" onclick="submitChat()">提问</button>
     </div>
   </div>
@@ -646,10 +647,14 @@ function toast(msg) {
 function openModal(id) { document.getElementById(id).classList.add('show'); }
 function closeModal(id) { document.getElementById(id).classList.remove('show'); }
 
-// ============ 对话助手 ============
+// ============ 对话 Agent ============
+let pendingActionSpec = null; // 当前等待用户确认的 action_spec
+
 function openChatModal() {
   document.getElementById('chat-result').innerHTML = '';
   document.getElementById('chat-query').value = '';
+  document.getElementById('chat-execute-btn').style.display = 'none';
+  pendingActionSpec = null;
   openModal('chat-modal');
   setTimeout(() => document.getElementById('chat-query').focus(), 100);
 }
@@ -660,33 +665,125 @@ document.getElementById('chat-query').addEventListener('keydown', (e) => {
 
 function submitChat() {
   const q = document.getElementById('chat-query').value.trim();
-  if (!q) { toast('请输入关键词'); return; }
+  if (!q) { toast('请输入指令'); return; }
   const btn = document.getElementById('chat-submit-btn');
+  const execBtn = document.getElementById('chat-execute-btn');
   const resultEl = document.getElementById('chat-result');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>思考中…';
-  resultEl.innerHTML = '<div class="inline-hint">调用豆包中，约需 5-30 秒…</div>';
+  execBtn.style.display = 'none';
+  pendingActionSpec = null;
+  resultEl.innerHTML = '<div class="inline-hint">🧠 豆包识别意图 + 扫描 Wiki 预览，约需 10-60 秒…</div>';
 
   callAction('open-chat', { query: q }).then(result => {
     btn.disabled = false;
     btn.innerHTML = '提问';
     if (!result || !result.chat) {
-      resultEl.innerHTML = `<div class="chat-answer">⚠️ ${result && result.message || '调用失败'}</div>`;
+      resultEl.innerHTML = `<div class="chat-answer" style="color:var(--danger)">⚠️ ${(result && result.message) || '调用失败'}</div>`;
+      return;
+    }
+    renderPlan(result.chat);
+  });
+}
+
+function renderPlan(c) {
+  const resultEl = document.getElementById('chat-result');
+  const execBtn = document.getElementById('chat-execute-btn');
+  let html = '';
+
+  // 意图 + 推理
+  if (c.intent) {
+    const intentLabel = ({
+      search: '🔍 搜索',
+      find_empty: '📋 找空节点',
+      delete_empty: '🗑 删空节点',
+      delete_by_prefix: '🗑 按前缀删除',
+      organize_preview: '🏷 整理建议',
+      unknown: '❓ 未识别',
+    })[c.intent] || c.intent;
+    html += `<div style="margin-top:10px;font-size:12px;color:var(--text-tertiary)">识别意图：<b>${intentLabel}</b>　${escapeHtml(c.reasoning || '')}</div>`;
+  }
+
+  // Agent 的计划说明
+  if (c.user_facing_plan) {
+    html += `<div class="chat-answer">${escapeHtml(c.user_facing_plan)}</div>`;
+  }
+
+  // 预览
+  const p = c.preview || {};
+  if (p.type === 'search') {
+    html += `<div style="margin-top:8px;font-size:12px;color:var(--text-tertiary)">搜到 ${p.count} 个相关页面：</div>`;
+    (p.items || []).forEach(s => {
+      html += `<a class="chat-source" href="${s.url}" onclick="event.preventDefault(); openInBrowser('${s.url}')">📄 ${escapeHtml(s.title)}</a>`;
+    });
+  } else if (p.type === 'empty_nodes') {
+    html += `<div style="margin-top:8px;font-size:12px;color:var(--text-tertiary)">扫描 ${p.scanned} 个节点，找到 <b>${p.count}</b> 个空节点：</div>`;
+    (p.items || []).slice(0, 30).forEach(it => {
+      html += `<div class="cleanup-item">${escapeHtml(it.title)} <span style="color:var(--text-tertiary);font-size:11px">(blocks=${it.block_count})</span></div>`;
+    });
+    if ((p.items || []).length > 30) {
+      html += `<div class="inline-hint">（还有 ${p.items.length - 30} 项未显示）</div>`;
+    }
+  } else if (p.type === 'prefix_match') {
+    html += `<div style="margin-top:8px;font-size:12px;color:var(--text-tertiary)">前缀 "<b>${escapeHtml(p.prefix)}</b>" 匹配 <b>${p.count}</b> 个节点：</div>`;
+    (p.items || []).slice(0, 30).forEach(it => {
+      html += `<div class="cleanup-item">${escapeHtml(it.title)}</div>`;
+    });
+  } else if (p.type === 'hint') {
+    html += `<div class="chat-answer">${escapeHtml(p.text || '')}</div>`;
+  }
+
+  // 危险标记 + 执行按钮
+  if (c.action_spec) {
+    pendingActionSpec = c.action_spec;
+    const n = (c.action_spec.tokens || []).length;
+    html += `<div class="chat-answer" style="color:var(--warning);margin-top:12px">⚠️ 将<b>不可恢复地删除 ${n} 个节点</b>。确认无误请点底部「确认执行」按钮。</div>`;
+    execBtn.style.display = 'inline-flex';
+    execBtn.className = 'primary';
+    execBtn.textContent = `确认删除 ${n} 个`;
+  } else {
+    execBtn.style.display = 'none';
+  }
+
+  // 消息
+  if (c.message && c.status !== 'success') {
+    html += `<div class="inline-hint">💬 ${escapeHtml(c.message)}</div>`;
+  }
+
+  resultEl.innerHTML = html;
+}
+
+function confirmExecute() {
+  if (!pendingActionSpec) { toast('没有待执行的动作'); return; }
+  const n = (pendingActionSpec.tokens || []).length;
+  if (!confirm(`即将删除 ${n} 个 Wiki 节点，此操作不可恢复。继续？`)) return;
+
+  const execBtn = document.getElementById('chat-execute-btn');
+  const resultEl = document.getElementById('chat-result');
+  execBtn.disabled = true;
+  execBtn.innerHTML = '<span class="spinner"></span>执行中…';
+
+  callAction('agent-execute', { action_spec: pendingActionSpec }).then(result => {
+    execBtn.disabled = false;
+    execBtn.textContent = '已执行';
+    execBtn.style.display = 'none';
+    pendingActionSpec = null;
+
+    if (!result || !result.chat) {
+      resultEl.innerHTML += `<div class="chat-answer" style="color:var(--danger)">⚠️ ${(result && result.message) || '执行失败'}</div>`;
       return;
     }
     const c = result.chat;
-    let html = '';
-    if (c.answer) html += `<div class="chat-answer">${escapeHtml(c.answer)}</div>`;
-    if (c.sources && c.sources.length) {
-      html += '<div style="margin-top:8px;font-size:12px;color:var(--text-tertiary)">相关 Wiki 页面：</div>';
-      c.sources.forEach(s => {
-        html += `<a class="chat-source" href="${s.url}" onclick="event.preventDefault(); openInBrowser('${s.url}')">📄 ${escapeHtml(s.title)}</a>`;
-      });
-    }
-    if (c.message && c.status === 'error') {
-      html += `<div class="chat-answer" style="color:var(--danger)">⚠️ ${escapeHtml(c.message)}</div>`;
-    }
-    resultEl.innerHTML = html;
+    let html = '<hr style="margin:12px 0;border:none;border-top:1px solid var(--border)"/>';
+    html += `<div class="chat-answer">${escapeHtml(c.message || '执行完成')}</div>`;
+    (c.deleted || []).slice(0, 20).forEach(d => {
+      html += `<div class="cleanup-item ok">${escapeHtml(d.title)}</div>`;
+    });
+    (c.failed || []).forEach(f => {
+      html += `<div class="cleanup-item fail">${escapeHtml(f.title)} — ${escapeHtml(f.error || '')}</div>`;
+    });
+    resultEl.innerHTML += html;
+    toast(`✅ ${c.message || '执行完成'}`);
   });
 }
 
