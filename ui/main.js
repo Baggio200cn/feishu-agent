@@ -3,6 +3,13 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 
+// Electron/Chromium 渲染进程自己不需要走 VPN —— 只有 Python 子进程抓 Reddit 才需要。
+// 若用户在 PowerShell 里设了 HTTP_PROXY 再 npm start，Chromium 会继承，然后试图用
+// VPN 代理去访问 Google 字体 / 自动更新等，产生 SSL handshake failed 噪音。
+// 这行强制 Chromium 不走任何代理，错误消除；spawn python 时仍从 process.env 透传
+// HTTP_PROXY，抓 Reddit 不受影响。
+app.commandLine.appendSwitch('no-proxy-server');
+
 const REPO_ROOT = path.join(__dirname, '..');
 const PY_CMD = process.platform === 'win32' ? 'python' : 'python3';
 const STATE_FILE = path.join(REPO_ROOT, 'logs', 'scheduler_state.json');

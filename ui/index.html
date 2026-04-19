@@ -306,11 +306,57 @@ button.flex { flex: 1; }
 .modal {
   background: var(--bg-card);
   border-radius: var(--radius-lg);
-  width: min(92%, 480px);
-  max-height: 88vh;
+  width: min(96%, 720px);
+  max-height: 92vh;
   display: flex; flex-direction: column;
   box-shadow: 0 12px 40px rgba(0,0,0,0.25);
   overflow: hidden;
+}
+/* 对话 modal 特别大一些 */
+#chat-modal .modal {
+  width: min(96%, 820px);
+  height: 85vh;
+}
+#chat-modal .modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+}
+#chat-result {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+  margin-top: 6px;
+}
+.chat-msg {
+  margin: 10px 0;
+}
+.chat-msg.user {
+  text-align: right;
+}
+.chat-msg.user .bubble {
+  background: var(--accent);
+  color: white;
+  display: inline-block;
+  max-width: 80%;
+  padding: 8px 12px;
+  border-radius: 12px;
+  border-bottom-right-radius: 2px;
+  text-align: left;
+  word-break: break-word;
+}
+.chat-msg.agent .bubble {
+  background: var(--bg-subtle);
+  padding: 10px 12px;
+  border-radius: 12px;
+  border-bottom-left-radius: 2px;
+}
+.chat-msg .meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-top: 4px;
 }
 .modal-header {
   padding: 14px 16px;
@@ -538,17 +584,22 @@ input[type="text"].text-input:focus { border-color: var(--accent); }
   <div class="modal">
     <div class="modal-header">
       <span class="modal-title">对话 Agent · Wiki 管家</span>
-      <button class="modal-close" onclick="closeModal('chat-modal')">×</button>
+      <div>
+        <button onclick="clearChatHistory()" style="font-size:11px;padding:4px 10px;margin-right:8px">新对话</button>
+        <button class="modal-close" onclick="closeModal('chat-modal')">×</button>
+      </div>
     </div>
     <div class="modal-body">
-      <input type="text" id="chat-query" class="text-input" placeholder='用中文说指令：如"删除空文件"、"找一下 Claude 的资料"、"删除 2026-04-17 的日报"' />
-      <div class="inline-hint">🤖 Agent 能做：搜 Wiki · 找空文档 · 删空文档 · 按前缀删除 · 整理建议</div>
+      <div class="inline-hint">🤖 Agent 能做：搜 Wiki · 找空文档 · 删空文档 · 按前缀删除 · 整理建议。可连续对话。</div>
       <div id="chat-result"></div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <input type="text" id="chat-query" class="text-input" placeholder='用中文说指令：如"删除空文件"、"找一下 Claude 的资料"' style="flex:1" />
+        <button class="primary" id="chat-submit-btn" onclick="submitChat()">提问</button>
+      </div>
     </div>
     <div class="modal-footer">
       <button onclick="closeModal('chat-modal')">关闭</button>
       <button id="chat-execute-btn" style="display:none;" onclick="confirmExecute()">确认执行</button>
-      <button class="primary" id="chat-submit-btn" onclick="submitChat()">提问</button>
     </div>
   </div>
 </div>
@@ -648,46 +699,79 @@ function openModal(id) { document.getElementById(id).classList.add('show'); }
 function closeModal(id) { document.getElementById(id).classList.remove('show'); }
 
 // ============ 对话 Agent ============
-let pendingActionSpec = null; // 当前等待用户确认的 action_spec
+let pendingActionSpec = null; // 当前等待用户确认的 action_spec（每次新问题刷新）
 
 function openChatModal() {
+  // 只有首次打开清空；后续重新打开保留历史（让用户能看到之前的对话）
+  openModal('chat-modal');
+  setTimeout(() => document.getElementById('chat-query').focus(), 100);
+}
+
+function clearChatHistory() {
   document.getElementById('chat-result').innerHTML = '';
   document.getElementById('chat-query').value = '';
   document.getElementById('chat-execute-btn').style.display = 'none';
   pendingActionSpec = null;
-  openModal('chat-modal');
-  setTimeout(() => document.getElementById('chat-query').focus(), 100);
+  document.getElementById('chat-query').focus();
 }
 
 document.getElementById('chat-query').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') submitChat();
 });
 
+function appendUserMsg(text) {
+  const el = document.getElementById('chat-result');
+  const div = document.createElement('div');
+  div.className = 'chat-msg user';
+  div.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}
+
+function appendAgentMsg(innerHtml) {
+  const el = document.getElementById('chat-result');
+  const div = document.createElement('div');
+  div.className = 'chat-msg agent';
+  div.innerHTML = `<div class="bubble">${innerHtml}</div>`;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+  return div;
+}
+
 function submitChat() {
   const q = document.getElementById('chat-query').value.trim();
   if (!q) { toast('请输入指令'); return; }
   const btn = document.getElementById('chat-submit-btn');
   const execBtn = document.getElementById('chat-execute-btn');
-  const resultEl = document.getElementById('chat-result');
+  const input = document.getElementById('chat-query');
+
+  // 新问题: 追加用户消息气泡 + 思考中占位 + 清空输入框 + 隐藏之前的执行按钮
+  appendUserMsg(q);
+  input.value = '';
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>思考中…';
   execBtn.style.display = 'none';
   pendingActionSpec = null;
-  resultEl.innerHTML = '<div class="inline-hint">🧠 豆包识别意图 + 扫描 Wiki 预览，约需 10-60 秒…</div>';
+
+  const thinkingBubble = appendAgentMsg('<span class="spinner"></span>🧠 豆包识别意图 + 扫描 Wiki 预览，约需 10-60 秒…');
 
   callAction('open-chat', { query: q }).then(result => {
     btn.disabled = false;
     btn.innerHTML = '提问';
+    // 移除"思考中"气泡
+    thinkingBubble.remove();
+
     if (!result || !result.chat) {
-      resultEl.innerHTML = `<div class="chat-answer" style="color:var(--danger)">⚠️ ${(result && result.message) || '调用失败'}</div>`;
+      appendAgentMsg(`<span style="color:var(--danger)">⚠️ ${escapeHtml((result && result.message) || '调用失败')}</span>`);
+      input.focus();
       return;
     }
     renderPlan(result.chat);
+    input.focus();
   });
 }
 
 function renderPlan(c) {
-  const resultEl = document.getElementById('chat-result');
   const execBtn = document.getElementById('chat-execute-btn');
   let html = '';
 
@@ -750,7 +834,7 @@ function renderPlan(c) {
     html += `<div class="inline-hint">💬 ${escapeHtml(c.message)}</div>`;
   }
 
-  resultEl.innerHTML = html;
+  appendAgentMsg(html);
 }
 
 function confirmExecute() {
@@ -765,25 +849,25 @@ function confirmExecute() {
 
   callAction('agent-execute', { action_spec: pendingActionSpec }).then(result => {
     execBtn.disabled = false;
-    execBtn.textContent = '已执行';
+    execBtn.textContent = '确认执行';
     execBtn.style.display = 'none';
     pendingActionSpec = null;
 
     if (!result || !result.chat) {
-      resultEl.innerHTML += `<div class="chat-answer" style="color:var(--danger)">⚠️ ${(result && result.message) || '执行失败'}</div>`;
+      appendAgentMsg(`<span style="color:var(--danger)">⚠️ ${escapeHtml((result && result.message) || '执行失败')}</span>`);
       return;
     }
     const c = result.chat;
-    let html = '<hr style="margin:12px 0;border:none;border-top:1px solid var(--border)"/>';
-    html += `<div class="chat-answer">${escapeHtml(c.message || '执行完成')}</div>`;
-    (c.deleted || []).slice(0, 20).forEach(d => {
+    let html = `<div style="font-weight:500;margin-bottom:6px">✅ ${escapeHtml(c.message || '执行完成')}</div>`;
+    (c.deleted || []).slice(0, 30).forEach(d => {
       html += `<div class="cleanup-item ok">${escapeHtml(d.title)}</div>`;
     });
     (c.failed || []).forEach(f => {
       html += `<div class="cleanup-item fail">${escapeHtml(f.title)} — ${escapeHtml(f.error || '')}</div>`;
     });
-    resultEl.innerHTML += html;
-    toast(`✅ ${c.message || '执行完成'}`);
+    appendAgentMsg(html);
+    toast(`${c.message || '执行完成'}`);
+    document.getElementById('chat-query').focus();
   });
 }
 
