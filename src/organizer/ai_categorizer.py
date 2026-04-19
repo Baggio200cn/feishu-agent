@@ -63,19 +63,27 @@ class AICategorizer:
         return None
 
     def _ask_ai(self, title: str, preview: str) -> Optional[str]:
-        """调用豆包 Chat API 判断分类"""
+        """调用豆包 Chat API 判断分类。为提速：temperature=0、max_tokens=20、timeout=12"""
         categories_str = "、".join(self._category_names)
         content = f"文档标题：{title}"
         if preview:
-            content += f"\n内容摘要：{preview[:200]}"
-        content += f"\n\n请从以下分类中选择最合适的一个，只返回分类名称，不要其他文字：\n{categories_str}"
+            content += f"\n内容摘要：{preview[:150]}"
+        content += (
+            f"\n\n请从以下分类中选择最合适的一个，只返回分类名称，不要推理过程，"
+            f"不要任何额外文字：\n{categories_str}"
+        )
 
         try:
             resp = requests.post(
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                json={"model": self.model, "messages": [{"role": "user", "content": content}], "max_tokens": 20},
-                timeout=15,
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": content}],
+                    "max_tokens": 20,
+                    "temperature": 0.0,
+                },
+                timeout=12,
             )
             resp.raise_for_status()
             result = resp.json()["choices"][0]["message"]["content"].strip()

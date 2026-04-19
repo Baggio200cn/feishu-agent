@@ -55,9 +55,14 @@ def cmd_organize(args):
         logger.error("请在 credentials.json 中配置 accounts.personal.wiki_space_id")
         sys.exit(1)
 
+    # --limit: dry-run 默认抽样 50 个（快预览），真执行默认 0（无限制）
+    limit = getattr(args, "limit", None)
+    if limit is None:
+        limit = 50 if args.dry_run else 0
+
     all_docs = []
 
-    # 扫描个人账号
+    # 扫描个人账号（Scanner 自带时间预算 + 节点上限，不会跑飞）
     logger.info("=== 扫描个人账号文档 ===")
     personal_client = factory.get_client("personal")
     personal_scanner = DocScanner(personal_client, "personal")
@@ -84,10 +89,24 @@ def cmd_organize(args):
         logger.info("未扫描到任何文档，退出")
         return
 
-    # AI 自动分类
-    logger.info(f"=== AI 分类（共 {len(all_docs)} 篇）===")
+    # AI 自动分类（limit>0 时只分类抽样的前 N 个）
+    total_found = len(all_docs)
+    sampled = all_docs if (limit <= 0 or total_found <= limit) else all_docs[:limit]
+    if sampled is not all_docs:
+        logger.info(
+            f"=== AI 分类（共扫到 {total_found} 篇，本次抽样 {len(sampled)} 篇）==="
+        )
+    else:
+        logger.info(f"=== AI 分类（共 {total_found} 篇）===")
+
     categorizer = AICategorizer(config_loader.get_ai_config(), categories_cfg)
-    all_docs = categorizer.categorize_batch(all_docs)
+    sampled = categorizer.categorize_batch(sampled)
+
+    # 未分类的其余文档标为"其他"，保证后续 organize 阶段不会 KeyError
+    sampled_tokens = {id(d) for d in sampled}
+    for d in all_docs:
+        if id(d) not in sampled_tokens:
+            d["category"] = d.get("category") or "其他（未分类）"
 
     # 打印分类预览
     from collections import Counter
@@ -97,7 +116,11 @@ def cmd_organize(args):
         print(f"  {cat}: {cnt} 篇")
 
     if args.dry_run:
-        print("\n[DRY-RUN 模式] 以上为预览，未实际移动任何文档。")
+        if sampled is not all_docs:
+            print(f"\n[DRY-RUN] 抽样 {len(sampled)}/{total_found} 个分类；剩余被标为 '其他（未分类）'")
+            print("  想全量分类（慢）：python main.py organize --dry-run --limit 0")
+        else:
+            print("\n[DRY-RUN] 以上为全量预览，未实际移动任何文档")
         print("去掉 --dry-run 参数后重新运行以执行实际整理。")
         return
 
@@ -1040,6 +1063,10 @@ def main():
     # organize 子命令
     p_organize = subparsers.add_parser("organize", help="扫描文档并整理到个人 Wiki")
     p_organize.add_argument("--dry-run", action="store_true", help="仅预览，不实际移动文档")
+    p_organize.add_argument(
+        "--limit", type=int, default=None,
+        help="AI 分类的文档数上限（dry-run 默认 50，真执行默认 0=全量）"
+    )
 
     # import-github 子命令
     p_import_github = subparsers.add_parser("import-github", help="将 GitHub 仓库导入飞书")

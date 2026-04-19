@@ -2,6 +2,7 @@
 文档扫描器 — 扫描指定飞书账号的 Wiki 和云盘文件
 """
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -24,18 +25,22 @@ class DocScanner:
         client,
         account_name: str,
         skip_prefixes: tuple = DEFAULT_SKIP_PREFIXES,
-        max_nodes: int = 500,
+        max_nodes: int = 200,
+        max_scan_seconds: int = 60,
     ):
         """
         Args:
-            skip_prefixes: 标题以这些前缀开头的节点不递归进入（避免扫自动生成的日报文件夹）
-            max_nodes: 单次扫描节点数上限（防止 Wiki 过大时 organize 超时）
+            skip_prefixes:    标题以这些前缀开头的节点不递归进入（自动生成的日报/诊断页）
+            max_nodes:        单次扫描节点数上限
+            max_scan_seconds: 全局时间预算，超过后停止递归并返回已扫到的
         """
         self._client = client
         self.account_name = account_name
         self.skip_prefixes = tuple(skip_prefixes) if skip_prefixes else ()
         self.max_nodes = max_nodes
+        self.max_scan_seconds = max_scan_seconds
         self._node_count = 0
+        self._deadline = 0.0
 
     def scan_wiki(self, space_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
@@ -61,6 +66,7 @@ class DocScanner:
 
         docs = []
         self._node_count = 0
+        self._deadline = time.monotonic() + self.max_scan_seconds
         space_ids = [space_id] if space_id else self._list_wiki_spaces()
 
         for sid in space_ids:
@@ -155,7 +161,12 @@ class DocScanner:
         while True:
             if self._node_count >= self.max_nodes:
                 logger.warning(
-                    f"[{self.account_name}] 已扫描节点数 {self._node_count} 达上限 {self.max_nodes}，停止继续递归"
+                    f"[{self.account_name}] 已扫描节点数 {self._node_count} 达上限 {self.max_nodes}，停止递归"
+                )
+                return nodes
+            if self._deadline and time.monotonic() > self._deadline:
+                logger.warning(
+                    f"[{self.account_name}] 扫描超过时间预算 {self.max_scan_seconds}s（已扫 {self._node_count} 个节点），停止"
                 )
                 return nodes
 

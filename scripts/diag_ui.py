@@ -181,10 +181,11 @@ def test_reddit() -> Tuple[bool, str]:
 
 
 def test_wiki_preview() -> Tuple[bool, str]:
-    res = run_cli(["organize", "--dry-run"], timeout=600)
+    # dry-run 默认抽样 50 个做 AI 分类，含豆包调用 50 * ~3s = 150s；
+    # 加扫描 30s + 余量 → 240s 够用
+    res = run_cli(["organize", "--dry-run", "--limit", "30"], timeout=240)
     if not res["ok"]:
         return False, f"code={res['code']} stderr={res['stderr'][:150]}"
-    # 报告文件名: logs/organize_report_*.json
     reports = [f for f in os.listdir(os.path.join(REPO_ROOT, "logs")) if f.startswith("organize_report_")]
     if not reports:
         return False, "没生成 organize_report_*.json"
