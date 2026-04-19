@@ -116,6 +116,22 @@ def cmd_organize(args):
         print(f"  {cat}: {cnt} 篇")
 
     if args.dry_run:
+        # dry-run 也写一份报告文件，方便审计 + 给 diag 读取
+        from datetime import datetime as _dt
+        os.makedirs("logs", exist_ok=True)
+        ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+        preview_report = {
+            "run_at": _dt.now().isoformat(),
+            "dry_run": True,
+            "total": total_found,
+            "sampled": len(sampled),
+            "by_category": {
+                cat: [d.get("title", "") for d in all_docs if d.get("category") == cat]
+                for cat in cat_counts
+            },
+        }
+        with open(f"logs/organize_report_{ts}.json", "w", encoding="utf-8") as f:
+            json.dump(preview_report, f, ensure_ascii=False, indent=2)
         if sampled is not all_docs:
             print(f"\n[DRY-RUN] 抽样 {len(sampled)}/{total_found} 个分类；剩余被标为 '其他（未分类）'")
             print("  想全量分类（慢）：python main.py organize --dry-run --limit 0")
