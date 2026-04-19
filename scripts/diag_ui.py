@@ -58,9 +58,35 @@ def run_cli(args: List[str], timeout: int = 600) -> Dict[str, Any]:
 
 
 def extract_json(stdout: str) -> Optional[Dict]:
-    """从 stdout 里拎最后一个合法 JSON 对象"""
+    """从 stdout 里拎最后一个合法 JSON 对象。兼容多行缩进 JSON。"""
     if not stdout:
         return None
+    # 试 1：整个 stdout 就是一个 JSON
+    t = stdout.strip()
+    if t.startswith("{") and t.endswith("}"):
+        try:
+            return json.loads(t)
+        except json.JSONDecodeError:
+            pass
+    # 试 2：找最后一个 } 往前扫到配对的 {，尝试解析
+    last_brace = stdout.rfind("}")
+    if last_brace < 0:
+        return None
+    depth = 0
+    for i in range(last_brace, -1, -1):
+        c = stdout[i]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            depth -= 1
+            if depth == 0:
+                candidate = stdout[i : last_brace + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    # 这个 { 不是 JSON 起点（可能是字符串里的），继续往前找
+                    continue
+    # 试 3：最后退化到按行扫（单行 JSON）
     for line in reversed(stdout.splitlines()):
         t = line.strip()
         if t.startswith("{") and t.endswith("}"):

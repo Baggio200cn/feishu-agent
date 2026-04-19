@@ -70,14 +70,36 @@ function runPython(pyArgs, { env } = {}) {
   });
 }
 
-/** 从 stdout 里拎出最后一个合法 JSON 对象（忽略前面的日志行） */
+/** 从 stdout 里拎出最后一个合法 JSON 对象（兼容多行缩进 JSON） */
 function extractJsonFromStdout(stdout) {
   if (!stdout) return null;
+  // 试 1：整个 stdout 就是 JSON
+  const t = stdout.trim();
+  if (t.startsWith('{') && t.endsWith('}')) {
+    try { return JSON.parse(t); } catch { /* continue */ }
+  }
+  // 试 2：最后一个 } 往前找配对的 {
+  const lastBrace = stdout.lastIndexOf('}');
+  if (lastBrace >= 0) {
+    let depth = 0;
+    for (let i = lastBrace; i >= 0; i--) {
+      const c = stdout[i];
+      if (c === '}') depth++;
+      else if (c === '{') {
+        depth--;
+        if (depth === 0) {
+          try { return JSON.parse(stdout.slice(i, lastBrace + 1)); }
+          catch { /* 这个 { 不对，继续 */ }
+        }
+      }
+    }
+  }
+  // 试 3：单行 JSON 兜底
   const lines = stdout.split(/\r?\n/);
   for (let i = lines.length - 1; i >= 0; i--) {
-    const t = lines[i].trim();
-    if (t.startsWith('{') && t.endsWith('}')) {
-      try { return JSON.parse(t); } catch { /* continue */ }
+    const line = lines[i].trim();
+    if (line.startsWith('{') && line.endsWith('}')) {
+      try { return JSON.parse(line); } catch { /* continue */ }
     }
   }
   return null;

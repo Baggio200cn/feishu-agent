@@ -721,26 +721,62 @@ def cmd_chat(args):
         factory = FeishuClientFactory(creds["accounts"])
         client = factory.get_client("personal")
 
-        # 1. 搜 Wiki
-        from lark_oapi.api.wiki.v1 import SearchNodeRequest, SearchNodeRequestBody
+        # 1. 搜 Wiki — 用 ListSpaceNode + 递归标题匹配（tenant_access_token 兼容）
+        # Wiki v1 SearchNode 需要 user_access_token (99991668)，tenant 过不了
+        from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
 
-        body = SearchNodeRequestBody.builder().query(query).space_id(wiki_space_id).build()
-        req = SearchNodeRequest.builder().page_size(limit).request_body(body).build()
-        resp = client.wiki.v1.node.search(req)
+        query_lower = query.lower()
+        matches: List[Dict[str, Any]] = []
 
-        if not resp.success():
-            result["message"] = f"Wiki 搜索失败: {resp.code} {resp.msg}"
-            _emit_chat_result(result, json_output)
-            return
+        def _scan(parent_token: Optional[str], depth: int):
+            if len(matches) >= limit * 3 or depth > 4:
+                return
+            page_token = None
+            for _ in range(5):
+                b = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50)
+                if parent_token:
+                    b.parent_node_token(parent_token)
+                if page_token:
+                    b.page_token(page_token)
+                r = client.wiki.v2.space_node.list(b.build())
+                if not r.success():
+                    return
+                for it in (getattr(r.data, "items", None) or []):
+                    title = getattr(it, "title", "") or ""
+                    if query_lower in title.lower():
+                        matches.append({
+                            "title": title,
+                            "node_token": it.node_token,
+                            "has_child": bool(getattr(it, "has_child", False)),
+                        })
+                        if len(matches) >= limit * 3:
+                            return
+                    # 递归向下（限深度）
+                    if getattr(it, "has_child", False) and depth < 4:
+                        _scan(it.node_token, depth + 1)
+                        if len(matches) >= limit * 3:
+                            return
+                if not getattr(r.data, "has_more", False):
+                    break
+                page_token = getattr(r.data, "page_token", None)
+                if not page_token:
+                    break
 
-        items = getattr(resp.data, "items", None) or []
-        for it in items[:limit]:
-            title = getattr(it, "title", "") or ""
-            node_token = getattr(it, "node_token", "") or ""
+        _scan(None, 0)
+
+        # 按匹配度简单排序：完全包含 > 前缀 > 任意位置
+        def _score(title: str) -> int:
+            t = title.lower()
+            if t == query_lower: return 100
+            if t.startswith(query_lower): return 50
+            return 10
+        matches.sort(key=lambda m: _score(m["title"]), reverse=True)
+
+        for m in matches[:limit]:
             result["sources"].append({
-                "title": title,
-                "url": f"https://open.feishu.cn/wiki/{node_token}" if node_token else "",
-                "node_token": node_token,
+                "title": m["title"],
+                "url": f"https://open.feishu.cn/wiki/{m['node_token']}",
+                "node_token": m["node_token"],
             })
 
         if not result["sources"]:
