@@ -20,11 +20,49 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from requests.exceptions import ConnectionError as _ReqConnectionError, SSLError, Timeout
 
 logger = logging.getLogger(__name__)
 
 SESSION_DIR = os.path.join("logs", "agent_sessions")
 os.makedirs(SESSION_DIR, exist_ok=True)
+
+# ============ 网络重试配置 ============
+_RETRY_EXCEPTIONS = (SSLError, _ReqConnectionError, Timeout)
+_RETRY_BACKOFF = (1.0, 2.5, 5.0)   # 三次，间隔递增
+
+
+def _http_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+    """requests 调用 + SSL/连接错误自动重试三次。"""
+    last: Optional[Exception] = None
+    for attempt, delay in enumerate([0.0, *_RETRY_BACKOFF]):
+        if delay:
+            time.sleep(delay)
+        try:
+            return requests.request(method, url, **kwargs)
+        except _RETRY_EXCEPTIONS as e:
+            last = e
+            logger.warning(f"{method} {url[:80]} 第 {attempt+1} 次失败: {type(e).__name__} {e}")
+            continue
+    if last:
+        raise last
+    raise RuntimeError("retry exhausted without exception")
+
+
+def _sdk_call_with_retry(fn, *args, max_retries: int = 3, **kwargs):
+    """给 lark-oapi SDK 调用加上重试（SDK 内部也是 requests）。"""
+    last: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        if attempt:
+            time.sleep(_RETRY_BACKOFF[min(attempt - 1, len(_RETRY_BACKOFF) - 1)])
+        try:
+            return fn(*args, **kwargs)
+        except _RETRY_EXCEPTIONS as e:
+            last = e
+            logger.warning(f"SDK 调用第 {attempt+1} 次失败: {type(e).__name__} {e}")
+            continue
+    if last:
+        raise last
 
 # ============ 空节点判定阈值 ============
 # 正文去除空白后字数 <= 此值视为"真正空"
@@ -135,7 +173,12 @@ def scan_wiki_tree(client, wiki_space_id: str, max_nodes: int = MAX_NODES_TO_SCA
                 b.parent_node_token(parent_token)
             if page_token:
                 b.page_token(page_token)
-            r = client.wiki.v2.space_node.list(b.build())
+            req = b.build()
+            try:
+                r = _sdk_call_with_retry(client.wiki.v2.space_node.list, req)
+            except Exception as e:
+                logger.warning(f"ListSpaceNode 网络异常 parent={parent_token}: {e}，跳过此子树")
+                return
             if not r.success():
                 logger.warning(f"ListSpaceNode 失败 parent={parent_token} code={r.code} msg={r.msg}")
                 return
@@ -173,7 +216,11 @@ def read_docx_raw_content(tenant_token: str, doc_id: str, timeout: int = 10) -> 
     """GET /open-apis/docx/v1/documents/:doc_id/raw_content → plain text"""
     url = f"https://open.feishu.cn/open-apis/docx/v1/documents/{doc_id}/raw_content"
     try:
-        r = requests.get(url, headers={"Authorization": f"Bearer {tenant_token}"}, timeout=timeout)
+        r = _http_with_retry(
+            "GET", url,
+            headers={"Authorization": f"Bearer {tenant_token}"},
+            timeout=timeout,
+        )
         if r.status_code != 200:
             return None
         j = r.json()
@@ -239,7 +286,8 @@ def detect_empty_nodes(
 # ---------------------------------------------------------------------------
 def get_tenant_token(app_id: str, app_secret: str, timeout: int = 10) -> Optional[str]:
     try:
-        r = requests.post(
+        r = _http_with_retry(
+            "POST",
             "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
             json={"app_id": app_id, "app_secret": app_secret},
             timeout=timeout,
@@ -282,7 +330,7 @@ def delete_node_via_drive(
     url = f"https://open.feishu.cn/open-apis/drive/v1/files/{obj_token}"
     headers = {"Authorization": f"Bearer {tenant_token}"}
     try:
-        r = requests.delete(url, headers=headers, params={"type": obj_type_clean}, timeout=timeout)
+        r = _http_with_retry("DELETE", url, headers=headers, params={"type": obj_type_clean}, timeout=timeout)
         if r.status_code == 200:
             try:
                 j = r.json()
@@ -353,7 +401,7 @@ def mark_node_titles(
                    .node_token(t["node_token"])
                    .request_body(body)
                    .build())
-            resp = client.wiki.v2.space_node.update_title(req)
+            resp = _sdk_call_with_retry(client.wiki.v2.space_node.update_title, req)
             if resp.success():
                 marked.append({**t, "new_title": new_title})
                 logger.info(f"🏷  已标记: {title} → {new_title}")

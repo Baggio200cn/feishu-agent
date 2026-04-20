@@ -1272,10 +1272,14 @@ def cmd_agent_chat(args):
         # ---- 找空节点（只预览） ----
         elif intent == "scan_empty":
             scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+            # 缓存到 session 供后续 delete_empty / mark_empty 复用
+            session["last_scan"] = {"empty": scan["empty"], "ts": int(time.time())}
             reply["reply_text"] = (
                 f"扫 {scan['scanned']} 个 · 读到 {scan['read_ok']} 个 · "
                 f"跳过 {len(scan['skipped'])} 个（权限/类型不支持） · 真正空 {len(scan['empty'])} 个。"
-                + ("" if not scan['empty'] else " 如需删除，回复「删空节点」或「删除这些」。")
+                + ("" if not scan['empty']
+                   else "\n\n如需删除，回复「删空节点」；想改名加 🗑 前缀方便手动删，回复「标记空节点」。"
+                        "（结果已缓存 5 分钟，不用等重扫）")
             )
             reply["preview"] = {
                 "title": "扫描结果",
@@ -1290,8 +1294,17 @@ def cmd_agent_chat(args):
 
         # ---- 删空节点（预览 + stage pending_action） ----
         elif intent == "delete_empty":
-            scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
-            empties = scan["empty"]
+            # 优先复用最近 5 分钟内的扫描结果
+            cached = session.get("last_scan") or {}
+            if cached and (int(time.time()) - cached.get("ts", 0) < 300):
+                empties = cached.get("empty", [])
+                logger.info(f"复用 5 分钟内缓存的扫描结果: {len(empties)} 个空节点")
+                scan_info = f"（复用 {len(empties)} 个已缓存空节点）"
+            else:
+                scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+                empties = scan["empty"]
+                session["last_scan"] = {"empty": empties, "ts": int(time.time())}
+                scan_info = f"（新扫 {scan['scanned']} 个节点，其中 {len(empties)} 个真正空）"
             if not empties:
                 reply["reply_text"] = (
                     f"扫 {scan['scanned']} 个节点，没找到空节点，无需清理。"
@@ -1310,7 +1323,7 @@ def cmd_agent_chat(args):
                     "confirm_hint": "回复「确认执行」真删，或「取消」放弃。",
                 }
                 reply["reply_text"] = (
-                    f"找到 {len(empties)} 个空节点。\n"
+                    f"找到 {len(empties)} 个空节点 {scan_info}。\n"
                     f"⚠️ 真删路径在个人 Wiki 下通常会因飞书 API 限制失败（drive 权限不够）。"
                     f"如果删除大面积失败，换句话说「标记空节点」——我会把标题加 🗑[空] 前缀，"
                     f"你在 Wiki UI 里肉眼批量删。\n\n"
@@ -1330,8 +1343,15 @@ def cmd_agent_chat(args):
 
         # ---- 标记空节点（改名加 🗑[空] 前缀，作为真删的替代方案） ----
         elif intent == "mark_empty":
-            scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
-            empties = scan["empty"]
+            # 同样优先复用缓存
+            cached = session.get("last_scan") or {}
+            if cached and (int(time.time()) - cached.get("ts", 0) < 300):
+                empties = cached.get("empty", [])
+                logger.info(f"mark_empty 复用缓存: {len(empties)} 个空节点")
+            else:
+                scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+                empties = scan["empty"]
+                session["last_scan"] = {"empty": empties, "ts": int(time.time())}
             if not empties:
                 reply["reply_text"] = f"扫 {scan['scanned']} 个节点，没找到空节点，无需标记。"
                 reply["status"] = "success"
