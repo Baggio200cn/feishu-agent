@@ -292,7 +292,7 @@ function openLocalFile(filePath) {
  * 会自动继承。UI 不再强制任何值，让用户在启动前控制即可。
  */
 const actionDispatch = {
-  // 对话助手：把 query 发给 Python，等 JSON 回来
+  // 旧的单轮对话助手（保留兼容）
   'open-chat': async (params) => {
     const query = (params && params.query) ? String(params.query) : '';
     if (!query.trim()) {
@@ -311,6 +311,40 @@ const actionDispatch = {
       message: data.status === 'success' ? '回答已生成' : (data.message || '部分完成'),
       chat: data,
     };
+  },
+
+  // Wiki 管家 Agent（多轮 + 意图路由 + 预览确认）
+  'agent-chat': async (params) => {
+    const query = (params && params.query) ? String(params.query) : '';
+    const session = (params && params.session) ? String(params.session) : '';
+    const reset = !!(params && params.reset);
+    const argv = ['agent-chat', '--json'];
+    if (session) { argv.push('--session', session); }
+    if (reset) { argv.push('--reset'); }
+    else if (query) { argv.push('--query', query); }
+    else { return { ok: false, message: '请输入指令' }; }
+
+    const res = await runPython(argv);
+    if (!res.ok) {
+      return { ok: false, message: `Agent 调用失败（退出码 ${res.code}）`, stderr: res.stderr };
+    }
+    const data = extractJsonFromStdout(res.stdout);
+    if (!data) {
+      return { ok: false, message: '未解析到 JSON 输出', stdout: res.stdout };
+    }
+    // 不设 message，避免弹层里每轮都被 toast 重复提示
+    return {
+      ok: data.status === 'success' || data.status === 'partial',
+      agent: data,
+    };
+  },
+
+  // 浏览器打开链接
+  'view-url': async (params) => {
+    const url = (params && params.url) ? String(params.url) : '';
+    if (!url) return { ok: false, message: '缺少 url' };
+    openExternalUrl(url);
+    return { ok: true, message: '已打开链接' };
   },
 
   'run-github': async () => {

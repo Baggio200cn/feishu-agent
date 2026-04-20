@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 os.makedirs("logs", exist_ok=True)
@@ -853,23 +854,27 @@ def _emit_chat_result(result: Dict[str, Any], json_output: bool) -> None:
 
 def cmd_cleanup_wiki(args):
     """
-    Wiki 清理：按标题前缀匹配批量删除空间下的节点。
+    Wiki 清理：按标题前缀 或 按 node_token 列表批量删除空间下的节点。
     **危险操作**：默认 --dry-run，只有显式加 --confirm 才真删。
+    删除路径：先试 wiki DELETE，forbidden（1061004）时兜底到 drive DELETE。
 
     用法:
-      python main.py cleanup-wiki --prefix "[诊断]"                    # 预览（安全）
-      python main.py cleanup-wiki --prefix "[诊断]" --confirm          # 真删
-      python main.py cleanup-wiki --prefix "GitHub Trending 日报 2025" --confirm
-      python main.py cleanup-wiki --json                                # UI 调用
+      python main.py cleanup-wiki --prefix "[诊断]"
+      python main.py cleanup-wiki --prefix "[诊断]" --confirm
+      python main.py cleanup-wiki --node-tokens tok1,tok2,tok3 --confirm --json
+      python main.py cleanup-wiki --json
     """
-    import argparse as _argparse
+    from src.agent import wiki_agent
 
     prefix = (getattr(args, "prefix", "") or "").strip()
+    node_tokens_raw = (getattr(args, "node_tokens", "") or "").strip()
+    node_tokens = [t.strip() for t in node_tokens_raw.split(",") if t.strip()]
     confirm = bool(getattr(args, "confirm", False))
     json_output = bool(getattr(args, "json", False))
 
     result: Dict[str, Any] = {
         "prefix": prefix,
+        "node_tokens": node_tokens,
         "dry_run": not confirm,
         "matched": [],
         "deleted": [],
@@ -878,8 +883,8 @@ def cmd_cleanup_wiki(args):
         "message": "",
     }
 
-    if not prefix:
-        result["message"] = "必须指定 --prefix，否则拒绝（避免误删整个空间）"
+    if not prefix and not node_tokens:
+        result["message"] = "必须指定 --prefix 或 --node-tokens，避免误删整个空间"
         _emit_cleanup_result(result, json_output)
         return
 
@@ -894,90 +899,97 @@ def cmd_cleanup_wiki(args):
         factory = FeishuClientFactory(creds["accounts"])
         client = factory.get_client("personal")
 
-        # 1. 扫顶层节点，按 title 前缀匹配
-        from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+        personal_cfg = creds["accounts"]["personal"]
+        tenant_token = wiki_agent.get_tenant_token(
+            personal_cfg.get("app_id", ""), personal_cfg.get("app_secret", "")
+        )
+        if not tenant_token:
+            result["message"] = "获取 tenant_access_token 失败，检查 app_id / app_secret"
+            _emit_cleanup_result(result, json_output)
+            return
 
-        matched_nodes: List[Dict[str, str]] = []
-        page_token = None
-        for _ in range(10):
-            builder = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50)
-            if page_token:
-                builder.page_token(page_token)
-            resp = client.wiki.v2.space_node.list(builder.build())
-            if not resp.success():
-                result["message"] = f"列节点失败: {resp.code} {resp.msg}"
-                _emit_cleanup_result(result, json_output)
-                return
-            for it in (getattr(resp.data, "items", None) or []):
-                title = getattr(it, "title", "") or ""
-                if title.startswith(prefix):
+        # 匹配目标节点
+        matched_nodes: List[Dict[str, Any]] = []
+        if node_tokens:
+            # 按 token 精确匹配，需要从树里拿到 title / obj_token / obj_type
+            all_nodes = wiki_agent.scan_wiki_tree(client, wiki_space_id)
+            by_tok = {n["node_token"]: n for n in all_nodes}
+            for tok in node_tokens:
+                n = by_tok.get(tok)
+                if n:
                     matched_nodes.append({
-                        "title": title,
-                        "node_token": it.node_token,
+                        "title": n["title"],
+                        "node_token": n["node_token"],
+                        "obj_token": n.get("obj_token", ""),
+                        "obj_type": n.get("obj_type", ""),
                     })
-            if not getattr(resp.data, "has_more", False):
-                break
-            page_token = getattr(resp.data, "page_token", None)
-            if not page_token:
-                break
+                else:
+                    matched_nodes.append({
+                        "title": "(未找到)",
+                        "node_token": tok,
+                        "obj_token": "",
+                        "obj_type": "",
+                        "not_found": True,
+                    })
+        else:
+            # 按前缀匹配，只扫一层顶层（保持原行为：前缀 delete 针对日报目录这类顶层）
+            from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+            page_token = None
+            for _ in range(10):
+                builder = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50)
+                if page_token:
+                    builder.page_token(page_token)
+                resp = client.wiki.v2.space_node.list(builder.build())
+                if not resp.success():
+                    result["message"] = f"列节点失败: {resp.code} {resp.msg}"
+                    _emit_cleanup_result(result, json_output)
+                    return
+                for it in (getattr(resp.data, "items", None) or []):
+                    title = getattr(it, "title", "") or ""
+                    if title.startswith(prefix):
+                        matched_nodes.append({
+                            "title": title,
+                            "node_token": it.node_token,
+                            "obj_token": getattr(it, "obj_token", "") or "",
+                            "obj_type": getattr(it, "obj_type", "") or "",
+                        })
+                if not getattr(resp.data, "has_more", False):
+                    break
+                page_token = getattr(resp.data, "page_token", None)
+                if not page_token:
+                    break
 
         result["matched"] = matched_nodes
 
         if not matched_nodes:
             result["status"] = "success"
-            result["message"] = f"没有标题以 '{prefix}' 开头的节点"
+            result["message"] = (
+                f"没有标题以 '{prefix}' 开头的节点" if prefix
+                else "未找到任何指定 node_token"
+            )
             _emit_cleanup_result(result, json_output)
             return
 
         if not confirm:
             result["status"] = "dry_run"
             result["message"] = (
-                f"预览模式：匹配到 {len(matched_nodes)} 个节点。"
-                f"加 --confirm 才会真删。"
+                f"预览模式：匹配到 {len(matched_nodes)} 个节点。加 --confirm 才会真删。"
             )
             _emit_cleanup_result(result, json_output)
             return
 
-        # 2. 真删 —— lark-oapi 1.5.3 没包 DeleteSpaceNode，用 raw REST
-        import requests as _requests
-
-        personal_cfg = creds["accounts"]["personal"]
-        auth_resp = _requests.post(
-            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-            json={
-                "app_id": personal_cfg.get("app_id", ""),
-                "app_secret": personal_cfg.get("app_secret", ""),
-            },
-            timeout=10,
+        # 真删（含 drive 兜底）
+        batch_result = wiki_agent.batch_delete_nodes(
+            tenant_token=tenant_token,
+            wiki_space_id=wiki_space_id,
+            targets=matched_nodes,
         )
-        auth_json = auth_resp.json() if auth_resp.status_code == 200 else {}
-        tenant_token = auth_json.get("tenant_access_token", "")
-        if not tenant_token:
-            result["message"] = f"获取 tenant_access_token 失败: {auth_json}"
-            _emit_cleanup_result(result, json_output)
-            return
-
-        headers = {"Authorization": f"Bearer {tenant_token}"}
-        for node in matched_nodes:
-            url = (
-                f"https://open.feishu.cn/open-apis/wiki/v2/spaces/"
-                f"{wiki_space_id}/nodes/{node['node_token']}"
-            )
-            try:
-                r = _requests.delete(url, headers=headers, timeout=15)
-                if r.status_code == 200 and r.json().get("code", -1) == 0:
-                    result["deleted"].append(node)
-                    logger.info(f"✅ 已删除: {node['title']}")
-                else:
-                    err = f"HTTP {r.status_code} {r.text[:200]}"
-                    result["failed"].append({**node, "error": err})
-                    logger.warning(f"删除失败 [{node['title']}]: {err}")
-            except Exception as e:
-                result["failed"].append({**node, "error": str(e)})
-                logger.exception(f"删除异常 [{node['title']}]")
-
+        result["deleted"] = batch_result["deleted"]
+        result["failed"] = batch_result["failed"]
         result["status"] = "success" if not result["failed"] else "partial"
-        result["message"] = f"删除 {len(result['deleted'])} 个，失败 {len(result['failed'])} 个"
+        result["message"] = (
+            f"删除 {len(result['deleted'])} 个，失败 {len(result['failed'])} 个"
+        )
         _emit_cleanup_result(result, json_output)
 
     except Exception as e:
@@ -992,18 +1004,484 @@ def _emit_cleanup_result(result: Dict[str, Any], json_output: bool) -> None:
     if json_output:
         print(json.dumps(result, ensure_ascii=False))
         return
-    prefix = result["prefix"]
-    print(f"\n清理目标前缀：'{prefix}'")
+    prefix = result.get("prefix") or ""
+    toks = result.get("node_tokens") or []
+    if prefix:
+        print(f"\n清理目标前缀：'{prefix}'")
+    if toks:
+        print(f"\n清理目标 node_tokens：{len(toks)} 个")
     print(f"匹配到 {len(result['matched'])} 个节点:")
     for n in result["matched"]:
-        marker = "✅" if n in result.get("deleted", []) else (
-            "❌" if any(f["node_token"] == n["node_token"] for f in result.get("failed", [])) else "·"
-        )
+        marker = "·"
+        if any(d["node_token"] == n["node_token"] for d in result.get("deleted", [])):
+            marker = "✅"
+        elif any(f["node_token"] == n["node_token"] for f in result.get("failed", [])):
+            marker = "❌"
         print(f"  {marker} {n['title']}  (token={n['node_token']})")
     if result["dry_run"]:
         print(f"\n[DRY-RUN] {result['message']}")
     else:
         print(f"\n{result['message']}")
+
+
+# ============================================================================
+# scan-empty-wiki：扫描 Wiki 树，找出正文为空的节点
+# ============================================================================
+def cmd_scan_empty_wiki(args):
+    """
+    扫全部 Wiki 节点 → 逐个读 docx 正文 → 判定空节点。
+    非 docx 类型（doc / sheet / file 等）计入 skipped。
+
+    用法:
+      python main.py scan-empty-wiki --json
+      python main.py scan-empty-wiki --threshold 5 --max 500
+    """
+    from src.agent import wiki_agent
+
+    threshold = int(getattr(args, "threshold", wiki_agent.EMPTY_BODY_CHAR_THRESHOLD)
+                    or wiki_agent.EMPTY_BODY_CHAR_THRESHOLD)
+    max_nodes = int(getattr(args, "max", wiki_agent.MAX_NODES_TO_SCAN)
+                    or wiki_agent.MAX_NODES_TO_SCAN)
+    json_output = bool(getattr(args, "json", False))
+
+    result: Dict[str, Any] = {
+        "scanned": 0,
+        "read_ok": 0,
+        "skipped": [],
+        "empty": [],
+        "body_threshold": threshold,
+        "status": "error",
+        "message": "",
+    }
+
+    try:
+        creds = config_loader.load_credentials()
+        wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
+        if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+            result["message"] = "飞书 Wiki space_id 未配置"
+        else:
+            factory = FeishuClientFactory(creds["accounts"])
+            client = factory.get_client("personal")
+            personal_cfg = creds["accounts"]["personal"]
+            tenant_token = wiki_agent.get_tenant_token(
+                personal_cfg.get("app_id", ""), personal_cfg.get("app_secret", "")
+            )
+            if not tenant_token:
+                result["message"] = "获取 tenant_access_token 失败"
+            else:
+                scan = wiki_agent.detect_empty_nodes(
+                    client=client,
+                    tenant_token=tenant_token,
+                    wiki_space_id=wiki_space_id,
+                    body_threshold=threshold,
+                    max_nodes=max_nodes,
+                )
+                result.update(scan)
+                result["status"] = "success"
+                result["message"] = (
+                    f"扫 {scan['scanned']} 个 · 读到 {scan['read_ok']} 个 · "
+                    f"跳过 {len(scan['skipped'])} 个 · 真正空 {len(scan['empty'])} 个"
+                )
+    except Exception as e:
+        logger.exception("scan-empty-wiki 异常")
+        result["message"] = f"异常: {e}"
+
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    print(f"\n{result['message']}")
+    for n in result.get("empty", [])[:50]:
+        print(f"  · {n['title']}  (正文 {n.get('body_chars',0)} 字, token={n['node_token']})")
+
+
+# ============================================================================
+# agent-chat：对话式 Wiki 管家（意图路由 + 预览 + 确认执行 + 多轮会话）
+# ============================================================================
+def cmd_agent_chat(args):
+    """
+    对话 Agent · Wiki 管家。
+
+    能力: 搜 Wiki · 找空文档 · 删空文档 · 按前缀删除 · 整理建议 · 连续对话。
+    会话状态持久化在 logs/agent_sessions/{session_id}.json。
+
+    用法:
+      python main.py agent-chat --query "找空节点" --json
+      python main.py agent-chat --query "确认执行" --session sess-xxx --json
+      python main.py agent-chat --reset --session sess-xxx --json
+    """
+    from src.agent import wiki_agent
+
+    query = (getattr(args, "query", "") or "").strip()
+    session_id = (getattr(args, "session", "") or "").strip()
+    reset = bool(getattr(args, "reset", False))
+    json_output = bool(getattr(args, "json", False))
+
+    reply: Dict[str, Any] = {
+        "session_id": session_id or wiki_agent.new_session_id(),
+        "query": query,
+        "intent": "",
+        "reply_text": "",
+        "preview": None,        # {title, items: [...], summary}
+        "pending_action": None, # {id, type, params, confirm_hint}
+        "sources": [],          # 搜索结果
+        "status": "error",
+        "message": "",
+    }
+
+    # 重置会话
+    if reset:
+        session = {"id": reply["session_id"], "history": [], "pending_action": None}
+        wiki_agent.save_session(session)
+        reply.update({
+            "status": "success",
+            "intent": "reset",
+            "reply_text": "会话已重置。Agent 能做：搜 Wiki · 找空文档 · 删空文档 · 按前缀删除 · 整理建议。说句话开始吧。",
+        })
+        print(json.dumps(reply, ensure_ascii=False) if json_output else reply["reply_text"])
+        return
+
+    if not query:
+        reply["message"] = "请传入 --query"
+        print(json.dumps(reply, ensure_ascii=False) if json_output else reply["message"])
+        return
+
+    session = wiki_agent.load_session(session_id)
+    reply["session_id"] = session["id"]
+
+    try:
+        creds = config_loader.load_credentials()
+        personal_cfg = creds["accounts"]["personal"]
+        wiki_space_id = personal_cfg.get("wiki_space_id", "")
+        if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+            reply["message"] = "飞书 Wiki space_id 未配置"
+            print(json.dumps(reply, ensure_ascii=False))
+            return
+
+        factory = FeishuClientFactory(creds["accounts"])
+        client = factory.get_client("personal")
+        tenant_token = wiki_agent.get_tenant_token(
+            personal_cfg.get("app_id", ""), personal_cfg.get("app_secret", "")
+        )
+        if not tenant_token:
+            reply["message"] = "获取 tenant_access_token 失败"
+            print(json.dumps(reply, ensure_ascii=False))
+            return
+
+        intent = wiki_agent.classify_intent(query, session)
+        reply["intent"] = intent
+
+        # ---- 确认执行待定动作 ----
+        if intent == "confirm":
+            pending = session.get("pending_action") or {}
+            action_type = pending.get("type")
+            params = pending.get("params") or {}
+            if not action_type:
+                reply["reply_text"] = "没有待确认的操作。"
+                reply["status"] = "success"
+            elif action_type == "delete_nodes":
+                targets = params.get("targets") or []
+                if not targets:
+                    reply["reply_text"] = "待删节点列表为空。"
+                    reply["status"] = "success"
+                else:
+                    br = wiki_agent.batch_delete_nodes(tenant_token, wiki_space_id, targets)
+                    ok = len(br["deleted"])
+                    bad = len(br["failed"])
+                    reply["reply_text"] = (
+                        f"本次删除完成：成功 {ok} 个，失败 {bad} 个。"
+                        + ("（失败一般是因为应用不是 Wiki 空间管理员且 drive 也无权限，"
+                           "到飞书 Wiki → 成员管理里把应用加成管理员即可。）" if bad else "")
+                    )
+                    reply["preview"] = {
+                        "title": "删除结果",
+                        "items": [
+                            *[{"title": d["title"], "ok": True, "detail": f"path={d.get('path','?')}"}
+                              for d in br["deleted"]],
+                            *[{"title": f["title"], "ok": False, "detail": f.get("error", "")}
+                              for f in br["failed"]],
+                        ],
+                        "summary": f"成功 {ok} · 失败 {bad}",
+                    }
+                    reply["status"] = "success" if bad == 0 else "partial"
+            elif action_type == "cleanup_prefix":
+                prefix = params.get("prefix", "")
+                targets = params.get("targets") or []
+                if not targets:
+                    reply["reply_text"] = f"前缀 '{prefix}' 没有匹配节点。"
+                    reply["status"] = "success"
+                else:
+                    br = wiki_agent.batch_delete_nodes(tenant_token, wiki_space_id, targets)
+                    ok = len(br["deleted"])
+                    bad = len(br["failed"])
+                    reply["reply_text"] = f"按前缀 '{prefix}' 清理完成：成功 {ok}，失败 {bad}。"
+                    reply["preview"] = {
+                        "title": "删除结果",
+                        "items": [
+                            *[{"title": d["title"], "ok": True, "detail": f"path={d.get('path','?')}"}
+                              for d in br["deleted"]],
+                            *[{"title": f["title"], "ok": False, "detail": f.get("error", "")}
+                              for f in br["failed"]],
+                        ],
+                        "summary": f"成功 {ok} · 失败 {bad}",
+                    }
+                    reply["status"] = "success" if bad == 0 else "partial"
+            session["pending_action"] = None
+
+        # ---- 取消 ----
+        elif intent == "cancel":
+            session["pending_action"] = None
+            reply["reply_text"] = "好的，已取消。没有做任何修改。"
+            reply["status"] = "success"
+
+        # ---- 找空节点（只预览） ----
+        elif intent == "scan_empty":
+            scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+            reply["reply_text"] = (
+                f"扫 {scan['scanned']} 个 · 读到 {scan['read_ok']} 个 · "
+                f"跳过 {len(scan['skipped'])} 个（权限/类型不支持） · 真正空 {len(scan['empty'])} 个。"
+                + ("" if not scan['empty'] else " 如需删除，回复「删空节点」或「删除这些」。")
+            )
+            reply["preview"] = {
+                "title": "扫描结果",
+                "items": [
+                    {"title": n["title"], "ok": True,
+                     "detail": f"正文 {n.get('body_chars',0)} 字"}
+                    for n in scan["empty"]
+                ],
+                "summary": f"空节点 {len(scan['empty'])} 个",
+            }
+            reply["status"] = "success"
+
+        # ---- 删空节点（预览 + stage pending_action） ----
+        elif intent == "delete_empty":
+            scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+            empties = scan["empty"]
+            if not empties:
+                reply["reply_text"] = (
+                    f"扫 {scan['scanned']} 个节点，没找到空节点，无需清理。"
+                )
+                reply["status"] = "success"
+            else:
+                targets = [
+                    {"title": n["title"], "node_token": n["node_token"],
+                     "obj_token": n.get("obj_token", ""), "obj_type": n.get("obj_type", "")}
+                    for n in empties
+                ]
+                session["pending_action"] = {
+                    "id": "act-" + time.strftime("%H%M%S"),
+                    "type": "delete_nodes",
+                    "params": {"targets": targets},
+                    "confirm_hint": "回复「确认执行」真删，或「取消」放弃。",
+                }
+                reply["reply_text"] = (
+                    f"找到 {len(empties)} 个空节点。"
+                    f"⚠️ 确认后将**不可恢复**地删除这 {len(empties)} 个节点。"
+                    f"回复「确认执行」真删，或「取消」放弃。"
+                )
+                reply["preview"] = {
+                    "title": f"即将删除 {len(empties)} 个空节点",
+                    "items": [
+                        {"title": n["title"], "ok": True,
+                         "detail": f"正文 {n.get('body_chars',0)} 字"}
+                        for n in empties
+                    ],
+                    "summary": f"共 {len(empties)} 个，删除后不可恢复",
+                }
+                reply["pending_action"] = session["pending_action"]
+                reply["status"] = "success"
+
+        # ---- 按前缀清理 ----
+        elif intent == "cleanup_prefix":
+            # 从 query 里抽取前缀（优先方括号/引号/「」）
+            prefix = _extract_prefix_from_query(query)
+            if not prefix:
+                reply["reply_text"] = (
+                    "请告诉我前缀。例如：「按前缀删 [诊断]」或「删除所有 GitHub Trending 日报 开头的节点」。"
+                )
+                reply["status"] = "success"
+            else:
+                # 扫顶层匹配
+                from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+                matched = []
+                page_token = None
+                for _ in range(10):
+                    b = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50)
+                    if page_token:
+                        b.page_token(page_token)
+                    r = client.wiki.v2.space_node.list(b.build())
+                    if not r.success():
+                        break
+                    for it in (getattr(r.data, "items", None) or []):
+                        t = getattr(it, "title", "") or ""
+                        if t.startswith(prefix):
+                            matched.append({
+                                "title": t,
+                                "node_token": it.node_token,
+                                "obj_token": getattr(it, "obj_token", "") or "",
+                                "obj_type": getattr(it, "obj_type", "") or "",
+                            })
+                    if not getattr(r.data, "has_more", False):
+                        break
+                    page_token = getattr(r.data, "page_token", None)
+                    if not page_token:
+                        break
+                if not matched:
+                    reply["reply_text"] = f"没有标题以 '{prefix}' 开头的顶层节点。"
+                    reply["status"] = "success"
+                else:
+                    session["pending_action"] = {
+                        "id": "act-" + time.strftime("%H%M%S"),
+                        "type": "cleanup_prefix",
+                        "params": {"prefix": prefix, "targets": matched},
+                        "confirm_hint": "回复「确认执行」真删，或「取消」放弃。",
+                    }
+                    reply["reply_text"] = (
+                        f"匹配到 {len(matched)} 个以 '{prefix}' 开头的顶层节点。"
+                        f"⚠️ 确认后将连同子页**不可恢复**地删除。回复「确认执行」或「取消」。"
+                    )
+                    reply["preview"] = {
+                        "title": f"即将删除 {len(matched)} 个节点",
+                        "items": [{"title": m["title"], "ok": True,
+                                   "detail": f"token={m['node_token'][:16]}…"} for m in matched],
+                        "summary": f"前缀 '{prefix}'",
+                    }
+                    reply["pending_action"] = session["pending_action"]
+                    reply["status"] = "success"
+
+        # ---- 整理建议 ----
+        elif intent == "suggest":
+            nodes = wiki_agent.scan_wiki_tree(client, wiki_space_id)
+            scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+            tips = wiki_agent.generate_suggestions(nodes, scan)
+            reply["reply_text"] = "Wiki 结构分析：\n" + "\n".join(f"• {t}" for t in tips)
+            reply["preview"] = {
+                "title": "整理建议",
+                "items": [{"title": t, "ok": True, "detail": ""} for t in tips],
+                "summary": f"共 {len(nodes)} 个节点，空 {len(scan['empty'])} 个",
+            }
+            reply["status"] = "success"
+
+        # ---- 搜 Wiki（默认） ----
+        else:
+            sources = _search_wiki_titles(client, wiki_space_id, query, limit=5)
+            reply["sources"] = sources
+            if not sources:
+                reply["reply_text"] = f"Wiki 里没找到与「{query}」相关的页面。"
+                reply["status"] = "success"
+            else:
+                from src.importers.ai_summarizer import AISummarizer
+                ai_cfg = config_loader.get_ai_config()
+                summarizer = AISummarizer(ai_cfg)
+                if summarizer.configured():
+                    lines = "\n".join(f"- {s['title']}  {s['url']}" for s in sources)
+                    ai = summarizer._chat_json(
+                        tag=f"agent[{query[:20]}]",
+                        user_prompt=(
+                            f"用户询问: {query}\n\n"
+                            f"检索到以下相关 Wiki 页面：\n{lines}\n\n"
+                            f"用中文给出 200 字以内的帮助回答，引用具体页名，"
+                            f"不要编造不存在的内容。返回 JSON: "
+                            '{"one_liner": "一句话答复", "detail": "展开"}'
+                        ),
+                        timeout=60,
+                        retries=1,
+                    )
+                    if ai:
+                        reply["reply_text"] = ai.get("detail") or ai.get("one_liner") or ""
+                    else:
+                        reply["reply_text"] = f"找到 {len(sources)} 个相关页面（AI 摘要失败，直接看下方链接）。"
+                else:
+                    reply["reply_text"] = f"找到 {len(sources)} 个相关页面（未配置豆包，仅列标题）。"
+                reply["status"] = "success"
+
+        # 追加到 history
+        session["history"].append({"role": "user", "content": query, "ts": int(time.time())})
+        session["history"].append({
+            "role": "agent",
+            "content": reply["reply_text"],
+            "intent": intent,
+            "ts": int(time.time()),
+        })
+        # 限制 history 长度
+        if len(session["history"]) > 40:
+            session["history"] = session["history"][-40:]
+        wiki_agent.save_session(session)
+
+        # 附带最近 history 给 UI 展示
+        reply["history"] = session["history"][-10:]
+
+    except Exception as e:
+        logger.exception("agent-chat 异常")
+        reply["message"] = f"异常: {e}"
+
+    if json_output:
+        print(json.dumps(reply, ensure_ascii=False))
+    else:
+        print(f"\n[Agent · intent={reply.get('intent')}]")
+        print(reply.get("reply_text") or reply.get("message") or "")
+
+
+def _extract_prefix_from_query(query: str) -> str:
+    """从用户 query 中抽取前缀：支持 []、""、「」、''。找不到则返回空串。"""
+    import re as _re
+    for pattern in [r"\[([^\]]+)\]", r"「([^」]+)」", r"\"([^\"]+)\"", r"'([^']+)'"]:
+        m = _re.search(pattern, query)
+        if m:
+            return m.group(1).strip()
+    # 回退：去掉常见动词/助词后取剩余前面一段
+    cleaned = _re.sub(r"(按前缀|前缀|删除|删|清理|批量|所有|开头的|节点|wiki|Wiki|把|请|帮我|为我|所有以|以)", "", query)
+    cleaned = cleaned.strip()
+    return cleaned if 1 <= len(cleaned) <= 40 else ""
+
+
+def _search_wiki_titles(client, wiki_space_id: str, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """轻量递归搜索 Wiki 标题（ListSpaceNode，不走 v1 search）。"""
+    from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+    q = query.lower()
+    hits: List[Dict[str, Any]] = []
+
+    def _scan(parent: Optional[str], depth: int):
+        if len(hits) >= limit * 3 or depth > 4:
+            return
+        page_token = None
+        for _ in range(5):
+            b = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50)
+            if parent:
+                b.parent_node_token(parent)
+            if page_token:
+                b.page_token(page_token)
+            r = client.wiki.v2.space_node.list(b.build())
+            if not r.success():
+                return
+            for it in (getattr(r.data, "items", None) or []):
+                t = getattr(it, "title", "") or ""
+                if q in t.lower():
+                    hits.append({
+                        "title": t,
+                        "node_token": it.node_token,
+                        "url": f"https://open.feishu.cn/wiki/{it.node_token}",
+                    })
+                    if len(hits) >= limit * 3:
+                        return
+                if getattr(it, "has_child", False) and depth < 4:
+                    _scan(it.node_token, depth + 1)
+                    if len(hits) >= limit * 3:
+                        return
+            if not getattr(r.data, "has_more", False):
+                break
+            page_token = getattr(r.data, "page_token", None)
+            if not page_token:
+                break
+
+    _scan(None, 0)
+
+    def _score(title: str) -> int:
+        t = title.lower()
+        if t == q: return 100
+        if t.startswith(q): return 50
+        return 10
+    hits.sort(key=lambda h: _score(h["title"]), reverse=True)
+    return hits[:limit]
 
 
 def cmd_schedule(args):
@@ -1062,10 +1540,25 @@ def main():
     p_chat.add_argument("--json", action="store_true", help="输出 JSON 供 UI 调用")
 
     # cleanup-wiki 子命令：批量删除 Wiki 节点
-    p_cleanup = subparsers.add_parser("cleanup-wiki", help="按前缀批量删 Wiki 节点（默认 dry-run）")
+    p_cleanup = subparsers.add_parser("cleanup-wiki", help="按前缀或 token 批量删 Wiki 节点（默认 dry-run）")
     p_cleanup.add_argument("--prefix", required=False, default="", help="要匹配的节点标题前缀")
+    p_cleanup.add_argument("--node-tokens", dest="node_tokens", required=False, default="",
+                           help="逗号分隔的 node_token 列表（优先于 --prefix）")
     p_cleanup.add_argument("--confirm", action="store_true", help="真删（不加则仅预览）")
     p_cleanup.add_argument("--json", action="store_true", help="输出 JSON 供 UI 调用")
+
+    # scan-empty-wiki 子命令：找空节点
+    p_scan = subparsers.add_parser("scan-empty-wiki", help="扫 Wiki 树找出正文为空的节点")
+    p_scan.add_argument("--threshold", type=int, default=8, help="正文字数阈值（≤ 视为空）")
+    p_scan.add_argument("--max", type=int, default=500, help="最多扫多少个节点")
+    p_scan.add_argument("--json", action="store_true", help="输出 JSON 供 UI 调用")
+
+    # agent-chat 子命令：Wiki 管家对话 Agent
+    p_agent = subparsers.add_parser("agent-chat", help="对话 Agent · Wiki 管家")
+    p_agent.add_argument("--query", default="", help="用户问题 / 指令")
+    p_agent.add_argument("--session", default="", help="会话 id（不传则新建）")
+    p_agent.add_argument("--reset", action="store_true", help="重置会话")
+    p_agent.add_argument("--json", action="store_true", help="输出 JSON 供 UI 调用")
 
     # schedule 子命令（守护进程）
     subparsers.add_parser("schedule", help="启动定时任务调度器")
@@ -1089,6 +1582,10 @@ def main():
         cmd_chat(args)
     elif args.command == "cleanup-wiki":
         cmd_cleanup_wiki(args)
+    elif args.command == "scan-empty-wiki":
+        cmd_scan_empty_wiki(args)
+    elif args.command == "agent-chat":
+        cmd_agent_chat(args)
     else:
         parser.print_help()
 

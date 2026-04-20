@@ -49,7 +49,7 @@
 
 # 当前进度
 
-**最后更新**：2026-04-19 晚
+**最后更新**：2026-04-20
 
 ## ✅ 已完成
 
@@ -82,8 +82,21 @@
 
 ### Wiki 清理（新）
 - `python main.py cleanup-wiki --prefix X [--confirm] [--json]`
+- 也支持 `--node-tokens tok1,tok2` 精准删（2026-04-20 新增，给 Agent 用）
 - lark-oapi 没包 DeleteSpaceNode，用 raw REST `DELETE /wiki/v2/spaces/:sid/nodes/:tk`
+- **1061004 forbidden 兜底**（2026-04-20）：wiki DELETE 失败时自动切到
+  `DELETE /drive/v1/files/:obj_token?type=docx` 删底层 docx（wiki 节点随之消失）
 - 三重防误删：prefix 必填 · 默认 dry-run · UI confirm() 二次弹窗
+
+### Wiki 管家 Agent（2026-04-20 新增）
+- `python main.py agent-chat --query "..." [--session sess-xxx] [--reset] --json`
+- `python main.py scan-empty-wiki [--threshold 8] [--max 500] --json`
+- 模块 `src/agent/wiki_agent.py`：意图路由（search / scan_empty / delete_empty /
+  cleanup_prefix / suggest / confirm / cancel）+ 全树扫描 + 空节点检测（读 docx
+  raw_content 按字数判定）+ 安全删除（带 drive 兜底）+ 会话持久化
+  （logs/agent_sessions/{id}.json）
+- UI 弹层重写为"对话 Agent · Wiki 管家"：多轮对话 + 预览卡片 + 底部确认栏，
+  删前确认→回复"确认执行"才真删，回复"取消"即放弃
 
 ### 诊断脚本四件套
 - `scripts/diag_feishu.py` — Wiki 权限分 4 步测
@@ -136,6 +149,10 @@
 | 2026-04-19 | Wiki 清理用 raw REST 而非 SDK | lark-oapi 1.5.3 未包 `DeleteSpaceNode`；飞书 REST 的 `DELETE /wiki/v2/spaces/:sid/nodes/:tk` 存在且工作 |
 | 2026-04-19 | Wiki 清理的三重防误删（prefix 必填 / dry-run 默认 / UI confirm 弹窗）| 删 Wiki 节点不可恢复；单一保障不够 |
 | 2026-04-19 | 对话助手 MVP 先做"搜+总结"单轮，不做对话历史 | 多轮需要状态持久化，目前 JSON 单次调用够用 |
+| 2026-04-20 | 对话助手升级为"Wiki 管家 Agent"（意图路由 + 多轮 + 确认执行） | 实战用户需要连续做"扫空 → 确认 → 删除"，单轮不够用；会话存文件够用 |
+| 2026-04-20 | 空节点判定=读 docx raw_content 按字数阈值（≤8 视为空） | `/docx/v1/documents/:id/raw_content` 稳定，能直接拿纯文本；块遍历 API 复杂度高 |
+| 2026-04-20 | Wiki 节点删除失败（1061004）兜底到 drive DELETE | 应用不是 Wiki 空间管理员时 wiki DELETE 永远 forbidden；drive 权限覆盖更广，删底层 docx 会连带消掉 wiki 节点 |
+| 2026-04-20 | Agent 意图路由用关键词规则而非 LLM | 中文意图词集合小（删空/找空/前缀/建议/确认/取消），规则既快又不花 token |
 
 ---
 
@@ -159,6 +176,8 @@
 16. **Veee VPN 的诡异端口**：用户的 VPN 客户端（Veee）监听在 `15235` / `15236`，不在常见代理端口列表里。`scripts/diag_proxy.py` 扫 14 个常见端口全空时，让用户跑 `Get-NetTCPConnection -State Listen` 按进程名定位（找到 `Veee` 进程名）。
 17. **Reddit 节点 IP 被拉黑**：即使 UA 对了，部分 VPN 节点的出口 IP 在 Reddit 黑名单，返回 403 + HTML。换 Veee 里的节点（美国/日本/新加坡）即可。
 18. **`open-chat` IPC 要异步返回 JSON**：UI 里对话助手的 modal 期待 `result.chat = {answer, sources, status, message}`，`ui/main.js::actionDispatch['open-chat']` 用 `extractJsonFromStdout` 从 Python 的 `--json` 输出尾部拎 JSON 对象。Python 日志（开头的 INFO 行）不影响解析。
+19. **`1061004 forbidden` 删 Wiki 节点**：飞书 `DELETE /wiki/v2/spaces/:sid/nodes/:tk` 要求应用是 Wiki 空间管理员，个人知识库默认不授权企业自建应用。修复：先试 wiki DELETE，失败就 fallback 到 `DELETE /drive/v1/files/:obj_token?type=docx` 删底层 docx。若两路都 forbidden，建议用户去飞书 Wiki → 成员管理把应用加成管理员。
+20. **Agent 会话状态必须持久化**：CLI 无常驻进程，每次调用都是新 Python 进程。用 `logs/agent_sessions/{session_id}.json` 存 `{id, history, pending_action}`，前端 localStorage 保 session_id 跨窗口可继。
 
 ---
 
@@ -179,6 +198,7 @@
 
 | 文件 | 作用 |
 |------|------|
+| `src/agent/wiki_agent.py` | Wiki 管家 Agent 核心：意图路由 · 全树扫描 · 空节点检测 · 带 drive 兜底的安全删除 · 会话持久化 |
 | `src/utils/feishu_client.py` | lark-oapi Client 工厂（双账号：personal / enterprise） |
 | `src/utils/config_loader.py` | `credentials.json` / `categories.json` 读取 |
 | `src/scheduler.py` | `FeishuScheduler`：APScheduler 封装，cron 调度 3 个任务 |
