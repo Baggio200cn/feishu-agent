@@ -1445,22 +1445,87 @@ def cmd_agent_chat(args):
         # ---- 整理建议 ----
         elif intent == "suggest":
             nodes = wiki_agent.scan_wiki_tree(client, wiki_space_id)
-            scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+            # 缓存扫描结果，复用
+            cached_scan = session.get("last_scan") or {}
+            if cached_scan and (int(time.time()) - cached_scan.get("ts", 0) < 300):
+                scan = {"empty": cached_scan.get("empty", []),
+                        "read_ok": 0, "skipped": [], "body_threshold": 8}
+            else:
+                scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+                session["last_scan"] = {"empty": scan["empty"], "ts": int(time.time())}
+
+            # 先尝试豆包 LLM 版建议（基于真实树概览）
+            overview = wiki_agent.summarize_tree_for_llm(nodes)
+            ai_text = None
+            try:
+                from src.importers.ai_summarizer import AISummarizer
+                ai_cfg = config_loader.get_ai_config()
+                summarizer = AISummarizer(ai_cfg)
+                ai_text = wiki_agent.ai_suggestions(
+                    summarizer, overview, len(scan["empty"]), user_question=query
+                )
+            except Exception as e:
+                logger.warning(f"AI suggestions 调用失败: {e}")
+
+            # 规则版 fallback
             tips = wiki_agent.generate_suggestions(nodes, scan)
-            reply["reply_text"] = "Wiki 结构分析：\n" + "\n".join(f"• {t}" for t in tips)
+
+            if ai_text:
+                reply["reply_text"] = f"Wiki 结构分析（AI）：\n{ai_text}"
+            else:
+                reply["reply_text"] = "Wiki 结构分析：\n" + "\n".join(f"• {t}" for t in tips)
+
+            # 预览卡片：展示顶层目录概览
+            items = []
+            for f in overview["top_folders"][:15]:
+                samples = "、".join(f["sample_titles"][:3]) if f["sample_titles"] else ""
+                detail = f"{f['node_count']} 个子节点" + (f" · 样例: {samples}" if samples else "")
+                items.append({"title": f["title"], "ok": True, "detail": detail[:80]})
+            # 追加规则结论
+            for t in tips[:5]:
+                items.append({"title": "💡 " + t, "ok": True, "detail": ""})
             reply["preview"] = {
                 "title": "整理建议",
-                "items": [{"title": t, "ok": True, "detail": ""} for t in tips],
-                "summary": f"共 {len(nodes)} 个节点，空 {len(scan['empty'])} 个",
+                "items": items,
+                "summary": f"共 {overview['total_nodes']} 节点 · 顶层 {overview['top_level_count']} · 空 {len(scan['empty'])}",
             }
             reply["status"] = "success"
 
         # ---- 搜 Wiki（默认） ----
         else:
             sources = _search_wiki_titles(client, wiki_space_id, query, limit=5)
-            reply["sources"] = sources
+            # 如果是长句 + 整句 substring 匹配找不到，尝试把长句切成关键词再搜
+            if not sources and len(query) > 6:
+                import re as _re
+                # 去掉常见停用词，抽 2-6 字的名词短语
+                stop = set("你我他的了是在有没和与或吗呢啊请帮给让把对就也都还这那么什么怎么能可以应该如何".split())
+                tokens = [t for t in _re.findall(r"[\u4e00-\u9fa5]{2,6}|[A-Za-z]{2,20}", query)
+                          if t not in stop and len(t) >= 2]
+                seen = set()
+                merged: List[Dict[str, Any]] = []
+                for tok in tokens[:5]:
+                    hits = _search_wiki_titles(client, wiki_space_id, tok, limit=3)
+                    for h in hits:
+                        if h["node_token"] in seen:
+                            continue
+                        seen.add(h["node_token"])
+                        merged.append(h)
+                sources = merged[:5]
+                reply["sources"] = sources
+
             if not sources:
-                reply["reply_text"] = f"Wiki 里没找到与「{query}」相关的页面。"
+                # 长句且无命中 → 主动引导走 suggest
+                if len(query) > 12:
+                    reply["reply_text"] = (
+                        f"没找到直接相关的 Wiki 页面。你这个问题更像是在让我分析知识库结构，"
+                        f"我重新路由到「整理建议」了——再发一句"
+                        f"「给点整理建议」或「你觉得我的 Wiki 怎么整理」，我就扫全树给你分析。"
+                    )
+                else:
+                    reply["reply_text"] = (
+                        f"Wiki 里没找到与「{query}」相关的页面。"
+                        f"换个说法试试，或说「给点整理建议」让我扫全树分析。"
+                    )
                 reply["status"] = "success"
             else:
                 from src.importers.ai_summarizer import AISummarizer

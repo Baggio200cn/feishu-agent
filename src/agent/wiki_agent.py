@@ -143,8 +143,16 @@ def classify_intent(query: str, session: Dict[str, Any]) -> str:
     if ("批量删" in q or "全删" in q or "都删" in q) and "空" not in q:
         return "cleanup_prefix"
 
-    # 建议
-    if any(k in q for k in ["建议", "整理建议", "怎么整理", "怎么优化", "结构", "诊断"]):
+    # 建议类（扩大触发面：很多"你觉得/重新整理/分类"的自然语言问题都路由到这里）
+    suggest_kw = [
+        "建议", "整理建议", "整理思路", "整理工作", "重新整理", "重新组织",
+        "怎么整理", "怎么分类", "怎么组织", "怎么优化",
+        "如何整理", "如何分类", "如何组织", "如何优化",
+        "结构", "分类", "目录", "重组", "优化", "诊断",
+        "你觉得", "你认为", "帮我看看", "帮我想想", "给建议", "提建议",
+        "提出整理", "提出思路", "提出方案",
+    ]
+    if any(k in q for k in suggest_kw):
         return "suggest"
 
     # 默认：搜 Wiki
@@ -425,9 +433,49 @@ def build_wiki_urls(targets: List[Dict[str, Any]]) -> List[Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# 整理建议（非 AI，按规则 + 统计）
+# 整理建议
 # ---------------------------------------------------------------------------
+def summarize_tree_for_llm(nodes: List[Dict[str, Any]], max_top: int = 20) -> Dict[str, Any]:
+    """把 Wiki 树压缩成 LLM 能消化的结构摘要：顶层目录 + 每个目录下的节点计数 + 样本标题。"""
+    top_nodes = [n for n in nodes if n["depth"] == 0]
+    # 把非顶层节点按"顶层祖先"分组
+    tok_to_parent: Dict[str, str] = {}
+    for n in nodes:
+        tok_to_parent[n["node_token"]] = n.get("parent_node_token", "")
+
+    def _root_of(tok: str) -> str:
+        cur = tok
+        for _ in range(10):
+            p = tok_to_parent.get(cur, "")
+            if not p:
+                return cur
+            cur = p
+        return cur
+
+    by_root: Dict[str, List[Dict[str, Any]]] = {}
+    for n in nodes:
+        root = _root_of(n["node_token"])
+        by_root.setdefault(root, []).append(n)
+
+    top_summary = []
+    for t in top_nodes[:max_top]:
+        children = by_root.get(t["node_token"], [])
+        titles = [c.get("title", "") for c in children if c.get("title")][:6]
+        top_summary.append({
+            "title": t.get("title", ""),
+            "node_count": len(children),
+            "sample_titles": titles,
+        })
+
+    return {
+        "total_nodes": len(nodes),
+        "top_level_count": len(top_nodes),
+        "top_folders": top_summary,
+    }
+
+
 def generate_suggestions(nodes: List[Dict[str, Any]], empty_result: Dict[str, Any]) -> List[str]:
+    """基于规则的结构性建议（LLM 不可用时的 fallback）。"""
     tips: List[str] = []
     total = len(nodes)
     if total == 0:
@@ -437,23 +485,19 @@ def generate_suggestions(nodes: List[Dict[str, Any]], empty_result: Dict[str, An
     for n in nodes:
         by_depth[n["depth"]] = by_depth.get(n["depth"], 0) + 1
 
-    # 顶层节点数
     top = by_depth.get(0, 0)
     if top > 15:
         tips.append(f"顶层节点有 {top} 个，建议合并到 5-8 个主题文件夹下，降低认知负担。")
 
-    # 空节点占比
     empties = len(empty_result.get("empty", []))
     read_ok = empty_result.get("read_ok", 0) or 1
     if empties >= 5 or empties / read_ok > 0.1:
-        tips.append(f"发现 {empties} 个空节点（正文 ≤ {empty_result.get('body_threshold')} 字），建议整批清理。")
+        tips.append(f"发现 {empties} 个空节点（正文 ≤ {empty_result.get('body_threshold')} 字），建议批量标记 🗑 或清理。")
 
-    # 深度告警
     max_depth = max(by_depth.keys()) if by_depth else 0
     if max_depth >= 5:
-        tips.append(f"最大层级达 {max_depth}，太深的嵌套不易检索，建议压平到 3 层以内。")
+        tips.append(f"最大层级达 {max_depth}，嵌套过深不易检索，建议压平到 3 层以内。")
 
-    # 重复标题
     title_map: Dict[str, int] = {}
     for n in nodes:
         t = (n.get("title") or "").strip()
@@ -467,3 +511,40 @@ def generate_suggestions(nodes: List[Dict[str, Any]], empty_result: Dict[str, An
     if not tips:
         tips.append("结构看起来不错 👍 暂无明显清理点。")
     return tips
+
+
+def ai_suggestions(
+    summarizer,
+    tree_overview: Dict[str, Any],
+    empty_count: int,
+    user_question: str = "",
+    timeout: int = 60,
+) -> Optional[str]:
+    """把树摘要喂豆包，返回一段中文整理建议。summarizer 必须已 configured。"""
+    if not summarizer or not summarizer.configured():
+        return None
+    try:
+        overview_json = json.dumps(tree_overview, ensure_ascii=False)[:4000]
+        user_prompt = (
+            f"我是一个飞书 Wiki 管家 Agent。用户想让我分析他的个人 Wiki 结构并给整理建议。\n\n"
+            f"用户原话: {user_question or '请对我的 Wiki 做一次整理分析'}\n\n"
+            f"Wiki 结构概览 (JSON):\n{overview_json}\n\n"
+            f"全 Wiki 里还有 {empty_count} 个正文为空的节点。\n\n"
+            f"请用中文给 4-7 条具体可执行的整理建议，每条 1-2 句。"
+            f"重点覆盖: 顶层目录命名是否清晰、是否该合并或拆分、"
+            f"是否有明显重复/归类错误、空节点怎么处理、深层嵌套是否需要压平。"
+            f"每条建议必须引用具体的目录名（从 top_folders 里挑），不要泛泛而谈。\n\n"
+            f"返回严格 JSON: "
+            '{"one_liner": "一句话总结", "detail": "用 • 开头的分条建议，换行分隔"}'
+        )
+        out = summarizer._chat_json(
+            tag="wiki-suggest",
+            user_prompt=user_prompt,
+            timeout=timeout,
+            retries=1,
+        )
+        if out:
+            return out.get("detail") or out.get("one_liner") or None
+    except Exception as e:
+        logger.warning(f"ai_suggestions 失败: {e}")
+    return None
