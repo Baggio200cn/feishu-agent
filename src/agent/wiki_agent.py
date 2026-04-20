@@ -85,7 +85,13 @@ def classify_intent(query: str, session: Dict[str, Any]) -> str:
         if any(k in q for k in ["取消", "不删", "不要", "算了", "no", "停", "放弃"]):
             return "cancel"
 
-    # 删空类（优先级最高：先匹配动作 + 对象）
+    # 打标记（改名加 🗑[空] 前缀 —— 比真删权限要求低）
+    if any(k in q for k in ["标记", "改名", "打标", "贴标", "加前缀"]) and "空" in q:
+        return "mark_empty"
+    if "改名" in q and ("空" in q or "empty" in q):
+        return "mark_empty"
+
+    # 删空类（优先级次高：先匹配动作 + 对象）
     if ("删" in q or "清" in q) and ("空" in q or "empty" in q):
         return "delete_empty"
 
@@ -190,7 +196,8 @@ def detect_empty_nodes(
 ) -> Dict[str, Any]:
     """
     扫全部节点 → 对每个 docx 读正文 → 判断是否空。
-    其他类型（doc / sheet / file）跳过。
+    ⚠️ 跳过 has_child=True 的节点（目录型父页通常本身正文也空但子下还有内容，不能删）。
+    其他类型（doc / sheet / file）也跳过。
     """
     nodes = scan_wiki_tree(client, wiki_space_id, max_nodes=max_nodes)
     scanned = len(nodes)
@@ -201,6 +208,10 @@ def detect_empty_nodes(
     for n in nodes:
         obj_type = (n.get("obj_type") or "").lower()
         obj_token = n.get("obj_token") or ""
+        # 有子节点 = 目录型，即便正文空也不视为"可删空节点"
+        if n.get("has_child"):
+            skipped.append({**n, "reason": "目录型（有子节点），不视为空"})
+            continue
         if obj_type != "docx" or not obj_token:
             skipped.append({**n, "reason": f"不支持的类型 {obj_type or '未知'}"})
             continue
@@ -242,107 +253,127 @@ def get_tenant_token(app_id: str, app_secret: str, timeout: int = 10) -> Optiona
 
 
 # ---------------------------------------------------------------------------
-# 删除 —— wiki DELETE 主路径 + drive DELETE 兜底
+# 删除 —— 只走 drive（wiki v2 API 没有 delete-node 方法）
 # ---------------------------------------------------------------------------
-def delete_node_with_fallback(
+# 历史背景：我曾以为 `DELETE /wiki/v2/spaces/:sid/nodes/:tk` 是有效端点，
+# 实测返回 404 page not found。查 lark-oapi 1.5.4 SDK 源码确认 Wiki v2 根本没封
+# 装任何 Delete 类 Request（只有 Create / Get / List / Copy / Move / UpdateTitle）。
+# 唯一能用的是 drive DELETE，删掉底层 docx，Wiki 节点随之消失。
+# 但 drive DELETE 要求应用对该 docx 有管理权限；个人 Wiki 下由用户创建的 docx
+# owner 是用户本人，应用 tenant_access_token 通常返 1061004 forbidden。
+# 所以：删不了不是 bug，是飞书 API 限制。
+def delete_node_via_drive(
     tenant_token: str,
-    wiki_space_id: str,
     node_token: str,
-    obj_token: str = "",
-    obj_type: str = "",
+    obj_token: str,
+    obj_type: str = "docx",
     timeout: int = 15,
-) -> Tuple[bool, str, str]:
+) -> Tuple[bool, str]:
     """
-    返回 (成功?, 实际走的路径, 错误信息).
-
-    路径 1: DELETE /wiki/v2/spaces/:sid/nodes/:tk
-      → 需要应用是 wiki 空间 admin，通常返回 1061004 forbidden
-    路径 2 (兜底): DELETE /drive/v1/files/:obj_token?type=:obj_type
-      → 删底层 docx / doc，Wiki 节点随之消失；只要应用有 drive 读写权限即可
+    返回 (成功?, 错误信息).
+    端点: DELETE /open-apis/drive/v1/files/:file_token?type=:obj_type
     """
-    headers = {"Authorization": f"Bearer {tenant_token}"}
-
-    # 路径 1: wiki node delete
-    url1 = (
-        f"https://open.feishu.cn/open-apis/wiki/v2/spaces/"
-        f"{wiki_space_id}/nodes/{node_token}"
-    )
-    err1 = ""
-    try:
-        r1 = requests.delete(url1, headers=headers, timeout=timeout)
-        if r1.status_code == 200:
-            try:
-                j1 = r1.json()
-            except Exception:
-                j1 = {}
-            if j1.get("code", -1) == 0:
-                return True, "wiki", ""
-            err1 = f"wiki code={j1.get('code')} msg={j1.get('msg')}"
-        else:
-            err1 = f"wiki HTTP {r1.status_code} {r1.text[:120]}"
-    except Exception as e:
-        err1 = f"wiki 异常 {e}"
-
-    logger.info(f"wiki delete 失败，尝试 drive 兜底: {err1}")
-
-    # 路径 2: drive file delete（docx / doc / sheet）
     if not obj_token:
-        return False, "none", f"{err1}；且无 obj_token 无法兜底"
+        return False, "无 obj_token"
+    obj_type_clean = (obj_type or "docx").lower()
+    if obj_type_clean not in ("docx", "doc", "sheet", "bitable", "mindnote", "file", "slides"):
+        obj_type_clean = "docx"
 
-    obj_type_drive = (obj_type or "docx").lower()
-    if obj_type_drive not in ("docx", "doc", "sheet", "bitable", "mindnote", "file"):
-        obj_type_drive = "docx"
-
-    url2 = f"https://open.feishu.cn/open-apis/drive/v1/files/{obj_token}"
-    err2 = ""
+    url = f"https://open.feishu.cn/open-apis/drive/v1/files/{obj_token}"
+    headers = {"Authorization": f"Bearer {tenant_token}"}
     try:
-        r2 = requests.delete(
-            url2,
-            headers=headers,
-            params={"type": obj_type_drive},
-            timeout=timeout,
-        )
-        if r2.status_code == 200:
+        r = requests.delete(url, headers=headers, params={"type": obj_type_clean}, timeout=timeout)
+        if r.status_code == 200:
             try:
-                j2 = r2.json()
+                j = r.json()
             except Exception:
-                j2 = {}
-            if j2.get("code", -1) == 0:
-                return True, "drive", ""
-            err2 = f"drive code={j2.get('code')} msg={j2.get('msg')}"
-        else:
-            err2 = f"drive HTTP {r2.status_code} {r2.text[:120]}"
+                j = {}
+            if j.get("code", -1) == 0:
+                return True, ""
+            return False, f"code={j.get('code')} msg={j.get('msg')}"
+        return False, f"HTTP {r.status_code} {r.text[:160]}"
     except Exception as e:
-        err2 = f"drive 异常 {e}"
-
-    return False, "none", f"{err1}；兜底失败 {err2}"
+        return False, f"异常 {e}"
 
 
 def batch_delete_nodes(
     tenant_token: str,
     wiki_space_id: str,
     targets: List[Dict[str, str]],
-    sleep_between: float = 0.2,
+    sleep_between: float = 0.15,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """targets: [{title, node_token, obj_token, obj_type}, ...]"""
     deleted: List[Dict[str, Any]] = []
     failed: List[Dict[str, Any]] = []
     for t in targets:
-        ok, path, err = delete_node_with_fallback(
+        ok, err = delete_node_via_drive(
             tenant_token=tenant_token,
-            wiki_space_id=wiki_space_id,
             node_token=t.get("node_token", ""),
             obj_token=t.get("obj_token", ""),
             obj_type=t.get("obj_type", ""),
         )
         if ok:
-            deleted.append({**t, "path": path})
-            logger.info(f"✅ 已删除 [{path}]: {t.get('title')}")
+            deleted.append({**t, "path": "drive"})
+            logger.info(f"✅ 已删除: {t.get('title')}")
         else:
             failed.append({**t, "error": err})
             logger.warning(f"❌ 删除失败: {t.get('title')} — {err}")
         time.sleep(sleep_between)
     return {"deleted": deleted, "failed": failed}
+
+
+# ---------------------------------------------------------------------------
+# 替代路径：改名打标记（用 SDK 的 UpdateTitleSpaceNode）
+# ---------------------------------------------------------------------------
+# drive DELETE 失败时的替代：把空节点标题加 🗑[空] 前缀，用户在 Wiki UI 里
+# 一眼可识别、肉眼批量选删。UpdateTitle 的权限宽松得多（应用作为节点成员就行）。
+def mark_node_titles(
+    client,
+    wiki_space_id: str,
+    targets: List[Dict[str, Any]],
+    prefix: str = "🗑[空] ",
+    sleep_between: float = 0.15,
+) -> Dict[str, List[Dict[str, Any]]]:
+    from lark_oapi.api.wiki.v2 import (
+        UpdateTitleSpaceNodeRequest,
+        UpdateTitleSpaceNodeRequestBody,
+    )
+    marked: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    for t in targets:
+        title = t.get("title") or ""
+        if title.startswith(prefix):
+            marked.append({**t, "new_title": title})
+            continue
+        new_title = (prefix + title)[:80]
+        try:
+            body = UpdateTitleSpaceNodeRequestBody.builder().title(new_title).build()
+            req = (UpdateTitleSpaceNodeRequest.builder()
+                   .space_id(wiki_space_id)
+                   .node_token(t["node_token"])
+                   .request_body(body)
+                   .build())
+            resp = client.wiki.v2.space_node.update_title(req)
+            if resp.success():
+                marked.append({**t, "new_title": new_title})
+                logger.info(f"🏷  已标记: {title} → {new_title}")
+            else:
+                failed.append({**t, "error": f"code={resp.code} msg={resp.msg}"})
+                logger.warning(f"标记失败: {title} — {resp.code} {resp.msg}")
+        except Exception as e:
+            failed.append({**t, "error": f"异常 {e}"})
+            logger.exception(f"标记异常: {title}")
+        time.sleep(sleep_between)
+    return {"marked": marked, "failed": failed}
+
+
+def build_wiki_urls(targets: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """给前端展示用：把 targets 转为 [{title, url}]，点 URL 可在 Wiki UI 里打开节点手动处理。"""
+    return [
+        {"title": t.get("title", ""),
+         "url": f"https://open.feishu.cn/wiki/{t['node_token']}"}
+        for t in targets if t.get("node_token")
+    ]
 
 
 # ---------------------------------------------------------------------------

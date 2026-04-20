@@ -151,8 +151,10 @@
 | 2026-04-19 | 对话助手 MVP 先做"搜+总结"单轮，不做对话历史 | 多轮需要状态持久化，目前 JSON 单次调用够用 |
 | 2026-04-20 | 对话助手升级为"Wiki 管家 Agent"（意图路由 + 多轮 + 确认执行） | 实战用户需要连续做"扫空 → 确认 → 删除"，单轮不够用；会话存文件够用 |
 | 2026-04-20 | 空节点判定=读 docx raw_content 按字数阈值（≤8 视为空） | `/docx/v1/documents/:id/raw_content` 稳定，能直接拿纯文本；块遍历 API 复杂度高 |
-| 2026-04-20 | Wiki 节点删除失败（1061004）兜底到 drive DELETE | 应用不是 Wiki 空间管理员时 wiki DELETE 永远 forbidden；drive 权限覆盖更广，删底层 docx 会连带消掉 wiki 节点 |
+| 2026-04-20 | ~~Wiki 节点删除失败（1061004）兜底到 drive DELETE~~ | **已废**。后续实测 wiki DELETE 本身就是 404（飞书根本没这个端点，我编的），drive DELETE 对个人 Wiki 的用户拥有的 docx 永远 forbidden。这是 API 硬限制。|
 | 2026-04-20 | Agent 意图路由用关键词规则而非 LLM | 中文意图词集合小（删空/找空/前缀/建议/确认/取消），规则既快又不花 token |
+| 2026-04-20 | 空节点删不了时改走"改名加 🗑[空] 前缀"作为替代方案 | 飞书 API 不给删用户个人 Wiki 空节点，但 UpdateTitleSpaceNode 权限宽得多。改名后用户在 Wiki UI 搜 🗑 可以一眼圈出批量选删。务实解。|
+| 2026-04-20 | 空节点检测跳过 `has_child=True` 的节点 | 目录型父页本身正文也是空但子下还有内容，误删会丢一堆文档 |
 
 ---
 
@@ -176,8 +178,9 @@
 16. **Veee VPN 的诡异端口**：用户的 VPN 客户端（Veee）监听在 `15235` / `15236`，不在常见代理端口列表里。`scripts/diag_proxy.py` 扫 14 个常见端口全空时，让用户跑 `Get-NetTCPConnection -State Listen` 按进程名定位（找到 `Veee` 进程名）。
 17. **Reddit 节点 IP 被拉黑**：即使 UA 对了，部分 VPN 节点的出口 IP 在 Reddit 黑名单，返回 403 + HTML。换 Veee 里的节点（美国/日本/新加坡）即可。
 18. **`open-chat` IPC 要异步返回 JSON**：UI 里对话助手的 modal 期待 `result.chat = {answer, sources, status, message}`，`ui/main.js::actionDispatch['open-chat']` 用 `extractJsonFromStdout` 从 Python 的 `--json` 输出尾部拎 JSON 对象。Python 日志（开头的 INFO 行）不影响解析。
-19. **`1061004 forbidden` 删 Wiki 节点**：飞书 `DELETE /wiki/v2/spaces/:sid/nodes/:tk` 要求应用是 Wiki 空间管理员，个人知识库默认不授权企业自建应用。修复：先试 wiki DELETE，失败就 fallback 到 `DELETE /drive/v1/files/:obj_token?type=docx` 删底层 docx。若两路都 forbidden，建议用户去飞书 Wiki → 成员管理把应用加成管理员。
+19. ~~`1061004 forbidden` 删 Wiki 节点~~：**原假设错误**。实际情况：飞书 Wiki v2 API **根本没有 delete-node 方法**（lark-oapi 1.5.4 只有 Create/Get/List/Copy/Move/UpdateTitle，无任何 Delete 类 Request）。我当初以为的 `DELETE /wiki/v2/spaces/:sid/nodes/:tk` 端点纯属编造，实测返回 `HTTP 404 page not found`。唯一能删的路径是 `DELETE /drive/v1/files/:obj_token?type=docx` 删底层 docx，但这要求应用对该 docx 有管理权限；个人 Wiki 下由用户本人创建的 docx，tenant_access_token 返 `1061004 forbidden` 是必然。**结论：加权限也绕不过，这是飞书 API 硬限制。**替代方案：用 `UpdateTitleSpaceNode` 给空节点标题加 🗑[空] 前缀，让用户在 Wiki UI 里肉眼批量选删（2026-04-20 下午落地）。
 20. **Agent 会话状态必须持久化**：CLI 无常驻进程，每次调用都是新 Python 进程。用 `logs/agent_sessions/{session_id}.json` 存 `{id, history, pending_action}`，前端 localStorage 保 session_id 跨窗口可继。
+21. **空节点误判——把目录型父页算空节点**：`detect_empty_nodes` 最初只看 docx 正文字数，结果像"学习笔记""工作记录"这种纯目录页（本身无正文但有子节点）全被误判为空。66 个"空节点"里大半是父目录。修复：`has_child=True` 的节点一律跳过。
 
 ---
 

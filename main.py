@@ -1187,18 +1187,54 @@ def cmd_agent_chat(args):
                     br = wiki_agent.batch_delete_nodes(tenant_token, wiki_space_id, targets)
                     ok = len(br["deleted"])
                     bad = len(br["failed"])
+                    if bad == 0:
+                        reply["reply_text"] = f"本次删除完成：成功 {ok} 个。"
+                    else:
+                        # 全部/大部分失败时，给出真相 + 替代方案
+                        reply["reply_text"] = (
+                            f"删除成功 {ok} 个，失败 {bad} 个。\n\n"
+                            f"📌 原因：飞书 Wiki v2 API 没有删除节点方法，只能通过 drive 删底层 docx；"
+                            f"而个人 Wiki 下由您本人创建的 docx，应用 tenant_token 无删除权限 (1061004)。"
+                            f"这是飞书 API 硬限制，加权限也绕不过。\n\n"
+                            f"✅ 两条替代路径：\n"
+                            f"1) 说「标记空节点」让我把这些节点改名加 🗑[空] 前缀，"
+                            f"你在 Wiki UI 里肉眼排一片 🗑 批量选删；\n"
+                            f"2) 下方列出了全部直链，点进去手动删也行。"
+                        )
+                    # 失败节点附 wiki 直链
+                    failed_urls = wiki_agent.build_wiki_urls(br["failed"])
+                    reply["sources"] = failed_urls[:30]  # 超过 30 条就截断
+                    reply["preview"] = {
+                        "title": "处理结果",
+                        "items": [
+                            *[{"title": d["title"], "ok": True, "detail": "已通过 drive 删除"}
+                              for d in br["deleted"]],
+                            *[{"title": f["title"], "ok": False, "detail": (f.get("error", "")[:100])}
+                              for f in br["failed"]],
+                        ],
+                        "summary": f"成功 {ok} · 失败 {bad}",
+                    }
+                    reply["status"] = "success" if bad == 0 else "partial"
+            elif action_type == "mark_nodes":
+                targets = params.get("targets") or []
+                if not targets:
+                    reply["reply_text"] = "待标记节点为空。"
+                    reply["status"] = "success"
+                else:
+                    mr = wiki_agent.mark_node_titles(client, wiki_space_id, targets)
+                    ok = len(mr["marked"])
+                    bad = len(mr["failed"])
                     reply["reply_text"] = (
-                        f"本次删除完成：成功 {ok} 个，失败 {bad} 个。"
-                        + ("（失败一般是因为应用不是 Wiki 空间管理员且 drive 也无权限，"
-                           "到飞书 Wiki → 成员管理里把应用加成管理员即可。）" if bad else "")
+                        f"标记完成：{ok} 个节点已加 🗑[空] 前缀，{bad} 个失败。\n"
+                        f"现在到飞书 Wiki UI 里，搜 🗑 就能一眼圈出全部空节点，批量选中后手动删即可。"
                     )
                     reply["preview"] = {
-                        "title": "删除结果",
+                        "title": "标记结果",
                         "items": [
-                            *[{"title": d["title"], "ok": True, "detail": f"path={d.get('path','?')}"}
-                              for d in br["deleted"]],
-                            *[{"title": f["title"], "ok": False, "detail": f.get("error", "")}
-                              for f in br["failed"]],
+                            *[{"title": f"{m.get('new_title','')}", "ok": True,
+                               "detail": "已改名"} for m in mr["marked"]],
+                            *[{"title": f["title"], "ok": False,
+                               "detail": f.get("error", "")} for f in mr["failed"]],
                         ],
                         "summary": f"成功 {ok} · 失败 {bad}",
                     }
@@ -1274,9 +1310,11 @@ def cmd_agent_chat(args):
                     "confirm_hint": "回复「确认执行」真删，或「取消」放弃。",
                 }
                 reply["reply_text"] = (
-                    f"找到 {len(empties)} 个空节点。"
-                    f"⚠️ 确认后将**不可恢复**地删除这 {len(empties)} 个节点。"
-                    f"回复「确认执行」真删，或「取消」放弃。"
+                    f"找到 {len(empties)} 个空节点。\n"
+                    f"⚠️ 真删路径在个人 Wiki 下通常会因飞书 API 限制失败（drive 权限不够）。"
+                    f"如果删除大面积失败，换句话说「标记空节点」——我会把标题加 🗑[空] 前缀，"
+                    f"你在 Wiki UI 里肉眼批量删。\n\n"
+                    f"确认真删请回「确认执行」，想改走标记路径回「标记空节点」，不想动回「取消」。"
                 )
                 reply["preview"] = {
                     "title": f"即将删除 {len(empties)} 个空节点",
@@ -1286,6 +1324,42 @@ def cmd_agent_chat(args):
                         for n in empties
                     ],
                     "summary": f"共 {len(empties)} 个，删除后不可恢复",
+                }
+                reply["pending_action"] = session["pending_action"]
+                reply["status"] = "success"
+
+        # ---- 标记空节点（改名加 🗑[空] 前缀，作为真删的替代方案） ----
+        elif intent == "mark_empty":
+            scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+            empties = scan["empty"]
+            if not empties:
+                reply["reply_text"] = f"扫 {scan['scanned']} 个节点，没找到空节点，无需标记。"
+                reply["status"] = "success"
+            else:
+                targets = [
+                    {"title": n["title"], "node_token": n["node_token"],
+                     "obj_token": n.get("obj_token", ""), "obj_type": n.get("obj_type", "")}
+                    for n in empties
+                ]
+                session["pending_action"] = {
+                    "id": "act-" + time.strftime("%H%M%S"),
+                    "type": "mark_nodes",
+                    "params": {"targets": targets},
+                    "confirm_hint": "回复「确认执行」开始改名，或「取消」放弃。",
+                }
+                reply["reply_text"] = (
+                    f"找到 {len(empties)} 个空节点。"
+                    f"将给它们的标题加 🗑[空] 前缀（可恢复，不会删内容）。"
+                    f"这样你在 Wiki UI 里搜 🗑 就能一键圈出。回复「确认执行」或「取消」。"
+                )
+                reply["preview"] = {
+                    "title": f"即将标记 {len(empties)} 个空节点",
+                    "items": [
+                        {"title": n["title"], "ok": True,
+                         "detail": f"→ 🗑[空] {n['title']}"[:60]}
+                        for n in empties
+                    ],
+                    "summary": f"共 {len(empties)} 个（可恢复）",
                 }
                 reply["pending_action"] = session["pending_action"]
                 reply["status"] = "success"
