@@ -23,6 +23,25 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
+# ============================================================================
+# 代理豁免：飞书 / 豆包 的 API 域名在中国大陆直连即可，走 VPN/代理（如 Veee）
+# 反而会因 TLS 劫持报 SSLEOFError。这里把它们加进 NO_PROXY，requests 和
+# urllib3 会自动绕过 HTTP_PROXY / HTTPS_PROXY 对这些域名的代理。
+# 用户已有的 NO_PROXY 会保留合并。
+# ============================================================================
+# 注意：Reddit (www.reddit.com) 在中国大陆**需要**挂 VPN 才能通，这里不能加豁免
+_DIRECT_HOSTS = [
+    "open.feishu.cn",
+    "open.larkoffice.com",
+    "ark.cn-beijing.volces.com",        # 豆包（火山方舟）
+    "ark-cn-beijing.volces.com",
+]
+
+_existing_np = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+_merged_np = ",".join(filter(None, [_existing_np, *_DIRECT_HOSTS]))
+os.environ["NO_PROXY"] = _merged_np
+os.environ["no_proxy"] = _merged_np
+
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
