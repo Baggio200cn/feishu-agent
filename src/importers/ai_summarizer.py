@@ -54,15 +54,20 @@ DEFAULT_REDDIT_PROMPT_TEMPLATE = """请分析以下 Reddit 讨论帖，生成中
 {selftext}
 ---
 
-高赞评论（已按点赞数排序）:
+置顶 / 作者补充评论（可能为空；[置顶] 或 [OP] 标记，常为上下文、FAQ、或作者补说明）:
 ---
-{comments}
+{stickied_comments}
+---
+
+高赞评论（已按点赞数排序，可能含反对/质疑声音）:
+---
+{top_comments_text}
 ---
 
 返回格式（严格 JSON，两个字段都必填）:
 {{
   "one_liner": "15-30 字的一句话中文定位，概括帖子讨论的核心话题和独特价值",
-  "detail": "300-500 字的详细中文介绍，分成 4 个自然段，顺序为：\\n\\n第 1 段 话题背景：这个讨论的起因和上下文，为什么值得关注。\\n\\n第 2 段 核心观点：原帖作者提出的主要论点、发现、或分享的内容。技术术语首次出现加括号注释。\\n\\n第 3 段 技术要点：如果涉及具体技术、模型、工具、方法，归纳关键细节。\\n\\n第 4 段 讨论亮点：社区评论里值得注意的反对意见、补充信息或经验分享，帮助读者快速把握讨论全貌。"
+  "detail": "400-600 字的详细中文介绍，分成 5 个自然段，顺序为：\\n\\n第 1 段 话题背景：讨论的起因、上下文，为什么值得关注。\\n\\n第 2 段 核心观点：原帖作者的主要论点、发现或分享内容。技术术语首次出现加括号注释。\\n\\n第 3 段 技术要点：涉及的具体技术、模型、工具、方法，归纳关键细节。\\n\\n第 4 段 置顶/作者补充：引用置顶评论或作者 OP 在评论区的补说明（如果有）；没有就写'无额外补充'。\\n\\n第 5 段 质疑与讨论：**重点**列出评论区里的反对意见、质疑点、不同立场的依据；没有明显质疑时写积极补充/经验分享，引用具体评论者观点。"
 }}
 """
 
@@ -206,19 +211,41 @@ class AISummarizer:
 
         tag = f"r/{post.get('subreddit','?')}/{post.get('id','?')}"
         comments = post.get("top_comments") or []
-        comments_txt = ""
-        remaining = comments_max_chars
-        for c in comments:
-            body = (c.get("body") or "").strip()
-            if not body:
-                continue
-            snippet = body[:remaining]
-            line = f"[+{c.get('score', 0)}] u/{c.get('author','?')}: {snippet}"
-            comments_txt += (line + "\n\n")
-            remaining -= len(snippet)
-            if remaining <= 0:
-                break
-        comments_txt = comments_txt.strip() or "（无可用评论）"
+
+        # 按类型分组：置顶 / OP / 其他高赞
+        stickied_entries = [c for c in comments if c.get("is_stickied")]
+        op_entries = [c for c in comments if c.get("is_op") and not c.get("is_stickied")]
+        regular_entries = [c for c in comments if not c.get("is_stickied") and not c.get("is_op")]
+
+        def _render(entries: List[Dict], budget: int, tag_fn=None) -> str:
+            if not entries:
+                return ""
+            out = ""
+            remaining = budget
+            for c in entries:
+                body = (c.get("body") or "").strip()
+                if not body:
+                    continue
+                snippet = body[:max(remaining, 200)]
+                prefix = tag_fn(c) if tag_fn else ""
+                line = f"{prefix}[+{c.get('score', 0)}] u/{c.get('author','?')}: {snippet}"
+                out += (line + "\n\n")
+                remaining -= len(snippet)
+                if remaining <= 0:
+                    break
+            return out.strip()
+
+        stickied_budget = min(comments_max_chars // 2, 1000) if (stickied_entries or op_entries) else 0
+        stickied_comments = _render(
+            stickied_entries + op_entries,
+            budget=stickied_budget or comments_max_chars,
+            tag_fn=lambda c: "[置顶] " if c.get("is_stickied") else "[OP] ",
+        ) or "（无置顶 / 作者补充评论）"
+
+        top_comments_text = _render(
+            regular_entries,
+            budget=comments_max_chars - min(len(stickied_comments), comments_max_chars // 2),
+        ) or "（无高赞评论）"
 
         flair_line = (
             f"帖子 Flair: {post['link_flair_text']}"
@@ -232,17 +259,36 @@ class AISummarizer:
             else f"外链: {external_url}"
         )
 
-        user_prompt = self.reddit_prompt_template.format(
-            subreddit=post.get("subreddit", ""),
-            title=post.get("title", ""),
-            author=post.get("author", ""),
-            score=post.get("score", 0),
-            num_comments=post.get("num_comments", 0),
-            flair_line=flair_line,
-            external_url_line=external_url_line,
-            selftext=(post.get("selftext") or "（link post，无正文）")[:selftext_max_chars],
-            comments=comments_txt,
-        )
+        try:
+            user_prompt = self.reddit_prompt_template.format(
+                subreddit=post.get("subreddit", ""),
+                title=post.get("title", ""),
+                author=post.get("author", ""),
+                score=post.get("score", 0),
+                num_comments=post.get("num_comments", 0),
+                flair_line=flair_line,
+                external_url_line=external_url_line,
+                selftext=(post.get("selftext") or "（link post，无正文）")[:selftext_max_chars],
+                stickied_comments=stickied_comments,
+                top_comments_text=top_comments_text,
+            )
+        except KeyError:
+            # 兼容旧模板（只有 {comments} 占位符）
+            merged = (
+                (f"[置顶/作者]\n{stickied_comments}\n\n" if stickied_entries or op_entries else "")
+                + f"[高赞]\n{top_comments_text}"
+            )
+            user_prompt = self.reddit_prompt_template.format(
+                subreddit=post.get("subreddit", ""),
+                title=post.get("title", ""),
+                author=post.get("author", ""),
+                score=post.get("score", 0),
+                num_comments=post.get("num_comments", 0),
+                flair_line=flair_line,
+                external_url_line=external_url_line,
+                selftext=(post.get("selftext") or "（link post，无正文）")[:selftext_max_chars],
+                comments=merged,
+            )
 
         return self._chat_json(tag, user_prompt, timeout=timeout, retries=retries)
 

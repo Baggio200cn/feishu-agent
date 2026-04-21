@@ -451,7 +451,7 @@ def cmd_import_reddit(args):
             period=reddit_cfg.get("period", "day"),
             per_sub_fetch=int(reddit_cfg.get("per_sub_fetch", 10)),
             limit_total=int(reddit_cfg.get("limit_total", 10)),
-            top_comments=int(reddit_cfg.get("top_comments", 3)),
+            top_comments=int(reddit_cfg.get("top_comments", 6)),
         )
         run_stats["fetched"] = len(posts)
         if not posts:

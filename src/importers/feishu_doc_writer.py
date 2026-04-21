@@ -804,16 +804,27 @@ class FeishuDocWriter:
         for paragraph in self._split_paragraphs(detail):
             blocks.append(self._text_block(paragraph))
 
-        # 精选评论
+        # 精选评论（分三组：置顶 / OP 作者补充 / 高赞质疑）
         if top_comments:
-            blocks.append(self._divider())
-            blocks.append(self._h2_block(f"精选评论（Top {len(top_comments)}）"))
-            for c in top_comments:
-                author_c = c.get("author", "?")
-                score_c = c.get("score", 0)
-                body = (c.get("body") or "").strip()
-                blocks.append(self._h3_block(f"⬆️ {score_c} · u/{author_c}"))
-                for paragraph in self._split_paragraphs(body):
-                    blocks.append(self._text_block(paragraph))
+            stickied = [c for c in top_comments if c.get("is_stickied")]
+            op_supps = [c for c in top_comments if c.get("is_op") and not c.get("is_stickied")]
+            regular = [c for c in top_comments if not c.get("is_stickied") and not c.get("is_op")]
+
+            def _render_group(title: str, entries: List[Dict], prefix_emoji: str):
+                if not entries:
+                    return
+                blocks.append(self._divider())
+                blocks.append(self._h2_block(f"{title}（{len(entries)}）"))
+                for c in entries:
+                    author_c = c.get("author", "?")
+                    score_c = c.get("score", 0)
+                    body = (c.get("body") or "").strip()
+                    blocks.append(self._h3_block(f"{prefix_emoji} {score_c} · u/{author_c}"))
+                    for paragraph in self._split_paragraphs(body):
+                        blocks.append(self._text_block(paragraph))
+
+            _render_group("📌 置顶评论", stickied, "📌")
+            _render_group("✍️ 作者 OP 补充", op_supps, "✍️")
+            _render_group("💬 高赞讨论 / 质疑观点", regular, "⬆️")
 
         return blocks
