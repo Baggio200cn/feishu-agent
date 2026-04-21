@@ -337,11 +337,31 @@ def _run_trending_pipeline(
     run_stats["ai_failed"] = len(items_with_summary) - run_stats["summarized"]
 
     # 3. 写飞书日报：文件夹 + N 个独立子页
-    result = writer.write_daily_trending_report(
-        items_with_summary=items_with_summary,
-        parent_folder_title=parent_folder,
-        date_str=date_str,
-    )
+    try:
+        result = writer.write_daily_trending_report(
+            items_with_summary=items_with_summary,
+            parent_folder_title=parent_folder,
+            date_str=date_str,
+        )
+    except Exception as e:
+        import requests as _req
+        is_ssl = isinstance(e, (_req.exceptions.SSLError, _req.exceptions.ConnectionError))
+        logger.exception("Wiki 写入失败")
+        if is_ssl:
+            logger.error(
+                "⚠️ 飞书 SSL 连接被切断（SSLEOFError 类）。常见原因：VPN/代理在拦截"
+                " open.feishu.cn 的 TLS。摘要已缓存到 %s，排查代理后重跑 "
+                "`python main.py import-github`，会自动续跑只写 Wiki 部分（不烧豆包）。"
+                "\n排查步骤：\n"
+                "  1. Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings' | Select ProxyEnable,ProxyServer\n"
+                "  2. netsh winhttp show proxy\n"
+                "  3. $env:HTTP_PROXY / $env:HTTPS_PROXY 是否为空",
+                cache_path,
+            )
+        run_stats["status"] = "error"
+        run_stats["message"] = f"Wiki 写入失败: {type(e).__name__} {str(e)[:200]}"
+        _write_run_stats(run_stats)
+        return
 
     if result:
         run_stats["wiki_url"] = result["folder_url"]
@@ -503,11 +523,27 @@ def cmd_import_reddit(args):
         run_stats["ai_failed"] = len(items_with_summary) - run_stats["summarized"]
 
         # 3. 写飞书日报（文件夹 + 子页）
-        result = writer.write_daily_reddit_report(
-            items_with_summary=items_with_summary,
-            parent_folder_title=parent_folder,
-            date_str=date_str,
-        )
+        try:
+            result = writer.write_daily_reddit_report(
+                items_with_summary=items_with_summary,
+                parent_folder_title=parent_folder,
+                date_str=date_str,
+            )
+        except Exception as e:
+            import requests as _req
+            is_ssl = isinstance(e, (_req.exceptions.SSLError, _req.exceptions.ConnectionError))
+            logger.exception("Reddit Wiki 写入失败")
+            if is_ssl:
+                logger.error(
+                    "⚠️ 飞书 SSL 连接被切断（SSLEOFError）。常见原因：VPN/代理在拦截"
+                    " open.feishu.cn TLS。摘要已缓存到 %s，排查代理后重跑 "
+                    "`python main.py import-reddit`，自动续跑只写 Wiki 部分。",
+                    cache_path,
+                )
+            run_stats["status"] = "error"
+            run_stats["message"] = f"Wiki 写入失败: {type(e).__name__} {str(e)[:200]}"
+            _write_run_stats(run_stats)
+            return
 
         if result:
             run_stats["wiki_url"] = result["folder_url"]

@@ -7,7 +7,35 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+import requests as _requests_mod
+
 logger = logging.getLogger(__name__)
+
+# SDK / HTTP 调用的网络重试（SSL 握手异常、连接被切等）
+_RETRY_EXCEPTIONS = (
+    _requests_mod.exceptions.SSLError,
+    _requests_mod.exceptions.ConnectionError,
+    _requests_mod.exceptions.Timeout,
+)
+_RETRY_BACKOFF = (1.5, 3.5, 7.0)
+
+
+def _sdk_retry(fn, *args, **kwargs):
+    """给 lark-oapi SDK 调用套重试（SSL/Connection/Timeout 最多 3 次）。"""
+    last = None
+    for attempt, delay in enumerate([0.0, *_RETRY_BACKOFF]):
+        if delay:
+            time.sleep(delay)
+        try:
+            return fn(*args, **kwargs)
+        except _RETRY_EXCEPTIONS as e:
+            last = e
+            logger.warning(
+                f"[writer] SDK 调用第 {attempt+1} 次失败: {type(e).__name__} {str(e)[:160]}"
+            )
+            continue
+    if last:
+        raise last
 
 # 飞书文档 Block 类型常量
 BLOCK_PAGE = 1
@@ -221,7 +249,7 @@ class FeishuDocWriter:
                 .request_body(node_builder.build())
                 .build()
             )
-            resp = self._client.wiki.v2.space_node.create(req)
+            resp = _sdk_retry(self._client.wiki.v2.space_node.create, req)
             if not resp.success():
                 logger.warning(f"创建 Wiki 页面失败: {resp.code} {resp.msg}")
                 return None
@@ -265,7 +293,7 @@ class FeishuDocWriter:
                     .request_body(body)
                     .build()
                 )
-                resp = self._client.docx.v1.document_block_children.create(req)
+                resp = _sdk_retry(self._client.docx.v1.document_block_children.create, req)
                 if not resp.success():
                     raw_body = ""
                     try:
@@ -308,7 +336,7 @@ class FeishuDocWriter:
                 builder.parent_node_token(parent_node_token)
             if page_token:
                 builder.page_token(page_token)
-            resp = self._client.wiki.v2.space_node.list(builder.build())
+            resp = _sdk_retry(self._client.wiki.v2.space_node.list, builder.build())
             if not resp.success():
                 logger.warning(f"查询节点失败: {resp.code} {resp.msg}")
                 return None
@@ -493,7 +521,7 @@ class FeishuDocWriter:
                 .request_body(node_builder.build())
                 .build()
             )
-            resp = self._client.wiki.v2.space_node.create(req)
+            resp = _sdk_retry(self._client.wiki.v2.space_node.create, req)
             if not resp.success():
                 logger.error(f"创建节点 '{title}' 失败: {resp.code} {resp.msg}")
                 return None, None
