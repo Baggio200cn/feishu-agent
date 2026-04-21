@@ -11,7 +11,7 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from apscheduler.events import EVENT_SCHEDULER_STARTED, EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
@@ -149,8 +149,72 @@ class FeishuScheduler:
         except OSError:
             pass
 
+    def _load_existing_state_if_any(self) -> None:
+        """启动时把 logs/scheduler_state.json 里的 last_runs 读进来，
+        这样 catch-up 才能判断"今天是否已跑过"。"""
+        try:
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    prev = json.load(f)
+                prev_runs = prev.get("last_runs") or {}
+                if isinstance(prev_runs, dict) and prev_runs:
+                    self.state["last_runs"] = prev_runs
+                    logger.info(f"已加载历史 last_runs: {list(prev_runs.keys())}")
+        except Exception as e:
+            logger.warning(f"读取历史 state 失败: {e}")
+
+    def _catch_up_missed_today(self) -> None:
+        """
+        启动时补跑：若今天某 job 的 cron 触发点已过 + 今天从未成功跑过，
+        就立刻安排一次性 run_date=now+5s 的触发。
+        """
+        now = datetime.now()
+        today_date = now.date().isoformat()
+        existing_last = self.state.get("last_runs") or {}
+
+        for job in self.jobs_config:
+            job_type = job.get("type")
+            if not job_type or not job.get("enabled", True):
+                continue
+            handler = self._get_handler(job_type)
+            if not handler:
+                continue
+
+            hour = int(job.get("hour", 9))
+            minute = int(job.get("minute", 0))
+            scheduled_today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+            # cron 点还没到，走常规调度即可
+            if scheduled_today > now:
+                continue
+
+            # 今天已经跑过（看 last_runs 日期是不是今天）就跳过
+            last = existing_last.get(job_type) or {}
+            last_at = str(last.get("at", ""))
+            if last_at.startswith(today_date):
+                logger.info(f"[catch-up] {job_type} 今天已跑过 ({last_at})，不补跑")
+                continue
+
+            # 今天没跑过 + cron 点已过 → 安排一次性补跑
+            run_at = now + timedelta(seconds=5)
+            logger.info(
+                f"[catch-up] {job_type} 今天 {hour:02d}:{minute:02d} 触发点已过，"
+                f"当天未跑，安排 {run_at.strftime('%H:%M:%S')} 补跑一次"
+            )
+            self.scheduler.add_job(
+                handler,
+                trigger="date",
+                run_date=run_at,
+                id=f"{job_type}_catchup",
+                name=f"{job_type} (补跑今日)",
+                replace_existing=True,
+                misfire_grace_time=60,
+            )
+
     def start(self) -> None:
         self.add_jobs()
+        self._load_existing_state_if_any()
+        self._catch_up_missed_today()
         self.state["running"] = True
         self.state["started_at"] = datetime.now().isoformat(timespec="seconds")
         self._write_pid()
