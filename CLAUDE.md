@@ -49,7 +49,7 @@
 
 # 当前进度
 
-**最后更新**：2026-04-20
+**最后更新**：2026-04-21
 
 ## ✅ 已完成
 
@@ -88,15 +88,41 @@
   `DELETE /drive/v1/files/:obj_token?type=docx` 删底层 docx（wiki 节点随之消失）
 - 三重防误删：prefix 必填 · 默认 dry-run · UI confirm() 二次弹窗
 
-### Wiki 管家 Agent（2026-04-20 新增）
+### Wiki 管家 Agent（2026-04-20 新增，2026-04-21 大幅增强）
 - `python main.py agent-chat --query "..." [--session sess-xxx] [--reset] --json`
 - `python main.py scan-empty-wiki [--threshold 8] [--max 500] --json`
 - 模块 `src/agent/wiki_agent.py`：意图路由（search / scan_empty / delete_empty /
-  cleanup_prefix / suggest / confirm / cancel）+ 全树扫描 + 空节点检测（读 docx
-  raw_content 按字数判定）+ 安全删除（带 drive 兜底）+ 会话持久化
-  （logs/agent_sessions/{id}.json）
-- UI 弹层重写为"对话 Agent · Wiki 管家"：多轮对话 + 预览卡片 + 底部确认栏，
-  删前确认→回复"确认执行"才真删，回复"取消"即放弃
+  **mark_empty** / cleanup_prefix / suggest / confirm / cancel）+ 全树扫描
+  + 空节点检测（读 docx raw_content 按字数判定，跳过 `has_child=True` 目录父页）
+  + **真删只走 drive**（wiki DELETE 端点不存在）+ **🗑[空] 改名替代方案**
+  + 会话持久化（logs/agent_sessions/{id}.json）+ **last_scan 5 分钟缓存**
+  + **SSL 重试封装**（3 次 backoff 1/2.5/5s）
+- **suggest 意图接豆包 AI**：扫全树 → 顶层目录+子节点计数+样本标题 JSON → 豆包返回
+  4-7 条引用具体目录名的中文整理建议（规则版 fallback）
+- **search 智能降级**：长句（>6 字）整句无命中时自动拆关键词搜；仍 0 命中
+  时引导到 suggest（"这更像整理建议"）
+- UI 弹层"对话 Agent · Wiki 管家"：多轮对话 + 预览卡片 + 底部确认栏
+
+### 网络稳定性（2026-04-21 硬仗）
+- `main.py` 顶部内置 NO_PROXY 豁免飞书 + 豆包域名（Veee VPN 开着也能跑）
+- `src/importers/feishu_doc_writer.py` 4 个 SDK 调用点全部套 `_sdk_retry`
+  （SSL / Connection / Timeout 3 次重试，backoff 1.5/3.5/7s）
+- Wiki 写入失败时明确打印代理排查命令 + 缓存路径 + 续跑指引
+- 豆包摘要每条完成都落盘 `logs/{trending,reddit}_cache_YYYY-MM-DD.json`，
+  Wiki 写入失败不会烧 Token
+
+### Reddit 评论分组（2026-04-21）
+- `_fetch_top_comments` 返回带 `is_stickied` / `is_op` 标记，三类分组:
+  📌 置顶 / ✍️ 作者 OP 补充 / 💬 高赞讨论+质疑
+- 默认 limit 从 3 → 6；置顶和 OP 不占 limit 额外保留
+- 豆包 prompt 五段输出：背景 / 核心观点 / 技术要点 / 置顶/作者补充 / 质疑与讨论
+- 飞书 Wiki 子页按三组独立 H2 渲染
+
+### 调度器补跑（2026-04-21）
+- 启动时读上次 `logs/scheduler_state.json` 里的 last_runs
+- 遍历所有 enabled job，若当天 cron 点已过 + 今天未跑过，自动安排
+  一次性 `run_date=now+5s` 补跑
+- 用户任意时间启动调度器都能当天至少跑一次；重复跑会按日期跳过
 
 ### 诊断脚本四件套
 - `scripts/diag_feishu.py` — Wiki 权限分 4 步测
@@ -106,23 +132,23 @@
 - `scripts/diag_ui.py`（新）— 不开 UI 逐个验证 10 个按钮对应的 CLI 动作
 
 ### 已在用户本地端到端验证
-- GitHub 日报（2026-04-18, 2026-04-19 各一次，格式 OK）
-- Reddit 日报（2026-04-19，Veee VPN 15236 端口 + 换节点 + 浏览器 UA 后成功，10 条帖子 + 中文摘要全部写入飞书）
+- GitHub 日报（2026-04-18, 2026-04-19, **2026-04-21 VPN 开着无报错**）
+- Reddit 日报（2026-04-19 首次，**2026-04-21 完整三分组评论 + NO_PROXY 豁免生效**）
 
 ## 🚧 进行中
 
-生产化冲刺已全部 commit 推送，代码层面无遗留。用户本地需要：
-1. `git pull` 最新代码（commits `8208962` / `50b2707` / 含 Phase C 的待推）
-2. 如要 UI 里跑 Reddit：必须在**启动 UI 前**的终端里设 `$env:HTTP_PROXY = "http://127.0.0.1:15236"`，否则 UI spawn 出来的 python 继承不到代理
-3. 测试 UI 所有按钮，确认无回归
+无阻塞性遗留。2026-04-21 端到端打通：
 
-## 📋 待办（低优先级，生产后再推）
+- **GitHub 日报**：[2026-04-21 文件夹](https://open.feishu.cn/wiki/UXvHwZ0KoiGhyUkpJphcrqnknne) 10 页全新建
+- **Reddit 日报**：[2026-04-21 文件夹](https://open.feishu.cn/wiki/L6aQwXuhki39Vvk1v6hclAXqnrf) 10 页全新建，含三组评论分区
+
+## 📋 待办（低优先级）
 
 - 打包 `.exe`（electron-builder），免用户装 Node
 - Wiki 反向校验去重（手删 Wiki 后同步本地索引）
-- 对话助手升级为"对话历史"模式（现在是单轮）
 - Reddit 改为接入 Reddit OAuth 提升限频配额（目前匿名 10 req/min）
 - 企业账号文档 organize 暂以"引用说明页"兜底，跨租户复制需额外授权
+- Agent 接 LLM 意图分类（现在靠关键词规则，覆盖面不够时会误判为 search）
 
 ---
 
@@ -155,6 +181,11 @@
 | 2026-04-20 | Agent 意图路由用关键词规则而非 LLM | 中文意图词集合小（删空/找空/前缀/建议/确认/取消），规则既快又不花 token |
 | 2026-04-20 | 空节点删不了时改走"改名加 🗑[空] 前缀"作为替代方案 | 飞书 API 不给删用户个人 Wiki 空节点，但 UpdateTitleSpaceNode 权限宽得多。改名后用户在 Wiki UI 搜 🗑 可以一眼圈出批量选删。务实解。|
 | 2026-04-20 | 空节点检测跳过 `has_child=True` 的节点 | 目录型父页本身正文也是空但子下还有内容，误删会丢一堆文档 |
+| 2026-04-21 | `main.py` 启动时内置 NO_PROXY 豁免飞书 + 豆包域名 | 用户 Veee VPN 开着无法关（其他工作要用），走 VPN 导致 `open.feishu.cn` 和 `ark.cn-beijing.volces.com` SSLEOFError。这两个是大陆直连域名，NO_PROXY 绕代理即可；Reddit 仍走代理不豁免。|
+| 2026-04-21 | FeishuDocWriter 所有 SDK 调用套 `_sdk_retry`（3 次 backoff 1.5/3.5/7s） | 豆包摘要 10 条全跑完，最后一步 Wiki 写入 SSL 被切整个流程崩；SDK 调用点加重试能扛大部分偶发抖动。摘要缓存保证不重烧 Token。|
+| 2026-04-21 | Reddit 评论抓成 `stickied` + `is_op` + `regular` 三类，豆包 prompt 拆两变量、detail 五段化 | 用户要求"每个帖子需要加入置顶评论的介绍和其他评论的质疑内容"。置顶评论通常是版规/OP 补充，和高赞讨论性质完全不同，混一起让豆包摘要不够清晰。|
+| 2026-04-21 | 调度器启动时补跑当日遗漏任务（date 触发器 now+5s） | 用户 18:34 启动调度器，cron=09:00 早过了，APScheduler `misfire_grace_time=300s` 也早超，导致全天没任何任务触发。补跑逻辑让任意时间启动都能当天至少跑一次。|
+| 2026-04-21 | suggest 意图扩触发词 20+ / search 降级 / 豆包 AI 整理建议 | "你觉得目录分类如何"这种自然语言被当 search，整句 substring 匹配当然 0 命中。扩触发词路由到 suggest，失败时拆关键词搜，最终降级到豆包基于真实树结构给分析。|
 
 ---
 
@@ -181,6 +212,9 @@
 19. ~~`1061004 forbidden` 删 Wiki 节点~~：**原假设错误**。实际情况：飞书 Wiki v2 API **根本没有 delete-node 方法**（lark-oapi 1.5.4 只有 Create/Get/List/Copy/Move/UpdateTitle，无任何 Delete 类 Request）。我当初以为的 `DELETE /wiki/v2/spaces/:sid/nodes/:tk` 端点纯属编造，实测返回 `HTTP 404 page not found`。唯一能删的路径是 `DELETE /drive/v1/files/:obj_token?type=docx` 删底层 docx，但这要求应用对该 docx 有管理权限；个人 Wiki 下由用户本人创建的 docx，tenant_access_token 返 `1061004 forbidden` 是必然。**结论：加权限也绕不过，这是飞书 API 硬限制。**替代方案：用 `UpdateTitleSpaceNode` 给空节点标题加 🗑[空] 前缀，让用户在 Wiki UI 里肉眼批量选删（2026-04-20 下午落地）。
 20. **Agent 会话状态必须持久化**：CLI 无常驻进程，每次调用都是新 Python 进程。用 `logs/agent_sessions/{session_id}.json` 存 `{id, history, pending_action}`，前端 localStorage 保 session_id 跨窗口可继。
 21. **空节点误判——把目录型父页算空节点**：`detect_empty_nodes` 最初只看 docx 正文字数，结果像"学习笔记""工作记录"这种纯目录页（本身无正文但有子节点）全被误判为空。66 个"空节点"里大半是父目录。修复：`has_child=True` 的节点一律跳过。
+22. **Veee VPN 全局代理劫持大陆域名 TLS**：用户 Veee VPN `HTTP_PROXY=http://127.0.0.1:15236` + 系统代理 `ProxyEnable=1 ProxyServer=localhost:15236`，所有 HTTPS 走 Veee。飞书 `open.feishu.cn` / 豆包 `ark.cn-beijing.volces.com` 走过去 TLS 握手被切（`SSLEOFError _ssl.c:1018`）。这两个大陆直连，不该走 VPN。修复是在 `main.py` 顶部把它们加进 `NO_PROXY` 环境变量，requests 自动绕过代理直连；Reddit 不豁免保持走 VPN。
+23. **调度器启动时间 > cron 时间 = 全天不触发**：APScheduler 的 cron 触发器配合默认 `misfire_grace_time=300s`，过了触发点 5 分钟就永远不补跑当天。用户 18:34 启动，09:00 的 job 再没机会跑。修复是启动时手动读 last_runs + 当天已过 cron 点 + 今天没跑过 → 安排 date 触发器 `now+5s` 补跑一次。
+24. **长句自然语言被当关键词 substring 匹配**：用户问"你觉得知识库目录分类有没有问题"被路由到 search 意图，用整句去 `title.lower() in query.lower()` 匹配，必然 0 命中。修复：classify_intent 扩触发词（"你觉得/整理思路/怎么分类/给建议"等 20+ 条），加上 search 降级（拆关键词 + 长句提示走 suggest）。
 
 ---
 
@@ -190,7 +224,7 @@
 
 | 文件 | 作用 |
 |------|------|
-| `main.py` | CLI 入口，所有子命令（`organize` / `import-github` / `import-reddit` / `schedule` / `schedule-status` / `manage`） |
+| `main.py` | CLI 入口。**顶部内置 NO_PROXY 豁免飞书+豆包**。子命令：`organize` / `import-github` / `import-reddit` / `schedule` / `schedule-status` / `manage` / `chat` / **`agent-chat`** / **`scan-empty-wiki`** / `cleanup-wiki` |
 | `config/credentials.json` | 用户凭证（gitignored）：飞书 app / 豆包 api_key / GitHub token / subreddits / 调度配置 |
 | `config/credentials.json.example` | 模板，带 `_comment` 注释说明每个字段 |
 | `requirements.txt` | Python 依赖 |
@@ -204,12 +238,12 @@
 | `src/agent/wiki_agent.py` | Wiki 管家 Agent 核心：意图路由 · 全树扫描 · 空节点检测 · 带 drive 兜底的安全删除 · 会话持久化 |
 | `src/utils/feishu_client.py` | lark-oapi Client 工厂（双账号：personal / enterprise） |
 | `src/utils/config_loader.py` | `credentials.json` / `categories.json` 读取 |
-| `src/scheduler.py` | `FeishuScheduler`：APScheduler 封装，cron 调度 3 个任务 |
+| `src/scheduler.py` | `FeishuScheduler`：APScheduler 封装，cron 调度 3 个任务 + 启动时补跑当日遗漏 |
 | `src/importers/github_trending.py` | GitHubTrending HTML 爬取 |
 | `src/importers/github_importer.py` | GitHubImporter：单仓库元信息 + README + 核心文件抓取（含限频退避） |
-| `src/importers/reddit_importer.py` | RedditImporter：多 subreddit top-of-day + 高赞评论（用 `.json` 端点） |
-| `src/importers/ai_summarizer.py` | AISummarizer：豆包 REST 封装，`summarize_repo` + `summarize_reddit_post` |
-| `src/importers/feishu_doc_writer.py` | FeishuDocWriter：`find_node_by_title` / `write_daily_trending_report` / `write_daily_reddit_report`，typed Block builder |
+| `src/importers/reddit_importer.py` | RedditImporter：`.json` 端点，评论分 📌 stickied / ✍️ OP / 💬 regular 三类 |
+| `src/importers/ai_summarizer.py` | AISummarizer：豆包 REST 封装，Reddit prompt 拆 `{stickied_comments}` + `{top_comments_text}` 两变量，detail 五段化 |
+| `src/importers/feishu_doc_writer.py` | FeishuDocWriter：typed Block builder；4 个 SDK 调用点统一走 `_sdk_retry` SSL 重试；Reddit 子页评论三组分区渲染 |
 | `src/organizer/*.py` | 文档扫描、AI 分类、归档（原功能） |
 | `src/managers/*.py` | 邮件、IM、日历、联系人管理（原功能） |
 
@@ -242,22 +276,25 @@
 | `logs/github_last_run.json` | 最近一次 GitHub 运行统计（UI 读这个展示）|
 | `logs/reddit_last_run.json` | 同上 for Reddit |
 | `logs/github_imported.json` | Legacy 流程的去重索引（trending 流程已不用）|
+| `logs/agent_sessions/{sess-xxx}.json` | Wiki 管家 Agent 会话状态：`{id, history, pending_action, last_scan}` |
 
 ---
 
 # 下次会话要做的事
 
-1. **解决 VPN 代理问题跑通 Reddit**：用户本地端口实际是 `12536` 还是别的待确认；确认后一条 `python main.py import-reddit` 验证端到端，贴飞书子页截图确认 AI 摘要质量
-2. **UI 卡片对接新数据源**：`ui/main.js::buildUiState` 读 `reddit_last_run.json` 补 Reddit 真实状态；GitHub 卡片文案里加 `wiki_folder_token` 链接
-3. **豆包超时率优化**：README 截断从 8K → 4K 再试；或测试其他豆包模型的响应时延
-4. **打包 `.exe`**：`electron-builder` 配置 + 内置 Python 运行时，用户不用装 Node
-5. **对话助手 MVP**：`open-chat` 按钮目前是占位；最小实现 = 用户输入关键词 → 豆包 + Wiki ListSpaceNode 检索 → 返回相关页 URL
+1. **定时任务日级监控**：看明天（2026-04-22）09:00 github + reddit 自动触发是否成功，24 小时内 catch-up 逻辑起作用的话能覆盖用户任意时间重启
+2. **Reddit 评论三组分区效果核对**：去 [2026-04-21 Reddit 日报](https://open.feishu.cn/wiki/L6aQwXuhki39Vvk1v6hclAXqnrf) 任选一篇验证 📌/✍️/💬 分区是否都有内容 + detail 第 5 段是否真列出质疑观点
+3. **Wiki 管家 Agent 实战**：用户说"整理建议"时豆包生成的建议质量；标记 🗑[空] 后用户在 Wiki UI 批量删的流畅度
+4. **打包 `.exe`**：`electron-builder` 配置 + 内置 Python 运行时，用户不装 Node
+5. **Agent 意图路由可选升级到 LLM**：关键词规则在中短句上效果好，遇到绕弯的长句（"帮我想想怎么把冗余的目录合并一下"）可能仍然误判
+6. **豆包超时率优化**：README 截断从 8K → 4K 再试；或测更快模型
 
 ---
 
 # Git 工作流
 
-- **开发分支**：`claude/feishu-agent-interface-HiudF`
+- **开发分支**：`claude/continue-pr-6-fixes-Ptuu4`（2026-04-20 起；之前是 `claude/feishu-agent-interface-HiudF`，PR #6 已合并到 main）
+- **活跃 PR**：[#7](https://github.com/Baggio200cn/feishu-agent/pull/7) draft，Wiki 管家 Agent + 网络稳定性全套
 - **远程**：`baggio200cn/feishu-agent`（GitHub）
 - 每次提交都附 `https://claude.ai/code/session_xxx` URL 以便追溯
 - commit message 按 conventional commits：`feat(scope): ...` / `fix(scope): ...` / `chore: ...` / `docs: ...` / `refactor: ...`
