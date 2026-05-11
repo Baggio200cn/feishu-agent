@@ -540,6 +540,22 @@ input[type="text"].text-input:focus { border-color: var(--accent); }
           <button class="small" onclick="callAction('view-github-log')">日志</button>
         </div>
       </div>
+
+      <div class="card-compact">
+        <div class="card-compact-header">
+          <span class="card-compact-title">🔥 老巴疯啦</span>
+          <span class="badge idle" id="laoba-status">未执行</span>
+        </div>
+        <div class="card-compact-meta" id="laoba-meta">
+          尚未执行<br>
+          7 个垂直 subreddit + GitHub 关键词 · 五维度头脑风暴 · 09:30 触发
+        </div>
+        <div class="btn-row">
+          <button class="small flex" onclick="runWithSpinner(this, 'run-laoba')">立即执行</button>
+          <button class="small" onclick="callAction('view-laoba-wiki')">Wiki</button>
+          <button class="small" onclick="callAction('view-github-log')">日志</button>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -709,6 +725,10 @@ function updateState(state) {
   if (state.reddit) {
     if (state.reddit.meta) document.getElementById('reddit-meta').innerHTML = state.reddit.meta;
     if (state.reddit.statusLabel) setBadge('reddit-status', state.reddit.statusLabel, state.reddit.statusType);
+  }
+  if (state.laoba) {
+    if (state.laoba.meta) document.getElementById('laoba-meta').innerHTML = state.laoba.meta;
+    if (state.laoba.statusLabel) setBadge('laoba-status', state.laoba.statusLabel, state.laoba.statusType);
   }
   if (state.scheduler) {
     if (state.scheduler.enabled !== undefined) updateScheduleUI(state.scheduler.enabled);
