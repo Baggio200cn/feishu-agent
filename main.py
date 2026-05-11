@@ -700,7 +700,7 @@ def cmd_import_laoba_feng(args):
         gh_limit = int(laoba_cfg.get("github_limit", 5))
         if gh_keywords and gh_limit > 0:
             try:
-                trending = GitHubTrending().fetch_trending(period="daily", language="")
+                trending = GitHubTrending().fetch(period="daily", language="", limit=30)
                 for repo in trending:
                     if len(github_items) >= gh_limit:
                         break
