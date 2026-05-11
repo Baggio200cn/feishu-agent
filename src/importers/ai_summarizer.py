@@ -9,7 +9,7 @@ AI 摘要器 — 调用豆包 API 对 GitHub 仓库 README 生成中文摘要。
 import json
 import logging
 import re
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import requests
 
