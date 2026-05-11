@@ -606,6 +606,241 @@ def _write_reddit_stats(stats: Dict[str, Any]) -> None:
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
 
+def _write_laoba_stats(stats: Dict[str, Any]) -> None:
+    os.makedirs("logs", exist_ok=True)
+    with open("logs/laoba_feng_last_run.json", "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
+def cmd_import_laoba_feng(args):
+    """
+    老巴疯啦：8 个垂直 subreddit + GitHub trending（关键词白名单）→
+    豆包用老巴人设做五维度头脑风暴 → 飞书 '老巴疯啦' 专区。
+    服务两个北极星: A=货代 BD agent，B=颠覆内容消费（B1/B2/B7）。
+    """
+    from datetime import datetime
+
+    from src.importers.reddit_importer import RedditImporter
+    from src.importers.github_trending import GitHubTrending
+    from src.importers.ai_summarizer import AISummarizer
+    from src.importers.feishu_doc_writer import FeishuDocWriter
+
+    run_stats: Dict[str, Any] = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "fetched_reddit": 0,
+        "fetched_github": 0,
+        "summarized": 0,
+        "ai_failed": 0,
+        "wiki_url": "",
+        "status": "error",
+        "message": "",
+    }
+
+    try:
+        creds = config_loader.load_credentials()
+        laoba_cfg = creds.get("laoba_feng", {}) or {}
+        ai_cfg = config_loader.get_ai_config()
+        wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
+
+        if not laoba_cfg.get("enabled", True):
+            msg = "老巴疯啦未启用（credentials.json 里 laoba_feng.enabled=false）"
+            logger.info(msg)
+            run_stats["status"] = "disabled"
+            run_stats["message"] = msg
+            _write_laoba_stats(run_stats)
+            return
+
+        subs = laoba_cfg.get("subreddits") or []
+        if not subs:
+            msg = "老巴疯啦 subreddit 列表为空"
+            logger.error(msg)
+            run_stats["message"] = msg
+            _write_laoba_stats(run_stats)
+            return
+
+        if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+            msg = "飞书 Wiki space_id 未配置"
+            logger.error(msg)
+            run_stats["message"] = msg
+            _write_laoba_stats(run_stats)
+            return
+
+        summarizer = AISummarizer(ai_cfg)
+        if not summarizer.configured():
+            msg = "豆包 AI 未配置，老巴疯啦摘要必须靠 AI"
+            logger.error(msg)
+            run_stats["message"] = msg
+            _write_laoba_stats(run_stats)
+            return
+
+        factory = FeishuClientFactory(creds["accounts"])
+        personal_client = factory.get_client("personal")
+        writer = FeishuDocWriter(personal_client, wiki_space_id)
+
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        parent_folder = laoba_cfg.get("parent_folder", "老巴疯啦")
+        force = getattr(args, "force", False)
+
+        # 1a. 抓 Reddit（多 sub）
+        importer = RedditImporter(
+            subreddits=subs,
+            user_agent=creds.get("reddit", {}).get("user_agent", "feishu-agent/0.1"),
+        )
+        reddit_posts = importer.fetch_daily(
+            period="day",
+            per_sub_fetch=int(laoba_cfg.get("per_sub_fetch", 5)),
+            limit_total=int(laoba_cfg.get("limit_total", 12)),
+            top_comments=int(laoba_cfg.get("top_comments", 3)),
+        )
+        run_stats["fetched_reddit"] = len(reddit_posts)
+
+        # 1b. 抓 GitHub Trending + 关键词白名单过滤
+        github_items: List[Dict[str, Any]] = []
+        gh_keywords = [k.lower() for k in (laoba_cfg.get("github_keyword_whitelist") or [])]
+        gh_limit = int(laoba_cfg.get("github_limit", 5))
+        if gh_keywords and gh_limit > 0:
+            try:
+                trending = GitHubTrending().fetch_trending(period="daily", language="")
+                for repo in trending:
+                    if len(github_items) >= gh_limit:
+                        break
+                    full_name = (repo.get("full_name") or "").lower()
+                    desc = (repo.get("description") or "").lower()
+                    blob = f"{full_name} {desc}"
+                    if any(k in blob for k in gh_keywords):
+                        github_items.append(repo)
+                logger.info(
+                    f"GitHub trending 抓 {len(trending)} 条，关键词命中 {len(github_items)} 条"
+                )
+            except Exception as e:
+                logger.warning(f"GitHub trending 抓取失败（继续，仅用 Reddit）: {e}")
+        run_stats["fetched_github"] = len(github_items)
+
+        if not reddit_posts and not github_items:
+            msg = "Reddit + GitHub 都抓不到（可能 VPN 断了 / 限频）"
+            logger.warning(msg)
+            run_stats["message"] = msg
+            _write_laoba_stats(run_stats)
+            return
+
+        # 2. 老巴摘要（缓存续跑：reddit 用 post.id, github 用 full_name 去重）
+        cache_path = f"logs/laoba_cache_{date_str}.json"
+        cached = _load_trending_cache(cache_path)
+        items_with_summary: List[Dict[str, Any]] = []
+        done_ids: set = set()
+        if cached and not force:
+            items_with_summary = [it for it in cached if it.get("summary_ok")]
+            for it in items_with_summary:
+                if it.get("source_type") == "reddit":
+                    rid = (it.get("raw") or {}).get("id", "")
+                    if rid:
+                        done_ids.add(f"r/{rid}")
+                else:
+                    fn = (it.get("raw") or {}).get("full_name", "")
+                    if fn:
+                        done_ids.add(f"gh/{fn}")
+            retried = len(cached) - len(items_with_summary)
+            if retried:
+                logger.info(
+                    f"老巴缓存命中 {len(done_ids)} 条成功项；{retried} 条失败项将在本次重试"
+                )
+
+        all_items: List[Dict[str, Any]] = [
+            {"source_type": "reddit", "raw": p, "key": f"r/{p.get('id','')}"}
+            for p in reddit_posts
+        ] + [
+            {"source_type": "github", "raw": r, "key": f"gh/{r.get('full_name','')}"}
+            for r in github_items
+        ]
+
+        for i, entry in enumerate(all_items, 1):
+            key = entry["key"]
+            source_type = entry["source_type"]
+            raw = entry["raw"]
+            if key in done_ids:
+                title = raw.get("title", "") if source_type == "reddit" else raw.get("full_name", "")
+                logger.info(f"[{i}/{len(all_items)}] 跳过（缓存已有）: {title[:50]}")
+                continue
+            title_log = raw.get("title", "") if source_type == "reddit" else raw.get("full_name", "")
+            logger.info(f"[{i}/{len(all_items)}] 老巴摘要 [{source_type}] {title_log[:50]}")
+            summary = summarizer.summarize_laoba_feng_item(raw, source_type=source_type)
+            summary_ok = summary is not None
+            if not summary:
+                summary = {
+                    "one_liner": title_log[:30] or "（老巴摘要失败）",
+                    "dim_a_freight_bd": "AI 摘要失败，老巴歇会儿",
+                    "dim_b_content_disruption": "",
+                    "dim_zoom": "",
+                    "dim_invert": "",
+                    "laoba_verdict": "悬",
+                }
+            items_with_summary.append({
+                "source_type": source_type,
+                "raw": raw,
+                "summary": summary,
+                "summary_ok": summary_ok,
+            })
+            _save_trending_cache(cache_path, items_with_summary)
+
+        run_stats["summarized"] = sum(1 for it in items_with_summary if it.get("summary_ok"))
+        run_stats["ai_failed"] = len(items_with_summary) - run_stats["summarized"]
+
+        # 3. 写飞书
+        try:
+            result = writer.write_daily_laoba_feng_report(
+                items_with_summary=items_with_summary,
+                parent_folder_title=parent_folder,
+                date_str=date_str,
+            )
+        except Exception as e:
+            import requests as _req
+            is_ssl = isinstance(e, (_req.exceptions.SSLError, _req.exceptions.ConnectionError))
+            logger.exception("老巴 Wiki 写入失败")
+            if is_ssl:
+                logger.error(
+                    "⚠️ 飞书 SSL 连接被切断（SSLEOFError）。摘要已缓存到 %s，"
+                    "排查代理后重跑 `python main.py import-laoba-feng` 自动续跑。",
+                    cache_path,
+                )
+            run_stats["status"] = "error"
+            run_stats["message"] = f"Wiki 写入失败: {type(e).__name__} {str(e)[:200]}"
+            _write_laoba_stats(run_stats)
+            return
+
+        if result:
+            run_stats["wiki_url"] = result["folder_url"]
+            run_stats["wiki_folder_token"] = result["folder_token"]
+            run_stats["pages_created"] = result["created_count"]
+            run_stats["pages_skipped"] = result["skipped_count"]
+            run_stats["status"] = "success" if run_stats["ai_failed"] == 0 else "partial"
+            run_stats["message"] = (
+                f"老巴写完了：{result['created_count']} 新页 + {result['skipped_count']} 跳过；"
+                f"摘要成功 {run_stats['summarized']} / 失败 {run_stats['ai_failed']}"
+            )
+            print(f"\n✅ 老巴疯啦日报: {result['folder_url']}")
+            print(
+                f"   Reddit {run_stats['fetched_reddit']} + GitHub {run_stats['fetched_github']} · "
+                f"摘要 {run_stats['summarized']} · AI失败 {run_stats['ai_failed']} · "
+                f"新建页 {result['created_count']} · 跳过 {result['skipped_count']}"
+            )
+            for p in result.get("repo_pages", []):
+                marker = "🆕" if p["created"] else "  "
+                print(f"   {marker} {p['title'][:70]}")
+                if p["url"]:
+                    print(f"        {p['url']}")
+        else:
+            run_stats["message"] = "老巴日报写入失败，可能飞书权限或节点问题"
+            logger.error(run_stats["message"])
+
+        _write_laoba_stats(run_stats)
+
+    except Exception as e:
+        logger.exception("import-laoba-feng 异常")
+        run_stats["message"] = f"异常终止: {e}"
+        _write_laoba_stats(run_stats)
+        raise
+
+
 def _run_legacy_pipeline(
     github_cfg: Dict, importer, writer, run_stats: Dict, force: bool
 ) -> None:
@@ -1741,6 +1976,13 @@ def main():
     p_import_reddit = subparsers.add_parser("import-reddit", help="Reddit AI 日报 → 飞书")
     p_import_reddit.add_argument("--force", action="store_true", help="忽略缓存，重新调用豆包摘要")
 
+    # import-laoba-feng 子命令
+    p_import_laoba = subparsers.add_parser(
+        "import-laoba-feng",
+        help="老巴疯啦：8 个垂直 subreddit + GitHub 关键词 → 五维度头脑风暴 → 飞书",
+    )
+    p_import_laoba.add_argument("--force", action="store_true", help="忽略缓存，重新调用豆包")
+
     # manage 子命令
     p_manage = subparsers.add_parser("manage", help="管理飞书资源")
     p_manage.add_argument("resource", choices=["email", "messages", "calendar", "contacts"])
@@ -1786,6 +2028,8 @@ def main():
         cmd_import_github(args)
     elif args.command == "import-reddit":
         cmd_import_reddit(args)
+    elif args.command == "import-laoba-feng":
+        cmd_import_laoba_feng(args)
     elif args.command == "manage":
         cmd_manage(args)
     elif args.command == "schedule":

@@ -28,6 +28,7 @@ def default_schedule_config() -> List[Dict[str, Any]]:
     return [
         {"type": "github", "hour": 9, "minute": 0, "enabled": True},
         {"type": "reddit", "hour": 9, "minute": 5, "enabled": False},
+        {"type": "laoba_feng", "hour": 9, "minute": 30, "enabled": True},
         {"type": "organize", "hour": 23, "minute": 0, "enabled": True},
     ]
 
@@ -81,6 +82,7 @@ class FeishuScheduler:
         return {
             "github": self._run_github,
             "reddit": self._run_reddit,
+            "laoba_feng": self._run_laoba_feng,
             "organize": self._run_organize,
         }.get(job_type)
 
@@ -136,6 +138,17 @@ class FeishuScheduler:
         except Exception as e:
             logger.exception("reddit 任务失败")
             self._record_run("reddit", "error", message=str(e))
+
+    def _run_laoba_feng(self) -> None:
+        logger.info("[scheduler] 触发任务: laoba_feng")
+        try:
+            import argparse
+            from main import cmd_import_laoba_feng
+            cmd_import_laoba_feng(argparse.Namespace(force=False))
+            self._record_run("laoba_feng", "success")
+        except Exception as e:
+            logger.exception("laoba_feng 任务失败")
+            self._record_run("laoba_feng", "error", message=str(e))
 
     def _write_pid(self) -> None:
         os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)

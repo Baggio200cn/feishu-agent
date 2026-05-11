@@ -49,7 +49,7 @@
 
 # 当前进度
 
-**最后更新**：2026-04-21
+**最后更新**：2026-05-11
 
 ## ✅ 已完成
 
@@ -124,6 +124,41 @@
   一次性 `run_date=now+5s` 补跑
 - 用户任意时间启动调度器都能当天至少跑一次；重复跑会按日期跳过
 
+### 老巴疯啦灵感流（2026-05-11 新增）
+**北极星定位**:
+- A = 海运/跨境电商客户线索的 AI Agent（B2B Sales Intelligence + Web Scraping + Intent Signal）
+- B = 颠覆人类内容消费的范式级 AI 形态，候选 B1/B2/B7:
+  - B1 生活即内容（lifelog auto-narrative）
+  - B2 平行人生（alternate life simulation）
+  - B7 孤独消除（continuous AI companion 替代"内容产业"）
+
+**老巴人设**: 50 岁是幽默（实际接近退休的体制内闲职），对 AI 极度风靡
+（痴迷到老婆嫌弃），说话带点东北味儿，爱讲段子，判断犀利但不咬文嚼字。
+看潮流是"老司机看小年轻"——激情但不端着。
+
+**抓取源**:
+- 7 个垂直 subreddit: Webscraping / DataHoarder / FulfillmentByAmazon /
+  dropshipping / coldemail / sales / LocalLLaMA（保留 1 个技术池）
+- GitHub Trending + 15 个关键词白名单过滤（scraper/crawler/lead/intent/
+  b2b/clearbit/apollo/outreach/enrichment/prospecting/crm/linkedin/
+  whois/shipping/customs）
+
+**摘要五维度**（豆包用老巴人设做头脑风暴而非客观摘要）:
+1. one_liner — 老巴一句话毒舌定性（封面页用）
+2. dim_a_freight_bd — 对北极星 A 货代 BD agent 启发
+3. dim_b_content_disruption — 对北极星 B（B1/B2/B7）启发
+4. dim_zoom — 放大 100 倍 / 缩小 100 倍
+5. dim_invert — 反过来做（核心假设取反）
+6. laoba_verdict — 老巴的疯狂判断（能成/悬/纯炒作/必爆/已经过气）
+
+**CLI**: `python main.py import-laoba-feng [--force] [--json]`
+**调度**: 默认 09:30 触发（github/reddit 都跑完后再跑）
+**Wiki 路径**: `老巴疯啦/老巴疯啦 YYYY-MM-DD/N. [r/sub或GH] 标题`
+**封面页**: 🔥 老巴今日精选 Top 3（按 laoba_verdict 含"能成/有戏/必爆"过滤）
+  + 📋 全部素材一句话清单
+**缓存**: `logs/laoba_cache_YYYY-MM-DD.json` 同结构续跑（reddit 用 post.id 去重，
+  github 用 full_name 去重）
+
 ### 诊断脚本四件套
 - `scripts/diag_feishu.py` — Wiki 权限分 4 步测
 - `scripts/diag_doubao.py` — 豆包 API Key / 模型名
@@ -186,6 +221,10 @@
 | 2026-04-21 | Reddit 评论抓成 `stickied` + `is_op` + `regular` 三类，豆包 prompt 拆两变量、detail 五段化 | 用户要求"每个帖子需要加入置顶评论的介绍和其他评论的质疑内容"。置顶评论通常是版规/OP 补充，和高赞讨论性质完全不同，混一起让豆包摘要不够清晰。|
 | 2026-04-21 | 调度器启动时补跑当日遗漏任务（date 触发器 now+5s） | 用户 18:34 启动调度器，cron=09:00 早过了，APScheduler `misfire_grace_time=300s` 也早超，导致全天没任何任务触发。补跑逻辑让任意时间启动都能当天至少跑一次。|
 | 2026-04-21 | suggest 意图扩触发词 20+ / search 降级 / 豆包 AI 整理建议 | "你觉得目录分类如何"这种自然语言被当 search，整句 substring 匹配当然 0 命中。扩触发词路由到 suggest，失败时拆关键词搜，最终降级到豆包基于真实树结构给分析。|
+| 2026-04-24 | `from typing import Dict, Optional` 漏 `List`，summarize_reddit_post 内嵌函数注解 `List[Dict]` NameError | 上版重构 _render 时引入的回归 bug。教训: 写新代码动了类型注解先看 import 顺手补 List/Tuple/Any 等常用。|
+| 2026-05-11 | "老巴疯啦"灵感流：独立流水线 + 老巴人设 + 五维度头脑风暴 prompt | 用户两大北极星（A 货代 BD agent / B 内容消费颠覆）需要持续灵感喂养，但客观摘要式日报激发不了发散思维。独立 pipeline 用人设化 prompt 把外网素材"硬扯"到北极星上，宁可扯也比客观要点列表有启发。 |
+| 2026-05-11 | 老巴的"北极星 B"从"AI 真人剧变种"转为范式级颠覆（B1/B2/B7） | 用户反馈早期 8 个候选都是"剧"这个媒介下的变种，不是颠覆。换框思路：AI 时代根本不需要"剧"这种形态了，颠覆是"生活即内容/平行人生/孤独消除"这种范式级重构。Prompt 里明确这三个方向让豆包对齐。 |
+| 2026-05-11 | 老巴日报 GitHub 抓取走"关键词白名单过滤"而非全量 | 老巴流要的是 B2B sales intelligence / data mining 信号，原 trending 流是泛技术日报，混抓会稀释信号。白名单 15 个 keyword（scraper/crawler/lead/intent/b2b/clearbit/apollo/outreach/enrichment/prospecting/crm/linkedin/whois/shipping/customs）只保命中项。 |
 
 ---
 
@@ -215,6 +254,7 @@
 22. **Veee VPN 全局代理劫持大陆域名 TLS**：用户 Veee VPN `HTTP_PROXY=http://127.0.0.1:15236` + 系统代理 `ProxyEnable=1 ProxyServer=localhost:15236`，所有 HTTPS 走 Veee。飞书 `open.feishu.cn` / 豆包 `ark.cn-beijing.volces.com` 走过去 TLS 握手被切（`SSLEOFError _ssl.c:1018`）。这两个大陆直连，不该走 VPN。修复是在 `main.py` 顶部把它们加进 `NO_PROXY` 环境变量，requests 自动绕过代理直连；Reddit 不豁免保持走 VPN。
 23. **调度器启动时间 > cron 时间 = 全天不触发**：APScheduler 的 cron 触发器配合默认 `misfire_grace_time=300s`，过了触发点 5 分钟就永远不补跑当天。用户 18:34 启动，09:00 的 job 再没机会跑。修复是启动时手动读 last_runs + 当天已过 cron 点 + 今天没跑过 → 安排 date 触发器 `now+5s` 补跑一次。
 24. **长句自然语言被当关键词 substring 匹配**：用户问"你觉得知识库目录分类有没有问题"被路由到 search 意图，用整句去 `title.lower() in query.lower()` 匹配，必然 0 命中。修复：classify_intent 扩触发词（"你觉得/整理思路/怎么分类/给建议"等 20+ 条），加上 search 降级（拆关键词 + 长句提示走 suggest）。
+25. **`typing.List` 漏 import 导致 Reddit 摘要全失败**：04-21 重构 `_render` 内嵌函数时用了 `List[Dict]` 注解，但 `from typing import Dict, Optional` 漏掉 `List`。Python 3 解析函数定义时立即评估注解，导致 `summarize_reddit_post` 一被调用就 NameError，用户 04-24 跑 import-reddit 全 10 条都失败。教训：动了类型注解习惯性补全常用 `List/Tuple/Any/Set/Union`。
 
 ---
 
@@ -224,7 +264,7 @@
 
 | 文件 | 作用 |
 |------|------|
-| `main.py` | CLI 入口。**顶部内置 NO_PROXY 豁免飞书+豆包**。子命令：`organize` / `import-github` / `import-reddit` / `schedule` / `schedule-status` / `manage` / `chat` / **`agent-chat`** / **`scan-empty-wiki`** / `cleanup-wiki` |
+| `main.py` | CLI 入口。**顶部内置 NO_PROXY 豁免飞书+豆包**。子命令：`organize` / `import-github` / `import-reddit` / **`import-laoba-feng`** / `schedule` / `schedule-status` / `manage` / `chat` / `agent-chat` / `scan-empty-wiki` / `cleanup-wiki` |
 | `config/credentials.json` | 用户凭证（gitignored）：飞书 app / 豆包 api_key / GitHub token / subreddits / 调度配置 |
 | `config/credentials.json.example` | 模板，带 `_comment` 注释说明每个字段 |
 | `requirements.txt` | Python 依赖 |
@@ -238,12 +278,12 @@
 | `src/agent/wiki_agent.py` | Wiki 管家 Agent 核心：意图路由 · 全树扫描 · 空节点检测 · 带 drive 兜底的安全删除 · 会话持久化 |
 | `src/utils/feishu_client.py` | lark-oapi Client 工厂（双账号：personal / enterprise） |
 | `src/utils/config_loader.py` | `credentials.json` / `categories.json` 读取 |
-| `src/scheduler.py` | `FeishuScheduler`：APScheduler 封装，cron 调度 3 个任务 + 启动时补跑当日遗漏 |
+| `src/scheduler.py` | `FeishuScheduler`：APScheduler 封装，cron 调度 4 个任务（含 laoba_feng）+ 启动时补跑当日遗漏 |
 | `src/importers/github_trending.py` | GitHubTrending HTML 爬取 |
 | `src/importers/github_importer.py` | GitHubImporter：单仓库元信息 + README + 核心文件抓取（含限频退避） |
 | `src/importers/reddit_importer.py` | RedditImporter：`.json` 端点，评论分 📌 stickied / ✍️ OP / 💬 regular 三类 |
-| `src/importers/ai_summarizer.py` | AISummarizer：豆包 REST 封装，Reddit prompt 拆 `{stickied_comments}` + `{top_comments_text}` 两变量，detail 五段化 |
-| `src/importers/feishu_doc_writer.py` | FeishuDocWriter：typed Block builder；4 个 SDK 调用点统一走 `_sdk_retry` SSL 重试；Reddit 子页评论三组分区渲染 |
+| `src/importers/ai_summarizer.py` | AISummarizer：豆包 REST 封装，Reddit prompt 拆 `{stickied_comments}` + `{top_comments_text}` 两变量 detail 五段化；新增 `summarize_laoba_feng_item` 老巴人设 + 五维 prompt（temperature 0.85） |
+| `src/importers/feishu_doc_writer.py` | FeishuDocWriter：typed Block builder；4 个 SDK 调用点统一走 `_sdk_retry` SSL 重试；Reddit 子页评论三组分区渲染；**`write_daily_laoba_feng_report` 封面页精选 Top3 + 五维 H2 子页** |
 | `src/organizer/*.py` | 文档扫描、AI 分类、归档（原功能） |
 | `src/managers/*.py` | 邮件、IM、日历、联系人管理（原功能） |
 
@@ -277,17 +317,19 @@
 | `logs/reddit_last_run.json` | 同上 for Reddit |
 | `logs/github_imported.json` | Legacy 流程的去重索引（trending 流程已不用）|
 | `logs/agent_sessions/{sess-xxx}.json` | Wiki 管家 Agent 会话状态：`{id, history, pending_action, last_scan}` |
+| `logs/laoba_feng_last_run.json` | 老巴疯啦最近一次运行统计 |
+| `logs/laoba_cache_YYYY-MM-DD.json` | 当日老巴五维摘要缓存（reddit + github 混合，按 source_type/key 去重）|
 
 ---
 
 # 下次会话要做的事
 
-1. **定时任务日级监控**：看明天（2026-04-22）09:00 github + reddit 自动触发是否成功，24 小时内 catch-up 逻辑起作用的话能覆盖用户任意时间重启
-2. **Reddit 评论三组分区效果核对**：去 [2026-04-21 Reddit 日报](https://open.feishu.cn/wiki/L6aQwXuhki39Vvk1v6hclAXqnrf) 任选一篇验证 📌/✍️/💬 分区是否都有内容 + detail 第 5 段是否真列出质疑观点
-3. **Wiki 管家 Agent 实战**：用户说"整理建议"时豆包生成的建议质量；标记 🗑[空] 后用户在 Wiki UI 批量删的流畅度
+1. **老巴疯啦实战验证**：本地拉新代码 → 跑 `python main.py import-laoba-feng` 看豆包产出的"老巴语气" 是不是真东北段子手味儿；五维度是否真扯到北极星 A/B；如果 prompt 调性不对，调 LAOBA_SYSTEM_PROMPT
+2. **UI 加老巴疯啦卡片**：`ui/index.html` + `ui/main.js` 加一张"老巴疯啦"卡片（立即执行 / Wiki / 日志三按钮），读 `logs/laoba_feng_last_run.json` 展示状态
+3. **老巴日报封面页"Top 3 精选"逻辑**：当前是关键词过滤（含"能成/有戏/必爆"），可能选不出来。如果实战中精选区常空，改为按 laoba_verdict 长度 + 关键词组合评分排序
 4. **打包 `.exe`**：`electron-builder` 配置 + 内置 Python 运行时，用户不装 Node
-5. **Agent 意图路由可选升级到 LLM**：关键词规则在中短句上效果好，遇到绕弯的长句（"帮我想想怎么把冗余的目录合并一下"）可能仍然误判
-6. **豆包超时率优化**：README 截断从 8K → 4K 再试；或测更快模型
+5. **Agent 意图路由可选升级到 LLM**：关键词规则在中短句上效果好，长句仍可能误判
+6. **豆包超时率优化**：老巴 prompt 比 reddit 长（system+user+JSON 都更复杂），可能加剧超时；测一下 timeout 是否需要从 180 → 240
 
 ---
 
