@@ -123,6 +123,16 @@ def classify_intent(query: str, session: Dict[str, Any]) -> str:
         if any(k in q for k in ["取消", "不删", "不要", "算了", "no", "停", "放弃"]):
             return "cancel"
 
+    # 导出为 Markdown（高优先级：避免被 suggest 的"整理"误吞）
+    # 规则: 出现明确的 md / markdown / .md 标识 + 任一动词（整理 / 合并 / 汇总 / 导出 / 打包 / 做成）
+    has_md_token = any(t in q for t in [".md", "markdown", " md ", "md文档", "md档"]) or q.endswith("md")
+    has_export_verb = any(v in q for v in ["整理", "合并", "汇总", "导出", "打包", "做成", "导成"])
+    if has_md_token and has_export_verb:
+        return "export_md"
+    # 兜底: 强动词 + 文档（"把 XX 合并成一个文档"）
+    if any(v in q for v in ["合并成", "汇总成", "打包成", "做成"]) and ("文档" in q or "一个" in q or "一份" in q):
+        return "export_md"
+
     # 打标记（改名加 🗑[空] 前缀 —— 比真删权限要求低）
     if any(k in q for k in ["标记", "改名", "打标", "贴标", "加前缀"]) and "空" in q:
         return "mark_empty"
@@ -548,3 +558,180 @@ def ai_suggestions(
     except Exception as e:
         logger.warning(f"ai_suggestions 失败: {e}")
     return None
+
+
+# ---------------------------------------------------------------------------
+# 导出 Wiki 子树为 Markdown
+# ---------------------------------------------------------------------------
+EXPORT_DIR = os.path.join("logs", "exports")
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
+
+def find_matching_parent_node(
+    nodes: List[Dict[str, Any]], query: str
+) -> Optional[Dict[str, Any]]:
+    """
+    在已扫好的节点列表里，找一个标题最匹配 query 的"目录型节点"（has_child=True）。
+    匹配规则:
+      1) 完全相等 → 100 分
+      2) query 是 title 的子串 → 50 分
+      3) 关键 token 匹配（日期 / 老巴疯啦 / 老巴 等）→ 30 分
+    取分数最高的那个。
+    """
+    import re as _re
+
+    q_lower = (query or "").lower()
+    q_tokens = set()
+    # 抽日期 YYYY-MM-DD
+    date_match = _re.search(r"\d{4}-\d{2}-\d{2}", query)
+    if date_match:
+        q_tokens.add(date_match.group(0))
+    # 抽 2-8 字中文连续段
+    for m in _re.findall(r"[一-龥]{2,8}", query):
+        q_tokens.add(m)
+    # 抽英文连续段
+    for m in _re.findall(r"[A-Za-z]{2,30}", query):
+        q_tokens.add(m.lower())
+
+    best = None
+    best_score = 0
+    for n in nodes:
+        if not n.get("has_child"):
+            # 没子节点的不是"目录"，跳过
+            continue
+        title = (n.get("title") or "").strip()
+        if not title:
+            continue
+        t_lower = title.lower()
+        score = 0
+        if t_lower == q_lower:
+            score = 100
+        elif q_lower and q_lower in t_lower:
+            score = 50
+        else:
+            for tok in q_tokens:
+                if tok and tok in t_lower:
+                    score += 20
+        if score > best_score:
+            best_score = score
+            best = n
+    return best if best_score >= 20 else None
+
+
+def export_subtree_to_md(
+    client,
+    tenant_token: str,
+    wiki_space_id: str,
+    parent_node: Dict[str, Any],
+    max_children: int = 50,
+) -> Dict[str, Any]:
+    """
+    把 parent_node 下所有子节点（仅 docx）整理成一份 Markdown 文档。
+
+    返回: {
+      "parent_title": str,
+      "children_count": int,
+      "children_exported": int,
+      "skipped": [{title, reason}, ...],
+      "md_path": str,           # 本地落盘绝对路径
+      "preview": str,           # 前 ~300 字预览
+      "byte_size": int,
+    }
+    """
+    from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+
+    parent_title = parent_node["title"]
+    parent_token = parent_node["node_token"]
+
+    # 1. 列出 parent 下的直接子节点
+    children: List[Dict[str, Any]] = []
+    page_token = None
+    for _ in range(20):
+        b = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50).parent_node_token(parent_token)
+        if page_token:
+            b.page_token(page_token)
+        try:
+            r = _sdk_call_with_retry(client.wiki.v2.space_node.list, b.build())
+        except Exception as e:
+            logger.warning(f"export 列子节点失败: {e}")
+            break
+        if not r.success():
+            logger.warning(f"export ListSpaceNode 失败 code={r.code} msg={r.msg}")
+            break
+        for it in (getattr(r.data, "items", None) or []):
+            children.append({
+                "title": getattr(it, "title", "") or "(未命名)",
+                "node_token": it.node_token,
+                "obj_token": getattr(it, "obj_token", "") or "",
+                "obj_type": getattr(it, "obj_type", "") or "",
+                "has_child": bool(getattr(it, "has_child", False)),
+            })
+            if len(children) >= max_children:
+                break
+        if len(children) >= max_children or not getattr(r.data, "has_more", False):
+            break
+        page_token = getattr(r.data, "page_token", None)
+        if not page_token:
+            break
+
+    # 2. 拼接 markdown
+    md_lines: List[str] = []
+    md_lines.append(f"# {parent_title}")
+    md_lines.append("")
+    md_lines.append(f"_由 Wiki 管家 Agent 整理 · 共 {len(children)} 条子页_")
+    md_lines.append("")
+    md_lines.append("---")
+    md_lines.append("")
+
+    exported = 0
+    skipped: List[Dict[str, Any]] = []
+    for idx, c in enumerate(children, 1):
+        title = c["title"]
+        obj_type = (c.get("obj_type") or "").lower()
+        obj_token = c.get("obj_token") or ""
+        if obj_type != "docx" or not obj_token:
+            skipped.append({"title": title, "reason": f"非 docx ({obj_type or '未知'})"})
+            md_lines.append(f"## {idx}. {title}")
+            md_lines.append("")
+            md_lines.append(f"_（{obj_type or '未知类型'}，无法读取正文）_")
+            md_lines.append("")
+            continue
+
+        text = read_docx_raw_content(tenant_token, obj_token)
+        if text is None:
+            skipped.append({"title": title, "reason": "读取失败"})
+            md_lines.append(f"## {idx}. {title}")
+            md_lines.append("")
+            md_lines.append("_（读取正文失败）_")
+            md_lines.append("")
+            continue
+
+        md_lines.append(f"## {idx}. {title}")
+        md_lines.append("")
+        # 飞书 docx raw_content 是纯文本，按双换行分段保留
+        for para in re.split(r"\n\s*\n", text.strip()):
+            para = para.strip()
+            if para:
+                md_lines.append(para)
+                md_lines.append("")
+        md_lines.append("---")
+        md_lines.append("")
+        exported += 1
+
+    md_text = "\n".join(md_lines)
+
+    # 3. 落盘
+    safe_name = re.sub(r"[\\/:*?\"<>|]+", "_", parent_title)[:80] or "export"
+    out_path = os.path.abspath(os.path.join(EXPORT_DIR, f"{safe_name}.md"))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(md_text)
+
+    return {
+        "parent_title": parent_title,
+        "children_count": len(children),
+        "children_exported": exported,
+        "skipped": skipped,
+        "md_path": out_path,
+        "preview": md_text[:300] + ("..." if len(md_text) > 300 else ""),
+        "byte_size": len(md_text.encode("utf-8")),
+    }

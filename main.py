@@ -1732,6 +1732,72 @@ def cmd_agent_chat(args):
                     reply["pending_action"] = session["pending_action"]
                     reply["status"] = "success"
 
+        # ---- 导出 Wiki 子树为 Markdown ----
+        elif intent == "export_md":
+            # 1. 扫树（复用缓存的全树扫描结果不太合适，因为缓存是空节点；这里要全树）
+            nodes = wiki_agent.scan_wiki_tree(client, wiki_space_id)
+            target = wiki_agent.find_matching_parent_node(nodes, query)
+            if not target:
+                reply["reply_text"] = (
+                    f"没在 Wiki 里找到匹配的目录节点。请明确点目录名，例如：\n"
+                    f"  「整理老巴疯啦 2026-05-12 为 .md」\n"
+                    f"  「把 GitHub Trending 日报 2026-04-21 导出成 markdown」"
+                )
+                reply["status"] = "success"
+            else:
+                # 2. 执行导出
+                result = wiki_agent.export_subtree_to_md(
+                    client=client,
+                    tenant_token=tenant_token,
+                    wiki_space_id=wiki_space_id,
+                    parent_node=target,
+                )
+                reply["reply_text"] = (
+                    f"✅ 已把 「{result['parent_title']}」 下 {result['children_count']} 条子页"
+                    f"整理为 Markdown ({result['children_exported']} 条正文成功"
+                    + (f" / {len(result['skipped'])} 条跳过" if result['skipped'] else "")
+                    + f"，共 {result['byte_size']} 字节)。\n\n"
+                    f"📄 本地文件: {result['md_path']}\n"
+                    f"（直接在文件管理器里打开此路径，或回复「打开导出文件」让我用系统默认编辑器打开）"
+                )
+                reply["preview"] = {
+                    "title": "导出结果",
+                    "items": [
+                        {"title": f"📄 {result['parent_title']}.md",
+                         "ok": True,
+                         "detail": f"{result['children_exported']} 段正文 · {result['byte_size']} 字节"},
+                        *[{"title": s["title"], "ok": False, "detail": s["reason"]}
+                          for s in result["skipped"]],
+                    ],
+                    "summary": result["md_path"],
+                }
+                # 把路径存到 session 让下一轮"打开导出文件"可用
+                session["last_export_md"] = result["md_path"]
+                reply["status"] = "success"
+
+        # ---- 打开本次导出文件 ----
+        elif ("打开" in query and ("文件" in query or "md" in query.lower() or "导出" in query)) \
+             and session.get("last_export_md"):
+            import subprocess as _sp
+            import platform as _pl
+            md_path = session.get("last_export_md", "")
+            if md_path and os.path.exists(md_path):
+                try:
+                    if _pl.system() == "Windows":
+                        os.startfile(md_path)  # type: ignore
+                    elif _pl.system() == "Darwin":
+                        _sp.Popen(["open", md_path])
+                    else:
+                        _sp.Popen(["xdg-open", md_path])
+                    reply["reply_text"] = f"已请求系统打开: {md_path}"
+                except Exception as e:
+                    reply["reply_text"] = f"打开失败: {e}\n你可以手动到这个路径打开: {md_path}"
+                reply["status"] = "success"
+            else:
+                reply["reply_text"] = "找不到导出文件，请先说「整理 XX 为 .md」生成一份。"
+                reply["status"] = "success"
+            reply["intent"] = "open_export"
+
         # ---- 整理建议 ----
         elif intent == "suggest":
             nodes = wiki_agent.scan_wiki_tree(client, wiki_space_id)
