@@ -1529,6 +1529,59 @@ def cmd_agent_chat(args):
                         "summary": f"成功 {ok} · 失败 {bad}",
                     }
                     reply["status"] = "success" if bad == 0 else "partial"
+            elif action_type == "move_nodes":
+                src_token = params.get("source_node_token")
+                src_title = params.get("source_title", "")
+                rng = params.get("range") or [1, 1]
+                dst_title = params.get("dest_title", "")
+                dst_token = params.get("dest_node_token")
+                create_dest = params.get("create_dest", False)
+                dest_parent_token = params.get("dest_parent_token")
+
+                if create_dest or not dst_token:
+                    # 先创建目标父目录（放在 source 同级，如果 source 有 parent 就用同 parent；否则空间根下）
+                    dst_token = wiki_agent.create_wiki_folder_node(
+                        client, wiki_space_id, title=dst_title,
+                        parent_node_token=dest_parent_token or None,
+                    )
+                    if not dst_token:
+                        reply["reply_text"] = (
+                            f"创建目标目录「{dst_title}」失败（可能权限不够）。"
+                            f"先到 Wiki 里手动建一个再来。"
+                        )
+                        reply["status"] = "error"
+                        session["pending_action"] = None
+                    else:
+                        logger.info(f"✅ 已建目标目录 {dst_title} token={dst_token}")
+
+                if dst_token:
+                    # 假装 source 节点是 parent 入参（move 只需要 node_token + has_child 字段）
+                    src_node = {"node_token": src_token, "title": src_title, "has_child": True}
+                    mr = wiki_agent.move_nodes_by_index_range(
+                        client, wiki_space_id, src_node,
+                        index_range=(rng[0], rng[1]),
+                        dest_parent_node_token=dst_token,
+                    )
+                    if mr.get("error"):
+                        reply["reply_text"] = f"移动失败: {mr['error']}"
+                        reply["status"] = "error"
+                    else:
+                        moved = mr["moved"]
+                        failed = mr["failed"]
+                        reply["reply_text"] = (
+                            f"✅ 移动完成：成功 {len(moved)} 个，失败 {len(failed)} 个。"
+                            f"现在「{src_title}」第 {mr['range_resolved'][0]}-{mr['range_resolved'][1]} 条"
+                            f"已搬到「{dst_title}」下。"
+                        )
+                        reply["preview"] = {
+                            "title": "移动结果",
+                            "items": [
+                                *[{"title": m["title"], "ok": True, "detail": "已移动"} for m in moved],
+                                *[{"title": f["title"], "ok": False, "detail": f.get("error", "")} for f in failed],
+                            ],
+                            "summary": f"成功 {len(moved)} · 失败 {len(failed)}",
+                        }
+                        reply["status"] = "success" if len(failed) == 0 else "partial"
             elif action_type == "cleanup_prefix":
                 prefix = params.get("prefix", "")
                 targets = params.get("targets") or []
@@ -1847,8 +1900,110 @@ def cmd_agent_chat(args):
             }
             reply["status"] = "success"
 
-        # ---- 搜 Wiki（默认） ----
+        # ---- 移动节点 ----
+        elif intent == "move_nodes":
+            from src.importers.ai_summarizer import AISummarizer
+            ai_cfg = config_loader.get_ai_config()
+            summarizer = AISummarizer(ai_cfg)
+            llm_args = wiki_agent.llm_classify_intent(query, summarizer) or {}
+
+            # 抽参数（规则优先，LLM 兜底）
+            rng = wiki_agent.parse_index_range(query)
+            if not rng and llm_args.get("range_start") and llm_args.get("range_end"):
+                rng = (int(llm_args["range_start"]), int(llm_args["range_end"]))
+
+            src_hint = wiki_agent.parse_source_folder(query) or llm_args.get("target_folder")
+            dst_hint = wiki_agent.parse_dest_folder(query) or llm_args.get("dest_folder")
+
+            if not src_hint or not rng or not dst_hint:
+                missing = []
+                if not src_hint: missing.append("源目录（如'老巴疯啦'）")
+                if not rng: missing.append("范围（如'13到21'）")
+                if not dst_hint: missing.append("目标目录（如'2026-05-13'）")
+                reply["reply_text"] = (
+                    f"我理解你想移动节点，但缺少：{' / '.join(missing)}。\n"
+                    f"完整例子：「把老巴疯啦目录中 13 到 21 的文件移到 2026-05-13 下」"
+                )
+                reply["status"] = "success"
+            else:
+                # 找源目录
+                nodes = wiki_agent.scan_wiki_tree(client, wiki_space_id)
+                source = wiki_agent.find_matching_parent_node(nodes, src_hint)
+                if not source:
+                    reply["reply_text"] = f"找不到名为 '{src_hint}' 的目录。请确认 Wiki 里有这个父节点。"
+                    reply["status"] = "success"
+                else:
+                    # 找或创建目标目录（dest 可以是新建的）
+                    dest = wiki_agent.find_matching_parent_node(nodes, dst_hint)
+                    dest_token = dest["node_token"] if dest else None
+                    will_create = False
+                    if not dest_token:
+                        will_create = True
+
+                    # stage 成 pending_action 等用户确认
+                    session["pending_action"] = {
+                        "id": "act-" + time.strftime("%H%M%S"),
+                        "type": "move_nodes",
+                        "params": {
+                            "source_node_token": source["node_token"],
+                            "source_title": source["title"],
+                            "range": list(rng),
+                            "dest_title": dst_hint,
+                            "dest_node_token": dest_token,
+                            "create_dest": will_create,
+                            "dest_parent_token": source.get("parent_node_token") or None,
+                        },
+                        "confirm_hint": "回复「确认执行」开始移动，或「取消」放弃。",
+                    }
+                    create_note = "（目标目录不存在，将先创建）" if will_create else ""
+                    reply["reply_text"] = (
+                        f"准备把「{source['title']}」下索引 {rng[0]}-{rng[1]} 的节点"
+                        f"移动到「{dst_hint}」{create_note}。\n"
+                        f"⚠️ 这会改变 Wiki 结构（不会删内容，但移动后位置变化）。"
+                        f"回复「确认执行」继续，或「取消」放弃。"
+                    )
+                    reply["preview"] = {
+                        "title": "即将移动",
+                        "items": [{"title": f"源: {source['title']}", "ok": True, "detail": ""},
+                                  {"title": f"范围: 第 {rng[0]} - {rng[1]} 条", "ok": True, "detail": ""},
+                                  {"title": f"目标: {dst_hint}" + (" (新建)" if will_create else ""),
+                                   "ok": True, "detail": ""}],
+                        "summary": "等待确认",
+                    }
+                    reply["pending_action"] = session["pending_action"]
+                    reply["status"] = "success"
+
+        # ---- 搜 Wiki（默认 / LLM 兜底） ----
         else:
+            # LLM 兜底：规则没覆盖的复杂指令，让豆包做一次意图分类
+            from src.importers.ai_summarizer import AISummarizer
+            ai_cfg = config_loader.get_ai_config()
+            summarizer = AISummarizer(ai_cfg)
+            llm_args = wiki_agent.llm_classify_intent(query, summarizer) if summarizer.configured() else None
+
+            if llm_args and llm_args.get("intent") and llm_args["intent"] != "search":
+                # LLM 把 query 改判到了其他意图。提示用户用更明确的话再发一次。
+                # （不直接执行，避免 LLM 误判带来的副作用）
+                target_intent = llm_args["intent"]
+                args_str = ", ".join(f"{k}={v}" for k, v in llm_args.items() if k != "intent")
+                reply["reply_text"] = (
+                    f"💡 我猜你想做的是「{target_intent}」（{args_str}）。"
+                    f"如果对，按下面建议的更明确的话再发一次，我就能直接执行：\n\n"
+                    + _intent_example_prompt(target_intent, llm_args)
+                )
+                reply["intent"] = "llm_clarify"
+                reply["status"] = "success"
+                session["history"].append({"role": "user", "content": query, "ts": int(time.time())})
+                session["history"].append({"role": "agent", "content": reply["reply_text"],
+                                            "intent": "llm_clarify", "ts": int(time.time())})
+                wiki_agent.save_session(session)
+                reply["history"] = session["history"][-10:]
+                if json_output:
+                    print(json.dumps(reply, ensure_ascii=False))
+                else:
+                    print(reply.get("reply_text") or "")
+                return
+
             sources = _search_wiki_titles(client, wiki_space_id, query, limit=5)
             # 如果是长句 + 整句 substring 匹配找不到，尝试把长句切成关键词再搜
             if not sources and len(query) > 6:
@@ -1934,6 +2089,33 @@ def cmd_agent_chat(args):
     else:
         print(f"\n[Agent · intent={reply.get('intent')}]")
         print(reply.get("reply_text") or reply.get("message") or "")
+
+
+def _intent_example_prompt(intent: str, args: Dict[str, Any]) -> str:
+    """LLM 兜底命中其他意图时，给用户一句更明确的示例话术。"""
+    if intent == "move_nodes":
+        src = args.get("target_folder", "X 目录")
+        rs, re_ = args.get("range_start", 1), args.get("range_end", 5)
+        dst = args.get("dest_folder", "Y 目录")
+        return f"  「把 {src} 目录中 {rs} 到 {re_} 的文件移到 {dst} 下」"
+    if intent == "export_md":
+        tgt = args.get("target_folder", "X")
+        return f"  「整理 {tgt} 为 .md 文档」"
+    if intent == "scan_empty":
+        return "  「找一下空节点」 或 「扫描空文档」"
+    if intent == "delete_empty":
+        return "  「删空节点」（先扫，再确认）"
+    if intent == "mark_empty":
+        return "  「标记空节点」（加 🗑[空] 前缀）"
+    if intent == "cleanup_prefix":
+        pfx = args.get("prefix", "X")
+        return f"  「按前缀删 {pfx}」"
+    if intent == "suggest":
+        return "  「给点整理建议」 或 「你觉得我的 Wiki 怎么整理」"
+    if intent == "search":
+        kw = args.get("keyword", "X")
+        return f"  「找一下 {kw} 的资料」"
+    return f"  （意图：{intent}）"
 
 
 def _extract_prefix_from_query(query: str) -> str:

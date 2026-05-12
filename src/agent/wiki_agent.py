@@ -123,6 +123,14 @@ def classify_intent(query: str, session: Dict[str, Any]) -> str:
         if any(k in q for k in ["取消", "不删", "不要", "算了", "no", "停", "放弃"]):
             return "cancel"
 
+    # 移动节点（"把 X 移到 Y / 放到 Y / 归到 Y"）
+    move_kw = ["移到", "移动到", "放到", "归到", "存放到", "存到", "迁移到", "归类到", "搬到"]
+    if any(k in q for k in move_kw):
+        return "move_nodes"
+    # 兼容："把 X 重新放在 Y 下" / "X 重新存放到 Y"
+    if "重新" in q and any(v in q for v in ["放", "存"]):
+        return "move_nodes"
+
     # 导出为 Markdown（高优先级：避免被 suggest 的"整理"误吞）
     # 规则: 出现明确的 md / markdown / .md 标识 + 任一动词（整理 / 合并 / 汇总 / 导出 / 打包 / 做成）
     has_md_token = any(t in q for t in [".md", "markdown", " md ", "md文档", "md档"]) or q.endswith("md")
@@ -153,15 +161,16 @@ def classify_intent(query: str, session: Dict[str, Any]) -> str:
     if ("批量删" in q or "全删" in q or "都删" in q) and "空" not in q:
         return "cleanup_prefix"
 
-    # 建议类（扩大触发面：很多"你觉得/重新整理/分类"的自然语言问题都路由到这里）
+    # 建议类（只在用户**明确求建议/分析**时触发，不要因为出现"目录""分类"这种泛词就吞）
     suggest_kw = [
-        "建议", "整理建议", "整理思路", "整理工作", "重新整理", "重新组织",
+        "整理建议", "整理思路", "整理工作", "重新整理", "重新组织",
         "怎么整理", "怎么分类", "怎么组织", "怎么优化",
         "如何整理", "如何分类", "如何组织", "如何优化",
-        "结构", "分类", "目录", "重组", "优化", "诊断",
         "你觉得", "你认为", "帮我看看", "帮我想想", "给建议", "提建议",
-        "提出整理", "提出思路", "提出方案",
+        "提出整理", "提出思路", "提出方案", "诊断一下", "分析一下",
     ]
+    # 注: 删去了 "建议" "结构" "分类" "目录" "重组" "优化" "诊断" 这种单字泛词，
+    # 它们出现在指令的修饰位置时（如"老巴疯啦目录"）会误路由
     if any(k in q for k in suggest_kw):
         return "suggest"
 
@@ -561,6 +570,219 @@ def ai_suggestions(
 
 
 # ---------------------------------------------------------------------------
+# 指令参数抽取
+# ---------------------------------------------------------------------------
+def parse_index_range(query: str) -> Optional[Tuple[int, int]]:
+    """
+    从 query 抽数字范围。返回 (start, end)（闭区间，1-based）。
+    支持:
+      - "13到21" / "13至21" / "13-21" / "13~21"
+      - "第 5 条到第 10 条"
+      - "前 5 条" → (1, 5)
+      - "后 3 条" → (-3, -1)   末尾负数表示"倒数 N 条"
+    注: 先去掉 YYYY-MM-DD 这种日期，避免日期数字被误当范围。
+    """
+    import re as _re
+    cleaned = _re.sub(r"\d{4}-\d{2}-\d{2}", " ", query)
+    # 直接范围: 数字-数字（前后不是更多数字以防被长 ID 切到）
+    m = _re.search(r"(?<!\d)(\d{1,3})\s*[-~到至]\s*(\d{1,3})(?!\d)", cleaned)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return (min(a, b), max(a, b))
+    # 第 N 条到第 M 条
+    m = _re.search(r"第\s*(\d{1,3})\s*[条个]?\s*到\s*第?\s*(\d{1,3})", cleaned)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return (min(a, b), max(a, b))
+    # 前 N 条
+    m = _re.search(r"前\s*(\d{1,3})\s*[条个]", cleaned)
+    if m:
+        return (1, int(m.group(1)))
+    # 后 N 条 (用负数表示从末尾)
+    m = _re.search(r"后\s*(\d{1,3})\s*[条个]", cleaned)
+    if m:
+        n = int(m.group(1))
+        return (-n, -1)
+    return None
+
+
+def parse_dest_folder(query: str) -> Optional[str]:
+    """
+    从 query 抽目标目录名。规则（按优先级，先强信号后弱信号）:
+      1) "即 XXX 新目录" / "即 XXX 目录"（最强：显式声明目标）
+      2) "移到/放到/归到/存到 XXX"（动词后的名词）
+      3) 引号 / 书名号 / 方括号包围的内容
+      4) 日期 YYYY-MM-DD（弱兜底：当上面都没匹配，常见归档场景）
+    """
+    import re as _re
+    # 1) 即 XXX 新目录
+    m = _re.search(r"即\s*([^\s,，。下]+?)\s*(?:新)?(?:目录|文件夹)", query)
+    if m:
+        return m.group(1).strip()
+    # 2) 移到/放到 等动词带目的地
+    m = _re.search(
+        r"(?:移到|移动到|放到|归到|存放到|存到|迁移到|搬到|放在)\s*"
+        r"[\"「『]?([^\"「』」\s,，。！\?]{2,30})[\"」』]?\s*(?:下|里|中|内)?",
+        query,
+    )
+    if m:
+        return m.group(1).strip().rstrip("下里中内")
+    # 3) 引号包围
+    for pattern in [r"[「『]([^」』]+)[」』]", r"\"([^\"]+)\"", r"\[([^\]]+)\]"]:
+        m = _re.search(pattern, query)
+        if m:
+            return m.group(1).strip()
+    # 4) 日期（弱兜底）
+    m = _re.search(r"\d{4}-\d{2}-\d{2}", query)
+    if m:
+        return m.group(0)
+    return None
+
+
+def parse_source_folder(query: str) -> Optional[str]:
+    """从 query 抽"X 目录中的"中的 X。"""
+    import re as _re
+    patterns = [
+        r"把\s*[\"「『]?([^\"「』」\s]{2,20})[\"」』]?\s*(?:目录|文件夹|专区|节点)",
+        r"在\s*[\"「『]?([^\"「』」\s]{2,20})[\"」』]?\s*(?:目录|文件夹|专区|节点)\s*(?:中|下|里|内)",
+        r"[\"「『]?([^\"「』」\s]{2,20})[\"」』]?\s*(?:目录|文件夹|专区|节点)\s*(?:中|下|里|内)",
+    ]
+    for p in patterns:
+        m = _re.search(p, query)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 移动节点
+# ---------------------------------------------------------------------------
+def move_nodes_by_index_range(
+    client,
+    wiki_space_id: str,
+    source_parent: Dict[str, Any],
+    index_range: Tuple[int, int],
+    dest_parent_node_token: str,
+) -> Dict[str, Any]:
+    """
+    把 source_parent 下索引在 [start, end] 范围内的子节点移到 dest_parent_node_token 下。
+    索引基于 ListSpaceNode 返回顺序（1-based）。
+    支持负数索引（从末尾倒数）。
+    """
+    from lark_oapi.api.wiki.v2 import (
+        ListSpaceNodeRequest,
+        MoveSpaceNodeRequest,
+        MoveSpaceNodeRequestBody,
+    )
+
+    # 1. 列源父节点的全部子节点
+    children: List[Dict[str, Any]] = []
+    page_token = None
+    for _ in range(20):
+        b = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50).parent_node_token(source_parent["node_token"])
+        if page_token:
+            b.page_token(page_token)
+        r = _sdk_call_with_retry(client.wiki.v2.space_node.list, b.build())
+        if not r.success():
+            return {"moved": [], "failed": [],
+                    "error": f"列源子节点失败: {r.code} {r.msg}"}
+        for it in (getattr(r.data, "items", None) or []):
+            children.append({
+                "title": getattr(it, "title", "") or "(未命名)",
+                "node_token": it.node_token,
+            })
+        if not getattr(r.data, "has_more", False):
+            break
+        page_token = getattr(r.data, "page_token", None)
+        if not page_token:
+            break
+
+    if not children:
+        return {"moved": [], "failed": [], "error": "源目录下没有子节点"}
+
+    # 2. 解析范围（支持负数）
+    total = len(children)
+    start, end = index_range
+    if start < 0:
+        start = max(1, total + start + 1)
+    if end < 0:
+        end = total + end + 1
+    start = max(1, start)
+    end = min(total, end)
+    if start > end:
+        return {"moved": [], "failed": [], "error": f"范围无效 [{start}, {end}]"}
+
+    selected = children[start - 1:end]
+    if not selected:
+        return {"moved": [], "failed": [], "error": "范围内无节点"}
+
+    # 3. 逐个 move
+    moved: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    for node in selected:
+        try:
+            body = (MoveSpaceNodeRequestBody.builder()
+                    .target_parent_token(dest_parent_node_token)
+                    .build())
+            req = (MoveSpaceNodeRequest.builder()
+                   .space_id(wiki_space_id)
+                   .node_token(node["node_token"])
+                   .request_body(body)
+                   .build())
+            r = _sdk_call_with_retry(client.wiki.v2.space_node.move, req)
+            if r.success():
+                moved.append(node)
+                logger.info(f"✅ 移动: {node['title']}")
+            else:
+                failed.append({**node, "error": f"{r.code} {r.msg}"})
+                logger.warning(f"❌ 移动失败: {node['title']} — {r.code} {r.msg}")
+        except Exception as e:
+            failed.append({**node, "error": str(e)})
+            logger.exception(f"移动异常: {node['title']}")
+        time.sleep(0.2)
+
+    return {
+        "moved": moved, "failed": failed,
+        "total_children": total,
+        "range_resolved": [start, end],
+    }
+
+
+def create_wiki_folder_node(
+    client, wiki_space_id: str, title: str, parent_node_token: Optional[str] = None
+) -> Optional[str]:
+    """在指定父节点下创建一个空 docx 节点，返回 node_token。"""
+    from lark_oapi.api.wiki.v2 import CreateSpaceNodeRequest, Node
+    body = (Node.builder()
+            .obj_type("docx")
+            .node_type("origin")
+            .title(title)
+            .build())
+    builder = (CreateSpaceNodeRequest.builder()
+               .space_id(wiki_space_id)
+               .request_body(body))
+    if parent_node_token:
+        # Node 上有 parent_node_token 字段，需要在 body 里设
+        body2 = (Node.builder()
+                 .obj_type("docx")
+                 .node_type("origin")
+                 .parent_node_token(parent_node_token)
+                 .title(title)
+                 .build())
+        builder = (CreateSpaceNodeRequest.builder()
+                   .space_id(wiki_space_id)
+                   .request_body(body2))
+    req = builder.build()
+    try:
+        r = _sdk_call_with_retry(client.wiki.v2.space_node.create, req)
+        if r.success() and r.data and r.data.node:
+            return r.data.node.node_token
+    except Exception as e:
+        logger.warning(f"create_wiki_folder_node 异常: {e}")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 导出 Wiki 子树为 Markdown
 # ---------------------------------------------------------------------------
 EXPORT_DIR = os.path.join("logs", "exports")
@@ -735,3 +957,84 @@ def export_subtree_to_md(
         "preview": md_text[:300] + ("..." if len(md_text) > 300 else ""),
         "byte_size": len(md_text.encode("utf-8")),
     }
+
+
+# ---------------------------------------------------------------------------
+# LLM 兜底意图分类 + 参数抽取
+# ---------------------------------------------------------------------------
+# 思路: 当规则的 classify_intent 路由到 "search"（兜底意图）时，可能是规则没覆盖
+# 的复杂指令。这时让豆包做一次完整的意图判断 + 参数抽取，把结果反馈给 dispatcher。
+LLM_INTENT_SYSTEM_PROMPT = """你是 Wiki 管家 Agent 的意图分类器。用户用中文给你一条指令或问题，你要判断意图并抽取参数。
+
+可选意图（intent 字段必填，只能是其中之一）：
+- search        : 查 Wiki 页面（关键词检索）
+- scan_empty    : 找空节点（正文为空的页面）
+- delete_empty  : 删空节点
+- mark_empty    : 标记空节点（标题加 🗑[空] 前缀）
+- cleanup_prefix: 按标题前缀批量删
+- suggest       : 给整理建议 / 结构分析
+- export_md     : 把某个 Wiki 子树整理成一份 .md 文档
+- move_nodes    : 把某些节点移动到另一个目录
+- confirm       : 用户在确认一个待定的操作
+- cancel        : 用户取消待定操作
+
+参数字段（按意图填，可缺）:
+- target_folder : 操作的目标父目录名（如"老巴疯啦"、"github专区"）
+- range_start   : 数字范围起始（1-based）
+- range_end     : 数字范围结束
+- dest_folder   : 目标父目录名（用于 move_nodes）
+- prefix        : 标题前缀（用于 cleanup_prefix）
+- keyword       : 搜索关键词（用于 search）
+
+返回严格 JSON，例如:
+  用户: "把老巴疯啦目录中 13 到 21 的文件移到 2026-05-13 下"
+  你: {"intent": "move_nodes", "target_folder": "老巴疯啦", "range_start": 13, "range_end": 21, "dest_folder": "2026-05-13"}
+
+  用户: "找 Claude 相关的资料"
+  你: {"intent": "search", "keyword": "Claude"}
+
+  用户: "整理老巴疯啦 2026-05-12 为 .md"
+  你: {"intent": "export_md", "target_folder": "老巴疯啦 2026-05-12"}
+
+不要解释，只返回 JSON。
+"""
+
+
+def llm_classify_intent(query: str, summarizer) -> Optional[Dict[str, Any]]:
+    """
+    返回 {intent, ...args} 或 None（豆包不可用 / 解析失败时）。
+    """
+    if not summarizer or not summarizer.configured():
+        return None
+    try:
+        # 直接调豆包 chat（不走 summarizer 的现有 reddit/repo prompt）
+        import requests as _req
+        payload = {
+            "model": summarizer.model,
+            "messages": [
+                {"role": "system", "content": LLM_INTENT_SYSTEM_PROMPT},
+                {"role": "user", "content": query},
+            ],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+        }
+        headers = {
+            "Authorization": f"Bearer {summarizer.api_key}",
+            "Content-Type": "application/json",
+        }
+        r = _req.post(
+            f"{summarizer.base_url}/chat/completions",
+            headers=headers, json=payload, timeout=60,
+        )
+        if r.status_code != 200:
+            logger.warning(f"llm_classify_intent HTTP {r.status_code}")
+            return None
+        data = r.json()
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        parsed = json.loads(content) if content else None
+        if parsed and parsed.get("intent"):
+            logger.info(f"LLM 意图分类: {parsed}")
+            return parsed
+    except Exception as e:
+        logger.warning(f"llm_classify_intent 异常: {e}")
+    return None
