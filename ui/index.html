@@ -848,10 +848,21 @@ function renderAgentReply(data) {
   } else if (data.status === 'partial' && data.intent === 'confirm') {
     extras.resultBad = data.reply_text;
   }
-  // 待确认警告
+  // 待确认警告（按 action type 动态文案）
   if (data.pending_action) {
     const n = (data.preview && data.preview.items || []).length;
-    extras.warning = `将不可恢复地删除 ${n} 个节点。确认无误请点底部「确认执行」按钮。`;
+    const type = data.pending_action.type || '';
+    let verbDesc;
+    if (type === 'delete_nodes' || type === 'cleanup_prefix') {
+      verbDesc = `将不可恢复地删除 ${n} 个节点`;
+    } else if (type === 'mark_nodes') {
+      verbDesc = `将给 ${n} 个节点的标题加 🗑[空] 前缀（可恢复，不动正文）`;
+    } else if (type === 'move_nodes') {
+      verbDesc = `将移动节点到新位置（不删内容，可再次移回）`;
+    } else {
+      verbDesc = `准备执行 ${n} 项操作`;
+    }
+    extras.warning = `${verbDesc}。确认无误请点底部「确认执行」按钮。`;
   }
   if (data.sources && data.sources.length) extras.sources = data.sources;
 

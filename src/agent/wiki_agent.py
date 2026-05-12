@@ -702,15 +702,24 @@ def move_nodes_by_index_range(
 
     # 2. 解析范围（支持负数）
     total = len(children)
-    start, end = index_range
+    orig_start, orig_end = index_range
+    start, end = orig_start, orig_end
     if start < 0:
         start = max(1, total + start + 1)
     if end < 0:
         end = total + end + 1
     start = max(1, start)
     end = min(total, end)
-    if start > end:
-        return {"moved": [], "failed": [], "error": f"范围无效 [{start}, {end}]"}
+    if start > end or end < 1:
+        sample_titles = ", ".join(c["title"][:30] for c in children[:5])
+        return {
+            "moved": [], "failed": [],
+            "error": (
+                f"源目录只有 {total} 个子节点，无法取范围 [{orig_start}, {orig_end}]。"
+                f"前 5 条标题: {sample_titles}"
+                + ("..." if total > 5 else "")
+            ),
+        }
 
     selected = children[start - 1:end]
     if not selected:

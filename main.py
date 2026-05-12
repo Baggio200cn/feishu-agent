@@ -1933,6 +1933,22 @@ def cmd_agent_chat(args):
                     reply["reply_text"] = f"找不到名为 '{src_hint}' 的目录。请确认 Wiki 里有这个父节点。"
                     reply["status"] = "success"
                 else:
+                    # 自动下钻：如果源目录直接子节点很少（≤ 3 个）且其中只有 1 个目录型，
+                    # 而 range_end > 直接子节点数，说明用户实际想操作那个目录型下的内容。
+                    direct_children = [n for n in nodes
+                                       if n.get("parent_node_token") == source["node_token"]]
+                    dir_children = [n for n in direct_children if n.get("has_child")]
+                    drill_msg = ""
+                    if (len(direct_children) <= 3 and len(dir_children) == 1
+                            and rng[1] > len(direct_children) and rng[1] > 1):
+                        old_title = source["title"]
+                        source = dir_children[0]
+                        drill_msg = (
+                            f"（提示：「{old_title}」只有 {len(direct_children)} 个直接子节点，"
+                            f"我自动下钻到唯一的子目录「{source['title']}」来取范围）"
+                        )
+                        logger.info(f"自动下钻: {old_title} → {source['title']}")
+
                     # 找或创建目标目录（dest 可以是新建的）
                     dest = wiki_agent.find_matching_parent_node(nodes, dst_hint)
                     dest_token = dest["node_token"] if dest else None
@@ -1959,8 +1975,9 @@ def cmd_agent_chat(args):
                     reply["reply_text"] = (
                         f"准备把「{source['title']}」下索引 {rng[0]}-{rng[1]} 的节点"
                         f"移动到「{dst_hint}」{create_note}。\n"
-                        f"⚠️ 这会改变 Wiki 结构（不会删内容，但移动后位置变化）。"
-                        f"回复「确认执行」继续，或「取消」放弃。"
+                        + (drill_msg + "\n" if drill_msg else "")
+                        + f"⚠️ 这会改变 Wiki 结构（不会删内容，但移动后位置变化）。"
+                        + f"回复「确认执行」继续，或「取消」放弃。"
                     )
                     reply["preview"] = {
                         "title": "即将移动",
