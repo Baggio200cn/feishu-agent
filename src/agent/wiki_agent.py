@@ -802,51 +802,91 @@ def find_matching_parent_node(
     nodes: List[Dict[str, Any]], query: str
 ) -> Optional[Dict[str, Any]]:
     """
-    在已扫好的节点列表里，找一个标题最匹配 query 的"目录型节点"（has_child=True）。
-    匹配规则:
-      1) 完全相等 → 100 分
-      2) query 是 title 的子串 → 50 分
-      3) 关键 token 匹配（日期 / 老巴疯啦 / 老巴 等）→ 30 分
-    取分数最高的那个。
+    在已扫好的节点列表里找一个标题最匹配 query 的"目录型节点"(has_child=True)。
+
+    分级匹配（高优先级先返回，不进入下一级）:
+      Tier 1  标题完全等于 query                                    → 立即返回
+      Tier 2  query 里有日期 YYYY-MM-DD，且某节点标题完全等于该日期  → 立即返回
+      Tier 3  query 里有日期，某节点标题包含该日期（取最短标题）     → 立即返回
+      Tier 4  query 里有引号/书名号/方括号包围的内容，匹配该内容    → 立即返回
+      Tier 5  query 整句是某标题的子串（query 长度 2-30）           → 立即返回
+      Tier 6  token 集合匹配（去停用词后 2-8 字中文 / 英文）         → 取最高分
     """
     import re as _re
 
-    q_lower = (query or "").lower()
-    q_tokens = set()
-    # 抽日期 YYYY-MM-DD
-    date_match = _re.search(r"\d{4}-\d{2}-\d{2}", query)
+    q = (query or "").strip()
+    q_lower = q.lower()
+    has_child_nodes = [n for n in nodes if n.get("has_child")]
+
+    if not has_child_nodes:
+        return None
+
+    # Tier 1: 完全相等
+    for n in has_child_nodes:
+        if (n.get("title") or "").strip() == q:
+            return n
+
+    # Tier 2 + 3: 日期信号最强
+    date_match = _re.search(r"\d{4}-\d{2}-\d{2}", q)
     if date_match:
-        q_tokens.add(date_match.group(0))
-    # 抽 2-8 字中文连续段
-    for m in _re.findall(r"[一-龥]{2,8}", query):
-        q_tokens.add(m)
-    # 抽英文连续段
-    for m in _re.findall(r"[A-Za-z]{2,30}", query):
+        target_date = date_match.group(0)
+        # 标题正好等于日期
+        for n in has_child_nodes:
+            if (n.get("title") or "").strip() == target_date:
+                return n
+        # 标题包含日期（取最短，最精确）
+        date_candidates = [n for n in has_child_nodes
+                           if target_date in (n.get("title") or "")]
+        if date_candidates:
+            return min(date_candidates, key=lambda x: len(x.get("title") or ""))
+
+    # Tier 4: 引号 / 书名号 / 方括号包围
+    for pattern in [r"[「『]([^」』]+)[」』]", r'"([^"]+)"', r"\[([^\]]+)\]"]:
+        m = _re.search(pattern, q)
+        if m:
+            exact = m.group(1).strip()
+            for n in has_child_nodes:
+                if (n.get("title") or "").strip() == exact:
+                    return n
+            for n in has_child_nodes:
+                if exact and exact in (n.get("title") or ""):
+                    return n
+
+    # Tier 5: 短 query 整体是标题子串
+    if q_lower and 2 <= len(q_lower) <= 30:
+        candidates = [n for n in has_child_nodes
+                      if q_lower in (n.get("title") or "").lower()]
+        if candidates:
+            return min(candidates, key=lambda x: len(x.get("title") or ""))
+
+    # Tier 6: token 模糊匹配（最后兜底，必须扣掉停用词）
+    stop_phrases = {
+        "请把", "把", "请", "目录", "文件", "整理", "文档", "下的", "里的", "中的",
+        "你理解", "你", "理解", "成单独", "单独的", "重新", "存放", "存到", "放到",
+        "我", "他", "她", "我们", "你们", "他们", "的", "了", "吗", "啊", "嗯",
+        "需要", "想要", "可以", "应该", "如何", "怎么", "什么",
+    }
+    q_tokens = set()
+    for m in _re.findall(r"[一-龥]{2,8}", q):
+        if m not in stop_phrases:
+            q_tokens.add(m)
+    for m in _re.findall(r"[A-Za-z]{3,30}", q):
         q_tokens.add(m.lower())
 
     best = None
     best_score = 0
-    for n in nodes:
-        if not n.get("has_child"):
-            # 没子节点的不是"目录"，跳过
-            continue
+    for n in has_child_nodes:
         title = (n.get("title") or "").strip()
         if not title:
             continue
-        t_lower = title.lower()
         score = 0
-        if t_lower == q_lower:
-            score = 100
-        elif q_lower and q_lower in t_lower:
-            score = 50
-        else:
-            for tok in q_tokens:
-                if tok and tok in t_lower:
-                    score += 20
+        for tok in q_tokens:
+            if tok and tok in title.lower():
+                score += 20
         if score > best_score:
             best_score = score
             best = n
-    return best if best_score >= 20 else None
+    return best if best_score >= 30 else None
 
 
 def export_subtree_to_md(
