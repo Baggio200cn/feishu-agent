@@ -46,7 +46,7 @@ class RedditImporter:
         period: str = "day",
         per_sub_fetch: int = 10,
         limit_total: int = 10,
-        top_comments: int = 3,
+        top_comments: int = 6,
     ) -> List[Dict[str, Any]]:
         """
         从所有订阅 subreddit 抓 top of {period}，合并去重排序，取前 limit_total 条。
@@ -94,7 +94,9 @@ class RedditImporter:
                 f"[Reddit] [{i}/{len(top)}] 抓评论 r/{post['subreddit']}/{post['id']}"
             )
             post["top_comments"] = self._fetch_top_comments(
-                post["subreddit"], post["id"], limit=top_comments
+                post["subreddit"], post["id"],
+                limit=top_comments,
+                post_author=post.get("author", ""),
             )
             time.sleep(0.5)
 
@@ -157,11 +159,19 @@ class RedditImporter:
         return results
 
     def _fetch_top_comments(
-        self, sub: str, post_id: str, limit: int = 3
-    ) -> List[Dict[str, str]]:
-        """拉某个帖子的高赞评论（只取顶层，深度 1）"""
+        self, sub: str, post_id: str, limit: int = 3, post_author: str = ""
+    ) -> List[Dict[str, Any]]:
+        """
+        拉某个帖子的评论（只取顶层，深度 1），返回:
+          [{author, score, body, is_stickied, is_op}, ...]
+        排序规则:
+          1) 置顶评论（is_stickied）优先
+          2) 原帖作者的顶层回复优先
+          3) 剩余按 score 降序
+        limit 是"非置顶/非 OP 高赞评论"的数量；置顶 / OP 另外额外保留（全部）。
+        """
         url = f"https://www.reddit.com/r/{sub}/comments/{post_id}.json"
-        params = {"limit": max(limit * 3, 10), "sort": "top", "depth": 1, "raw_json": 1}
+        params = {"limit": max(limit * 3, 20), "sort": "top", "depth": 1, "raw_json": 1}
 
         try:
             resp = self.session.get(url, params=params, timeout=self.timeout)
@@ -183,19 +193,34 @@ class RedditImporter:
             return []
 
         children = data[1].get("data", {}).get("children", [])
-        comments: List[Dict[str, Any]] = []
+        stickied_list: List[Dict[str, Any]] = []
+        op_list: List[Dict[str, Any]] = []
+        other_list: List[Dict[str, Any]] = []
+
         for c in children:
             if c.get("kind") != "t1":
                 continue
             cd = c.get("data", {})
             body = (cd.get("body") or "").strip()
-            if not body or body == "[deleted]" or body == "[removed]":
+            if not body or body in ("[deleted]", "[removed]"):
                 continue
-            comments.append({
-                "author": cd.get("author", ""),
+            author = cd.get("author", "") or ""
+            entry = {
+                "author": author,
                 "score": int(cd.get("score", 0) or 0),
-                "body": body[:800],  # 截断 800 字，避免 prompt 炸
-            })
-            if len(comments) >= limit:
-                break
-        return comments
+                "body": body[:1200],  # 扩到 1200 字
+                "is_stickied": bool(cd.get("stickied", False)),
+                "is_op": bool(post_author and author and author.lower() == post_author.lower()),
+            }
+            if entry["is_stickied"]:
+                stickied_list.append(entry)
+            elif entry["is_op"]:
+                op_list.append(entry)
+            else:
+                other_list.append(entry)
+
+        other_list.sort(key=lambda c: c["score"], reverse=True)
+        op_list.sort(key=lambda c: c["score"], reverse=True)
+
+        # 置顶 + OP 不计入 limit，额外保留
+        return stickied_list + op_list + other_list[:limit]

@@ -374,6 +374,83 @@ input[type="text"].text-input:focus { border-color: var(--accent); }
 .cleanup-item.ok::before { content: "✅ "; }
 .cleanup-item.fail::before { content: "❌ "; color: var(--danger); }
 
+/* ============ 对话 Agent · Wiki 管家 ============ */
+.agent-modal { width: min(94%, 640px); }
+.agent-capabilities {
+  font-size: 11px; color: var(--text-tertiary);
+  padding: 6px 12px; background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border);
+}
+.agent-conversation {
+  flex: 1; min-height: 240px; max-height: 54vh; overflow-y: auto;
+  padding: 12px;
+}
+.agent-turn { margin-bottom: 14px; }
+.agent-turn.user {
+  font-size: 12px; font-weight: 500;
+  background: var(--bg-subtle);
+  padding: 8px 10px; border-radius: var(--radius-md);
+  border-left: 3px solid var(--accent);
+}
+.agent-turn.agent {
+  font-size: 12px; line-height: 1.6;
+}
+.agent-summary {
+  font-size: 12px; color: var(--text-secondary);
+  padding: 4px 0; margin: 4px 0;
+}
+.agent-preview {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  margin-top: 8px;
+  overflow: hidden;
+}
+.agent-preview-item {
+  padding: 6px 10px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+  word-break: break-all;
+}
+.agent-preview-item:last-child { border-bottom: none; }
+.agent-preview-item.ok::before { content: "· "; color: var(--text-tertiary); }
+.agent-preview-item.fail::before { content: "✗ "; color: var(--danger); }
+.agent-preview-item .detail {
+  font-size: 11px; color: var(--text-tertiary); margin-left: 6px;
+}
+.agent-warning {
+  background: #fff7e6; color: #b7791f;
+  padding: 8px 10px; border-radius: var(--radius-md);
+  font-size: 12px; margin: 8px 0;
+  border-left: 3px solid #f6ad55;
+}
+.agent-result-ok {
+  background: #f0fdf4; color: #166534;
+  padding: 8px 10px; border-radius: var(--radius-md);
+  font-size: 12px; margin: 8px 0;
+  border-left: 3px solid #22c55e;
+}
+.agent-result-bad {
+  background: #fef2f2; color: #991b1b;
+  padding: 8px 10px; border-radius: var(--radius-md);
+  font-size: 12px; margin: 8px 0;
+  border-left: 3px solid var(--danger);
+}
+.agent-input-row {
+  display: flex; gap: 8px; padding: 10px 12px;
+  border-top: 1px solid var(--border);
+}
+.agent-input-row input { flex: 1; }
+.agent-reset-btn {
+  font-size: 11px; padding: 4px 10px;
+  background: transparent; border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); cursor: pointer;
+}
+.agent-confirm-row {
+  padding: 8px 12px; background: var(--bg-subtle);
+  border-top: 1px solid var(--border);
+  display: flex; justify-content: flex-end; gap: 8px;
+}
+
 .inline-hint {
   font-size: 11px;
   color: var(--text-tertiary);
@@ -420,8 +497,8 @@ input[type="text"].text-input:focus { border-color: var(--accent); }
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
           </div>
           <div>
-            <div class="card-title">对话助手</div>
-            <div class="card-desc">关键词检索 Wiki · 豆包 AI 中文回答</div>
+            <div class="card-title">Wiki 管家 Agent</div>
+            <div class="card-desc">搜 Wiki · 找空文档 · 删空文档 · 按前缀删 · 整理建议</div>
           </div>
         </div>
         <button class="primary" onclick="openChatModal()">打开</button>
@@ -460,6 +537,22 @@ input[type="text"].text-input:focus { border-color: var(--accent); }
         <div class="btn-row">
           <button class="small flex" onclick="runWithSpinner(this, 'run-reddit')">立即执行</button>
           <button class="small" onclick="callAction('view-reddit-result')">Wiki</button>
+          <button class="small" onclick="callAction('view-github-log')">日志</button>
+        </div>
+      </div>
+
+      <div class="card-compact">
+        <div class="card-compact-header">
+          <span class="card-compact-title">🔥 老巴疯啦</span>
+          <span class="badge idle" id="laoba-status">未执行</span>
+        </div>
+        <div class="card-compact-meta" id="laoba-meta">
+          尚未执行<br>
+          7 个垂直 subreddit + GitHub 关键词 · 五维度头脑风暴 · 09:30 触发
+        </div>
+        <div class="btn-row">
+          <button class="small flex" onclick="runWithSpinner(this, 'run-laoba')">立即执行</button>
+          <button class="small" onclick="callAction('view-laoba-wiki')">Wiki</button>
           <button class="small" onclick="callAction('view-github-log')">日志</button>
         </div>
       </div>
@@ -533,21 +626,31 @@ input[type="text"].text-input:focus { border-color: var(--accent); }
 
 <div class="toast" id="toast"></div>
 
-<!-- ============ 对话助手弹层 ============ -->
+<!-- ============ 对话 Agent · Wiki 管家 ============ -->
 <div class="modal-backdrop" id="chat-modal">
-  <div class="modal">
+  <div class="modal agent-modal">
     <div class="modal-header">
-      <span class="modal-title">对话助手 · 搜 Wiki</span>
-      <button class="modal-close" onclick="closeModal('chat-modal')">×</button>
+      <span class="modal-title">对话 Agent · Wiki 管家</span>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button class="agent-reset-btn" onclick="resetAgentSession()">新对话</button>
+        <button class="modal-close" onclick="closeModal('chat-modal')">×</button>
+      </div>
     </div>
-    <div class="modal-body">
-      <input type="text" id="chat-query" class="text-input" placeholder='输入关键词，例如"Trending 日报"或"Claude Opus 4.7"' />
-      <div class="inline-hint">豆包 AI 会基于飞书 Wiki 里的命中页面给一段中文回答</div>
-      <div id="chat-result"></div>
+    <div class="agent-capabilities">
+      🤖 Agent 能做：搜 Wiki · 找空文档 · 删空文档 · 标记空文档（🗑前缀）· 按前缀删除 · 整理建议。可连续对话。
+    </div>
+    <div class="agent-conversation" id="agent-conversation"></div>
+    <div class="agent-confirm-row" id="agent-confirm-row" style="display:none;">
+      <button onclick="cancelAgentAction()">取消</button>
+      <button class="primary" id="agent-confirm-btn" onclick="confirmAgentAction()">确认执行</button>
+    </div>
+    <div class="agent-input-row">
+      <input type="text" id="chat-query" class="text-input"
+             placeholder='用中文说指令：如"删除空文档"、"找一下 Claude 的资料"' />
+      <button class="primary" id="chat-submit-btn" onclick="submitAgent()">提问</button>
     </div>
     <div class="modal-footer">
       <button onclick="closeModal('chat-modal')">关闭</button>
-      <button class="primary" id="chat-submit-btn" onclick="submitChat()">提问</button>
     </div>
   </div>
 </div>
@@ -623,6 +726,10 @@ function updateState(state) {
     if (state.reddit.meta) document.getElementById('reddit-meta').innerHTML = state.reddit.meta;
     if (state.reddit.statusLabel) setBadge('reddit-status', state.reddit.statusLabel, state.reddit.statusType);
   }
+  if (state.laoba) {
+    if (state.laoba.meta) document.getElementById('laoba-meta').innerHTML = state.laoba.meta;
+    if (state.laoba.statusLabel) setBadge('laoba-status', state.laoba.statusLabel, state.laoba.statusType);
+  }
   if (state.scheduler) {
     if (state.scheduler.enabled !== undefined) updateScheduleUI(state.scheduler.enabled);
     if (state.scheduler.desc) document.getElementById('schedule-desc').textContent = state.scheduler.desc;
@@ -646,47 +753,189 @@ function toast(msg) {
 function openModal(id) { document.getElementById(id).classList.add('show'); }
 function closeModal(id) { document.getElementById(id).classList.remove('show'); }
 
-// ============ 对话助手 ============
+// ============ 对话 Agent · Wiki 管家 ============
+let agentSessionId = localStorage.getItem('agentSessionId') || '';
+let agentHasPending = false;
+
 function openChatModal() {
-  document.getElementById('chat-result').innerHTML = '';
   document.getElementById('chat-query').value = '';
+  if (!document.getElementById('agent-conversation').childElementCount) {
+    appendAgentTurn('agent', 'Hi，我是 Wiki 管家。想让我做什么？例如：找空文档、删空文档、按前缀删 [诊断]、搜 Claude 的资料。');
+  }
   openModal('chat-modal');
   setTimeout(() => document.getElementById('chat-query').focus(), 100);
 }
 
 document.getElementById('chat-query').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') submitChat();
+  if (e.key === 'Enter') submitAgent();
 });
 
-function submitChat() {
+function appendAgentTurn(role, text, extras) {
+  const conv = document.getElementById('agent-conversation');
+  const turn = document.createElement('div');
+  turn.className = 'agent-turn ' + role;
+  let html = '';
+  if (role === 'user') {
+    html = '🙋 ' + escapeHtml(text);
+  } else {
+    html = text ? escapeHtml(text) : '';
+  }
+  turn.innerHTML = html;
+  if (extras && extras.summary) {
+    const s = document.createElement('div');
+    s.className = 'agent-summary';
+    s.textContent = extras.summary;
+    turn.appendChild(s);
+  }
+  if (extras && extras.preview) {
+    const p = extras.preview;
+    const card = document.createElement('div');
+    card.className = 'agent-preview';
+    (p.items || []).forEach(it => {
+      const row = document.createElement('div');
+      row.className = 'agent-preview-item ' + (it.ok === false ? 'fail' : 'ok');
+      row.innerHTML = escapeHtml(it.title || '')
+        + (it.detail ? `<span class="detail">${escapeHtml(it.detail)}</span>` : '');
+      card.appendChild(row);
+    });
+    turn.appendChild(card);
+  }
+  if (extras && extras.warning) {
+    const w = document.createElement('div');
+    w.className = 'agent-warning';
+    w.innerHTML = '⚠️ ' + escapeHtml(extras.warning);
+    turn.appendChild(w);
+  }
+  if (extras && extras.resultOk) {
+    const r = document.createElement('div');
+    r.className = 'agent-result-ok';
+    r.innerHTML = '✅ ' + escapeHtml(extras.resultOk);
+    turn.appendChild(r);
+  }
+  if (extras && extras.resultBad) {
+    const r = document.createElement('div');
+    r.className = 'agent-result-bad';
+    r.innerHTML = '❌ ' + escapeHtml(extras.resultBad);
+    turn.appendChild(r);
+  }
+  if (extras && extras.sources && extras.sources.length) {
+    const lbl = document.createElement('div');
+    lbl.style.cssText = 'margin-top:6px;font-size:11px;color:var(--text-tertiary)';
+    lbl.textContent = '相关 Wiki 页面：';
+    turn.appendChild(lbl);
+    extras.sources.forEach(s => {
+      const a = document.createElement('a');
+      a.className = 'chat-source';
+      a.href = s.url;
+      a.textContent = '📄 ' + s.title;
+      a.onclick = (e) => { e.preventDefault(); openInBrowser(s.url); };
+      turn.appendChild(a);
+    });
+  }
+  conv.appendChild(turn);
+  conv.scrollTop = conv.scrollHeight;
+}
+
+function renderAgentReply(data) {
+  const extras = {};
+  if (data.preview && (data.preview.items || []).length) {
+    extras.preview = data.preview;
+    if (data.preview.summary) extras.summary = data.preview.summary;
+  }
+  // 结果 banner
+  if (data.status === 'success' && data.intent === 'confirm') {
+    extras.resultOk = data.reply_text;
+  } else if (data.status === 'partial' && data.intent === 'confirm') {
+    extras.resultBad = data.reply_text;
+  }
+  // 待确认警告（按 action type 动态文案）
+  if (data.pending_action) {
+    const n = (data.preview && data.preview.items || []).length;
+    const type = data.pending_action.type || '';
+    let verbDesc;
+    if (type === 'delete_nodes' || type === 'cleanup_prefix') {
+      verbDesc = `将不可恢复地删除 ${n} 个节点`;
+    } else if (type === 'mark_nodes') {
+      verbDesc = `将给 ${n} 个节点的标题加 🗑[空] 前缀（可恢复，不动正文）`;
+    } else if (type === 'move_nodes') {
+      verbDesc = `将移动节点到新位置（不删内容，可再次移回）`;
+    } else {
+      verbDesc = `准备执行 ${n} 项操作`;
+    }
+    extras.warning = `${verbDesc}。确认无误请点底部「确认执行」按钮。`;
+  }
+  if (data.sources && data.sources.length) extras.sources = data.sources;
+
+  const text = (extras.resultOk || extras.resultBad) ? '' : (data.reply_text || data.message || '');
+  appendAgentTurn('agent', text, extras);
+
+  // 控制底部确认栏
+  agentHasPending = !!data.pending_action;
+  document.getElementById('agent-confirm-row').style.display = agentHasPending ? 'flex' : 'none';
+}
+
+function submitAgent() {
   const q = document.getElementById('chat-query').value.trim();
-  if (!q) { toast('请输入关键词'); return; }
+  if (!q) { toast('请输入指令或问题'); return; }
   const btn = document.getElementById('chat-submit-btn');
-  const resultEl = document.getElementById('chat-result');
+  const input = document.getElementById('chat-query');
+  appendAgentTurn('user', q);
+  input.value = '';
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>思考中…';
-  resultEl.innerHTML = '<div class="inline-hint">调用豆包中，约需 5-30 秒…</div>';
 
-  callAction('open-chat', { query: q }).then(result => {
+  callAction('agent-chat', { query: q, session: agentSessionId }).then(result => {
     btn.disabled = false;
     btn.innerHTML = '提问';
-    if (!result || !result.chat) {
-      resultEl.innerHTML = `<div class="chat-answer">⚠️ ${result && result.message || '调用失败'}</div>`;
+    if (!result || !result.agent) {
+      appendAgentTurn('agent', '⚠️ ' + ((result && result.message) || '调用失败'));
       return;
     }
-    const c = result.chat;
-    let html = '';
-    if (c.answer) html += `<div class="chat-answer">${escapeHtml(c.answer)}</div>`;
-    if (c.sources && c.sources.length) {
-      html += '<div style="margin-top:8px;font-size:12px;color:var(--text-tertiary)">相关 Wiki 页面：</div>';
-      c.sources.forEach(s => {
-        html += `<a class="chat-source" href="${s.url}" onclick="event.preventDefault(); openInBrowser('${s.url}')">📄 ${escapeHtml(s.title)}</a>`;
-      });
+    const data = result.agent;
+    if (data.session_id) {
+      agentSessionId = data.session_id;
+      localStorage.setItem('agentSessionId', agentSessionId);
     }
-    if (c.message && c.status === 'error') {
-      html += `<div class="chat-answer" style="color:var(--danger)">⚠️ ${escapeHtml(c.message)}</div>`;
+    renderAgentReply(data);
+  });
+}
+
+function confirmAgentAction() {
+  // 发送"确认执行"触发后端执行 pending_action
+  const btn = document.getElementById('agent-confirm-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>执行中…';
+  appendAgentTurn('user', '确认执行');
+  callAction('agent-chat', { query: '确认执行', session: agentSessionId }).then(result => {
+    btn.disabled = false;
+    btn.innerHTML = '确认执行';
+    if (!result || !result.agent) {
+      appendAgentTurn('agent', '⚠️ ' + ((result && result.message) || '执行失败'));
+      document.getElementById('agent-confirm-row').style.display = 'none';
+      agentHasPending = false;
+      return;
     }
-    resultEl.innerHTML = html;
+    renderAgentReply(result.agent);
+  });
+}
+
+function cancelAgentAction() {
+  appendAgentTurn('user', '取消');
+  callAction('agent-chat', { query: '取消', session: agentSessionId }).then(result => {
+    if (result && result.agent) renderAgentReply(result.agent);
+    else {
+      agentHasPending = false;
+      document.getElementById('agent-confirm-row').style.display = 'none';
+    }
+  });
+}
+
+function resetAgentSession() {
+  callAction('agent-chat', { session: agentSessionId, reset: true }).then(() => {
+    document.getElementById('agent-conversation').innerHTML = '';
+    document.getElementById('agent-confirm-row').style.display = 'none';
+    agentHasPending = false;
+    appendAgentTurn('agent', '会话已重置。换个话题吧～');
   });
 }
 

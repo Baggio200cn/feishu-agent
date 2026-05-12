@@ -10,6 +10,7 @@ const PID_FILE = path.join(REPO_ROOT, 'logs', 'scheduler.pid');
 const GITHUB_LAST_RUN = path.join(REPO_ROOT, 'logs', 'github_last_run.json');
 const GITHUB_INDEX = path.join(REPO_ROOT, 'logs', 'github_imported.json');
 const REDDIT_LAST_RUN = path.join(REPO_ROOT, 'logs', 'reddit_last_run.json');
+const LAOBA_LAST_RUN = path.join(REPO_ROOT, 'logs', 'laoba_feng_last_run.json');
 const FEISHU_AGENT_LOG = path.join(REPO_ROOT, 'logs', 'feishu_agent.log');
 
 let mainWindow;
@@ -248,6 +249,37 @@ function buildUiState() {
     redditStatus = { label: '未执行', type: 'idle' };
   }
 
+  // ---------- 老巴疯啦卡片 ----------
+  const laobaLast = readJsonFile(LAOBA_LAST_RUN, null);
+  let laobaMeta;
+  let laobaStatus;
+  if (laobaLast) {
+    const atLine = `上次 · ${fmtTime(laobaLast.at)}`;
+    let countLine;
+    if (laobaLast.status === 'error') {
+      countLine = `失败：${(laobaLast.message || '').slice(0, 60) || '未知错误'}`;
+    } else if (laobaLast.status === 'disabled') {
+      countLine = '已禁用（credentials.json 里 laoba_feng.enabled=false）';
+    } else {
+      const fr = laobaLast.fetched_reddit || 0;
+      const fg = laobaLast.fetched_github || 0;
+      const summ = laobaLast.summarized || 0;
+      const aiFailed = laobaLast.ai_failed || 0;
+      const created = laobaLast.pages_created || 0;
+      countLine = `Reddit ${fr} + GH ${fg} · 摘要 ${summ} · 失败 ${aiFailed} · 新建页 ${created}`;
+    }
+    const nextLine = nextRuns.laoba_feng ? `下次 · ${fmtTime(nextRuns.laoba_feng)}` : '';
+    laobaMeta = nextLine ? `${atLine}<br>${countLine}<br>${nextLine}` : `${atLine}<br>${countLine}`;
+    if (laobaLast.status === 'success') laobaStatus = { label: '成功', type: 'success' };
+    else if (laobaLast.status === 'partial') laobaStatus = { label: '部分完成', type: 'warning' };
+    else if (laobaLast.status === 'disabled') laobaStatus = { label: '已禁用', type: 'idle' };
+    else laobaStatus = { label: '失败', type: 'danger' };
+  } else {
+    const nextLine = nextRuns.laoba_feng ? `下次 · ${fmtTime(nextRuns.laoba_feng)}` : '默认 09:30';
+    laobaMeta = `尚未执行<br>${nextLine}<br>7 sub + GH 关键词 · 五维度头脑风暴`;
+    laobaStatus = { label: '未执行', type: 'idle' };
+  }
+
   return {
     scheduler: {
       enabled: !!sched.running,
@@ -264,6 +296,11 @@ function buildUiState() {
       meta: redditMeta,
       statusLabel: redditStatus.label,
       statusType: redditStatus.type,
+    },
+    laoba: {
+      meta: laobaMeta,
+      statusLabel: laobaStatus.label,
+      statusType: laobaStatus.type,
     },
   };
 }
@@ -292,7 +329,7 @@ function openLocalFile(filePath) {
  * 会自动继承。UI 不再强制任何值，让用户在启动前控制即可。
  */
 const actionDispatch = {
-  // 对话助手：把 query 发给 Python，等 JSON 回来
+  // 旧的单轮对话助手（保留兼容）
   'open-chat': async (params) => {
     const query = (params && params.query) ? String(params.query) : '';
     if (!query.trim()) {
@@ -311,6 +348,40 @@ const actionDispatch = {
       message: data.status === 'success' ? '回答已生成' : (data.message || '部分完成'),
       chat: data,
     };
+  },
+
+  // Wiki 管家 Agent（多轮 + 意图路由 + 预览确认）
+  'agent-chat': async (params) => {
+    const query = (params && params.query) ? String(params.query) : '';
+    const session = (params && params.session) ? String(params.session) : '';
+    const reset = !!(params && params.reset);
+    const argv = ['agent-chat', '--json'];
+    if (session) { argv.push('--session', session); }
+    if (reset) { argv.push('--reset'); }
+    else if (query) { argv.push('--query', query); }
+    else { return { ok: false, message: '请输入指令' }; }
+
+    const res = await runPython(argv);
+    if (!res.ok) {
+      return { ok: false, message: `Agent 调用失败（退出码 ${res.code}）`, stderr: res.stderr };
+    }
+    const data = extractJsonFromStdout(res.stdout);
+    if (!data) {
+      return { ok: false, message: '未解析到 JSON 输出', stdout: res.stdout };
+    }
+    // 不设 message，避免弹层里每轮都被 toast 重复提示
+    return {
+      ok: data.status === 'success' || data.status === 'partial',
+      agent: data,
+    };
+  },
+
+  // 浏览器打开链接
+  'view-url': async (params) => {
+    const url = (params && params.url) ? String(params.url) : '';
+    if (!url) return { ok: false, message: '缺少 url' };
+    openExternalUrl(url);
+    return { ok: true, message: '已打开链接' };
   },
 
   'run-github': async () => {
@@ -352,6 +423,23 @@ const actionDispatch = {
     const url = data && data.wiki_url;
     if (url) { openExternalUrl(url); return { message: '已打开 Reddit 日报' }; }
     return { message: 'Reddit 日报还没生成，先点"立即执行"' };
+  },
+
+  'run-laoba': async () => {
+    const res = await runPython(['import-laoba-feng']);
+    pushState();
+    return {
+      message: res.ok ? '老巴疯啦抓取完成' : `老巴疯啦失败（退出码 ${res.code}）`,
+      stdout: res.stdout,
+      stderr: res.stderr,
+    };
+  },
+
+  'view-laoba-wiki': async () => {
+    const data = readJsonFile(LAOBA_LAST_RUN, null);
+    const url = data && data.wiki_url;
+    if (url) { openExternalUrl(url); return { message: '已打开老巴疯啦日报' }; }
+    return { message: '老巴疯啦还没生成，先点"立即执行"' };
   },
 
   'preview-wiki': async () => {

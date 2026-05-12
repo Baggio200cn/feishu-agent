@@ -7,7 +7,35 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+import requests as _requests_mod
+
 logger = logging.getLogger(__name__)
+
+# SDK / HTTP 调用的网络重试（SSL 握手异常、连接被切等）
+_RETRY_EXCEPTIONS = (
+    _requests_mod.exceptions.SSLError,
+    _requests_mod.exceptions.ConnectionError,
+    _requests_mod.exceptions.Timeout,
+)
+_RETRY_BACKOFF = (1.5, 3.5, 7.0)
+
+
+def _sdk_retry(fn, *args, **kwargs):
+    """给 lark-oapi SDK 调用套重试（SSL/Connection/Timeout 最多 3 次）。"""
+    last = None
+    for attempt, delay in enumerate([0.0, *_RETRY_BACKOFF]):
+        if delay:
+            time.sleep(delay)
+        try:
+            return fn(*args, **kwargs)
+        except _RETRY_EXCEPTIONS as e:
+            last = e
+            logger.warning(
+                f"[writer] SDK 调用第 {attempt+1} 次失败: {type(e).__name__} {str(e)[:160]}"
+            )
+            continue
+    if last:
+        raise last
 
 # 飞书文档 Block 类型常量
 BLOCK_PAGE = 1
@@ -221,7 +249,7 @@ class FeishuDocWriter:
                 .request_body(node_builder.build())
                 .build()
             )
-            resp = self._client.wiki.v2.space_node.create(req)
+            resp = _sdk_retry(self._client.wiki.v2.space_node.create, req)
             if not resp.success():
                 logger.warning(f"创建 Wiki 页面失败: {resp.code} {resp.msg}")
                 return None
@@ -265,7 +293,7 @@ class FeishuDocWriter:
                     .request_body(body)
                     .build()
                 )
-                resp = self._client.docx.v1.document_block_children.create(req)
+                resp = _sdk_retry(self._client.docx.v1.document_block_children.create, req)
                 if not resp.success():
                     raw_body = ""
                     try:
@@ -308,7 +336,7 @@ class FeishuDocWriter:
                 builder.parent_node_token(parent_node_token)
             if page_token:
                 builder.page_token(page_token)
-            resp = self._client.wiki.v2.space_node.list(builder.build())
+            resp = _sdk_retry(self._client.wiki.v2.space_node.list, builder.build())
             if not resp.success():
                 logger.warning(f"查询节点失败: {resp.code} {resp.msg}")
                 return None
@@ -493,7 +521,7 @@ class FeishuDocWriter:
                 .request_body(node_builder.build())
                 .build()
             )
-            resp = self._client.wiki.v2.space_node.create(req)
+            resp = _sdk_retry(self._client.wiki.v2.space_node.create, req)
             if not resp.success():
                 logger.error(f"创建节点 '{title}' 失败: {resp.code} {resp.msg}")
                 return None, None
@@ -804,16 +832,267 @@ class FeishuDocWriter:
         for paragraph in self._split_paragraphs(detail):
             blocks.append(self._text_block(paragraph))
 
-        # 精选评论
+        # 精选评论（分三组：置顶 / OP 作者补充 / 高赞质疑）
         if top_comments:
+            stickied = [c for c in top_comments if c.get("is_stickied")]
+            op_supps = [c for c in top_comments if c.get("is_op") and not c.get("is_stickied")]
+            regular = [c for c in top_comments if not c.get("is_stickied") and not c.get("is_op")]
+
+            def _render_group(title: str, entries: List[Dict], prefix_emoji: str):
+                if not entries:
+                    return
+                blocks.append(self._divider())
+                blocks.append(self._h2_block(f"{title}（{len(entries)}）"))
+                for c in entries:
+                    author_c = c.get("author", "?")
+                    score_c = c.get("score", 0)
+                    body = (c.get("body") or "").strip()
+                    blocks.append(self._h3_block(f"{prefix_emoji} {score_c} · u/{author_c}"))
+                    for paragraph in self._split_paragraphs(body):
+                        blocks.append(self._text_block(paragraph))
+
+            _render_group("📌 置顶评论", stickied, "📌")
+            _render_group("✍️ 作者 OP 补充", op_supps, "✍️")
+            _render_group("💬 高赞讨论 / 质疑观点", regular, "⬆️")
+
+        return blocks
+
+    # ========================================================================
+    # 老巴疯啦：灵感发散日报
+    # ========================================================================
+    def write_daily_laoba_feng_report(
+        self,
+        items_with_summary: List[Dict[str, Any]],
+        parent_folder_title: str = "老巴疯啦",
+        date_str: Optional[str] = None,
+        auto_create_parent: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        老巴疯啦日报结构:
+        老巴疯啦/
+          老巴疯啦 YYYY-MM-DD/
+            1. [reddit/sub] <title>
+            2. [github] <full_name>
+            ...
+
+        items_with_summary 元素:
+          {
+            "source_type": "reddit" | "github",
+            "raw": {...原始字段...},
+            "summary": {one_liner, dim_a_freight_bd, dim_b_content_disruption,
+                        dim_zoom, dim_invert, laoba_verdict},
+            "summary_ok": bool,
+          }
+        """
+        if not items_with_summary:
+            logger.warning("老巴疯啦日报内容为空，跳过")
+            return None
+
+        date_str = date_str or datetime.now().strftime("%Y-%m-%d")
+        folder_title = f"老巴疯啦 {date_str}"
+
+        parent_token = self.find_node_by_title(parent_folder_title)
+        if not parent_token:
+            if not auto_create_parent:
+                logger.error(f"父节点 '{parent_folder_title}' 不存在")
+                return None
+            logger.warning(f"父节点 '{parent_folder_title}' 不存在，自动在空间根下创建")
+            parent_token, _ = self._create_wiki_node(
+                title=parent_folder_title,
+                parent_node_token=None,
+                blocks=[
+                    self._h1_block(parent_folder_title),
+                    self._text_block(
+                        "老巴每天从外网捞素材做的五维头脑风暴。"
+                        "服务两个北极星：A=货代 BD agent，B=颠覆内容消费（B1/B2/B7）。"
+                    ),
+                ],
+            )
+            if not parent_token:
+                logger.error(f"自动创建父节点 '{parent_folder_title}' 失败")
+                return None
+            logger.info(f"✅ 自动创建父节点: {parent_folder_title}")
+
+        folder_token = self.find_node_by_title(folder_title, parent_node_token=parent_token)
+        folder_created = False
+        if folder_token:
+            logger.info(f"当日老巴文件夹已存在，续跑: {folder_title}")
+        else:
+            folder_token, _ = self._create_wiki_node(
+                title=folder_title,
+                parent_node_token=parent_token,
+                blocks=self._build_laoba_folder_cover_blocks(items_with_summary, date_str),
+            )
+            if not folder_token:
+                logger.error(f"创建老巴疯啦日报文件夹失败: {folder_title}")
+                return None
+            folder_created = True
+            logger.info(f"✅ 老巴疯啦日报文件夹已创建: {folder_title}")
+
+        item_pages: List[Dict[str, Any]] = []
+        created_count = 0
+        skipped_count = 0
+
+        for idx, item in enumerate(items_with_summary, 1):
+            source_type = item.get("source_type", "reddit")
+            raw = item.get("raw", {})
+            summary = item.get("summary") or {}
+
+            if source_type == "reddit":
+                sub = raw.get("subreddit", "?")
+                raw_title = raw.get("title", f"unknown-{idx}")
+                truncated = raw_title if len(raw_title) <= 70 else raw_title[:67] + "..."
+                page_title = f"{idx}. [r/{sub}] {truncated}"
+            else:
+                raw_title = raw.get("full_name", f"unknown-{idx}")
+                page_title = f"{idx}. [GH] {raw_title}"
+
+            page_title = re.sub(r"[\\/:*?\"<>|]", " ", page_title)[:80]
+
+            existing = self.find_node_by_title(page_title, parent_node_token=folder_token)
+            if existing:
+                logger.info(f"  [{idx}/{len(items_with_summary)}] 跳过（已存在）: {page_title[:50]}")
+                item_pages.append({
+                    "title": page_title,
+                    "url": f"https://open.feishu.cn/wiki/{existing}",
+                    "created": False,
+                })
+                skipped_count += 1
+                continue
+
+            child_token, _ = self._create_wiki_node(
+                title=page_title,
+                parent_node_token=folder_token,
+                blocks=self._build_single_laoba_item_blocks(source_type, raw, summary),
+            )
+            if child_token:
+                item_pages.append({
+                    "title": page_title,
+                    "url": f"https://open.feishu.cn/wiki/{child_token}",
+                    "created": True,
+                })
+                created_count += 1
+                logger.info(f"  [{idx}/{len(items_with_summary)}] 已创建: {page_title[:50]}")
+            else:
+                item_pages.append({"title": page_title, "url": "", "created": False})
+                logger.warning(f"  [{idx}/{len(items_with_summary)}] 创建失败: {page_title[:50]}")
+
+        folder_url = f"https://open.feishu.cn/wiki/{folder_token}"
+        logger.info(
+            f"老巴疯啦日报完成: 文件夹 {'新建' if folder_created else '续跑'} · "
+            f"新建 {created_count} 页 · 跳过 {skipped_count} 页"
+        )
+
+        return {
+            "folder_url": folder_url,
+            "folder_token": folder_token,
+            "repo_pages": item_pages,
+            "created_count": created_count,
+            "skipped_count": skipped_count,
+        }
+
+    def _build_laoba_folder_cover_blocks(
+        self, items_with_summary: List[Dict[str, Any]], date_str: str
+    ) -> List[Dict[str, Any]]:
+        """老巴日报封面页：每条一行 one_liner + 顶部精选 3 条"""
+        blocks: List[Dict[str, Any]] = []
+        blocks.append(self._h1_block(f"老巴疯啦 · {date_str}"))
+        blocks.append(self._text_block(
+            f"老巴今天从外网捞了 {len(items_with_summary)} 条素材，每条做了五维头脑风暴："
+            f"对货代 BD agent 启发 · 对颠覆内容消费启发 · 放大缩小 · 反向假设 · 老巴疯判断。"
+        ))
+        blocks.append(self._divider())
+
+        # 顶部精选：one_liner 里挑出'判断为能成/有戏'的前 3 条（简易过滤）
+        verdict_keywords = ["能成", "有戏", "必爆", "稳了", "可以试"]
+        picks = [
+            it for it in items_with_summary
+            if any(k in (it.get("summary") or {}).get("laoba_verdict", "") for k in verdict_keywords)
+        ][:3]
+        if picks:
+            blocks.append(self._h2_block("🔥 老巴今日精选 Top 3"))
+            for it in picks:
+                s = it.get("summary") or {}
+                line = f"· {s.get('one_liner', '(无)')}  |  {s.get('laoba_verdict', '')[:40]}"
+                blocks.append(self._text_block(line))
             blocks.append(self._divider())
-            blocks.append(self._h2_block(f"精选评论（Top {len(top_comments)}）"))
-            for c in top_comments:
-                author_c = c.get("author", "?")
-                score_c = c.get("score", 0)
-                body = (c.get("body") or "").strip()
-                blocks.append(self._h3_block(f"⬆️ {score_c} · u/{author_c}"))
-                for paragraph in self._split_paragraphs(body):
-                    blocks.append(self._text_block(paragraph))
+
+        blocks.append(self._h2_block("📋 今日全部素材一句话清单"))
+        for idx, it in enumerate(items_with_summary, 1):
+            s = it.get("summary") or {}
+            raw = it.get("raw") or {}
+            src_tag = (
+                f"r/{raw.get('subreddit','?')}" if it.get("source_type") == "reddit"
+                else f"GH/{raw.get('full_name','?')}"
+            )
+            line = f"{idx}. [{src_tag}] {s.get('one_liner', '(摘要失败)')}"
+            blocks.append(self._text_block(line))
+        return blocks
+
+    def _build_single_laoba_item_blocks(
+        self, source_type: str, raw: Dict[str, Any], summary: Dict[str, str]
+    ) -> List[Dict[str, Any]]:
+        """单条素材子页：原内容元数据 + 5 维度 H2"""
+        blocks: List[Dict[str, Any]] = []
+
+        # 标题 + 一句话
+        if source_type == "reddit":
+            title = raw.get("title", "")
+            sub = raw.get("subreddit", "?")
+            author = raw.get("author", "?")
+            score = raw.get("score", 0)
+            num_comments = raw.get("num_comments", 0)
+            permalink = raw.get("permalink", "")
+            blocks.append(self._h1_block(title))
+            blocks.append(self._text_block(
+                f"📍 r/{sub}  ·  作者 u/{author}  ·  ⬆️ {score}  ·  💬 {num_comments}"
+            ))
+            if permalink:
+                blocks.append(self._text_block(f"原帖: {permalink}"))
+        else:
+            full_name = raw.get("full_name", "")
+            stars_total = raw.get("stars_total", 0)
+            stars_today = raw.get("stars_today", 0)
+            language = raw.get("language", "?")
+            blocks.append(self._h1_block(full_name))
+            blocks.append(self._text_block(
+                f"⭐ 总 {stars_total}  ·  今日 +{stars_today}  ·  语言 {language}"
+            ))
+            blocks.append(self._text_block(f"https://github.com/{full_name}"))
+
+        # 老巴一句话
+        if summary.get("one_liner"):
+            blocks.append(self._divider())
+            blocks.append(self._h2_block("🎯 老巴一句话"))
+            blocks.append(self._text_block(summary["one_liner"]))
+
+        # 五维度
+        dim_map = [
+            ("dim_a_freight_bd", "📦 维度 A · 对货代 BD agent 启发"),
+            ("dim_b_content_disruption", "🎬 维度 B · 对颠覆内容消费启发（B1/B2/B7）"),
+            ("dim_zoom", "🔭 维度 · 放大 100 倍 / 缩小 100 倍"),
+            ("dim_invert", "🔄 维度 · 反过来做"),
+            ("laoba_verdict", "🔥 老巴的疯狂判断"),
+        ]
+        for key, heading in dim_map:
+            content = (summary.get(key) or "").strip()
+            if not content:
+                continue
+            blocks.append(self._divider())
+            blocks.append(self._h2_block(heading))
+            for paragraph in self._split_paragraphs(content):
+                blocks.append(self._text_block(paragraph))
+
+        # 原文摘要（便于核对）
+        body = ""
+        if source_type == "reddit":
+            body = (raw.get("selftext") or "").strip()
+        else:
+            body = (raw.get("description") or "").strip()
+        if body:
+            blocks.append(self._divider())
+            blocks.append(self._h2_block("📝 原文摘要（节选）"))
+            for paragraph in self._split_paragraphs(body[:1500]):
+                blocks.append(self._text_block(paragraph))
 
         return blocks

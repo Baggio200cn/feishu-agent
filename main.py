@@ -20,7 +20,27 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional
+
+# ============================================================================
+# 代理豁免：飞书 / 豆包 的 API 域名在中国大陆直连即可，走 VPN/代理（如 Veee）
+# 反而会因 TLS 劫持报 SSLEOFError。这里把它们加进 NO_PROXY，requests 和
+# urllib3 会自动绕过 HTTP_PROXY / HTTPS_PROXY 对这些域名的代理。
+# 用户已有的 NO_PROXY 会保留合并。
+# ============================================================================
+# 注意：Reddit (www.reddit.com) 在中国大陆**需要**挂 VPN 才能通，这里不能加豁免
+_DIRECT_HOSTS = [
+    "open.feishu.cn",
+    "open.larkoffice.com",
+    "ark.cn-beijing.volces.com",        # 豆包（火山方舟）
+    "ark-cn-beijing.volces.com",
+]
+
+_existing_np = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+_merged_np = ",".join(filter(None, [_existing_np, *_DIRECT_HOSTS]))
+os.environ["NO_PROXY"] = _merged_np
+os.environ["no_proxy"] = _merged_np
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
@@ -336,11 +356,31 @@ def _run_trending_pipeline(
     run_stats["ai_failed"] = len(items_with_summary) - run_stats["summarized"]
 
     # 3. 写飞书日报：文件夹 + N 个独立子页
-    result = writer.write_daily_trending_report(
-        items_with_summary=items_with_summary,
-        parent_folder_title=parent_folder,
-        date_str=date_str,
-    )
+    try:
+        result = writer.write_daily_trending_report(
+            items_with_summary=items_with_summary,
+            parent_folder_title=parent_folder,
+            date_str=date_str,
+        )
+    except Exception as e:
+        import requests as _req
+        is_ssl = isinstance(e, (_req.exceptions.SSLError, _req.exceptions.ConnectionError))
+        logger.exception("Wiki 写入失败")
+        if is_ssl:
+            logger.error(
+                "⚠️ 飞书 SSL 连接被切断（SSLEOFError 类）。常见原因：VPN/代理在拦截"
+                " open.feishu.cn 的 TLS。摘要已缓存到 %s，排查代理后重跑 "
+                "`python main.py import-github`，会自动续跑只写 Wiki 部分（不烧豆包）。"
+                "\n排查步骤：\n"
+                "  1. Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings' | Select ProxyEnable,ProxyServer\n"
+                "  2. netsh winhttp show proxy\n"
+                "  3. $env:HTTP_PROXY / $env:HTTPS_PROXY 是否为空",
+                cache_path,
+            )
+        run_stats["status"] = "error"
+        run_stats["message"] = f"Wiki 写入失败: {type(e).__name__} {str(e)[:200]}"
+        _write_run_stats(run_stats)
+        return
 
     if result:
         run_stats["wiki_url"] = result["folder_url"]
@@ -450,7 +490,7 @@ def cmd_import_reddit(args):
             period=reddit_cfg.get("period", "day"),
             per_sub_fetch=int(reddit_cfg.get("per_sub_fetch", 10)),
             limit_total=int(reddit_cfg.get("limit_total", 10)),
-            top_comments=int(reddit_cfg.get("top_comments", 3)),
+            top_comments=int(reddit_cfg.get("top_comments", 6)),
         )
         run_stats["fetched"] = len(posts)
         if not posts:
@@ -502,11 +542,27 @@ def cmd_import_reddit(args):
         run_stats["ai_failed"] = len(items_with_summary) - run_stats["summarized"]
 
         # 3. 写飞书日报（文件夹 + 子页）
-        result = writer.write_daily_reddit_report(
-            items_with_summary=items_with_summary,
-            parent_folder_title=parent_folder,
-            date_str=date_str,
-        )
+        try:
+            result = writer.write_daily_reddit_report(
+                items_with_summary=items_with_summary,
+                parent_folder_title=parent_folder,
+                date_str=date_str,
+            )
+        except Exception as e:
+            import requests as _req
+            is_ssl = isinstance(e, (_req.exceptions.SSLError, _req.exceptions.ConnectionError))
+            logger.exception("Reddit Wiki 写入失败")
+            if is_ssl:
+                logger.error(
+                    "⚠️ 飞书 SSL 连接被切断（SSLEOFError）。常见原因：VPN/代理在拦截"
+                    " open.feishu.cn TLS。摘要已缓存到 %s，排查代理后重跑 "
+                    "`python main.py import-reddit`，自动续跑只写 Wiki 部分。",
+                    cache_path,
+                )
+            run_stats["status"] = "error"
+            run_stats["message"] = f"Wiki 写入失败: {type(e).__name__} {str(e)[:200]}"
+            _write_run_stats(run_stats)
+            return
 
         if result:
             run_stats["wiki_url"] = result["folder_url"]
@@ -548,6 +604,241 @@ def _write_reddit_stats(stats: Dict[str, Any]) -> None:
     os.makedirs("logs", exist_ok=True)
     with open("logs/reddit_last_run.json", "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
+def _write_laoba_stats(stats: Dict[str, Any]) -> None:
+    os.makedirs("logs", exist_ok=True)
+    with open("logs/laoba_feng_last_run.json", "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
+def cmd_import_laoba_feng(args):
+    """
+    老巴疯啦：8 个垂直 subreddit + GitHub trending（关键词白名单）→
+    豆包用老巴人设做五维度头脑风暴 → 飞书 '老巴疯啦' 专区。
+    服务两个北极星: A=货代 BD agent，B=颠覆内容消费（B1/B2/B7）。
+    """
+    from datetime import datetime
+
+    from src.importers.reddit_importer import RedditImporter
+    from src.importers.github_trending import GitHubTrending
+    from src.importers.ai_summarizer import AISummarizer
+    from src.importers.feishu_doc_writer import FeishuDocWriter
+
+    run_stats: Dict[str, Any] = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "fetched_reddit": 0,
+        "fetched_github": 0,
+        "summarized": 0,
+        "ai_failed": 0,
+        "wiki_url": "",
+        "status": "error",
+        "message": "",
+    }
+
+    try:
+        creds = config_loader.load_credentials()
+        laoba_cfg = creds.get("laoba_feng", {}) or {}
+        ai_cfg = config_loader.get_ai_config()
+        wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
+
+        if not laoba_cfg.get("enabled", True):
+            msg = "老巴疯啦未启用（credentials.json 里 laoba_feng.enabled=false）"
+            logger.info(msg)
+            run_stats["status"] = "disabled"
+            run_stats["message"] = msg
+            _write_laoba_stats(run_stats)
+            return
+
+        subs = laoba_cfg.get("subreddits") or []
+        if not subs:
+            msg = "老巴疯啦 subreddit 列表为空"
+            logger.error(msg)
+            run_stats["message"] = msg
+            _write_laoba_stats(run_stats)
+            return
+
+        if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+            msg = "飞书 Wiki space_id 未配置"
+            logger.error(msg)
+            run_stats["message"] = msg
+            _write_laoba_stats(run_stats)
+            return
+
+        summarizer = AISummarizer(ai_cfg)
+        if not summarizer.configured():
+            msg = "豆包 AI 未配置，老巴疯啦摘要必须靠 AI"
+            logger.error(msg)
+            run_stats["message"] = msg
+            _write_laoba_stats(run_stats)
+            return
+
+        factory = FeishuClientFactory(creds["accounts"])
+        personal_client = factory.get_client("personal")
+        writer = FeishuDocWriter(personal_client, wiki_space_id)
+
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        parent_folder = laoba_cfg.get("parent_folder", "老巴疯啦")
+        force = getattr(args, "force", False)
+
+        # 1a. 抓 Reddit（多 sub）
+        importer = RedditImporter(
+            subreddits=subs,
+            user_agent=creds.get("reddit", {}).get("user_agent", "feishu-agent/0.1"),
+        )
+        reddit_posts = importer.fetch_daily(
+            period="day",
+            per_sub_fetch=int(laoba_cfg.get("per_sub_fetch", 5)),
+            limit_total=int(laoba_cfg.get("limit_total", 12)),
+            top_comments=int(laoba_cfg.get("top_comments", 3)),
+        )
+        run_stats["fetched_reddit"] = len(reddit_posts)
+
+        # 1b. 抓 GitHub Trending + 关键词白名单过滤
+        github_items: List[Dict[str, Any]] = []
+        gh_keywords = [k.lower() for k in (laoba_cfg.get("github_keyword_whitelist") or [])]
+        gh_limit = int(laoba_cfg.get("github_limit", 5))
+        if gh_keywords and gh_limit > 0:
+            try:
+                trending = GitHubTrending().fetch(period="daily", language="", limit=30)
+                for repo in trending:
+                    if len(github_items) >= gh_limit:
+                        break
+                    full_name = (repo.get("full_name") or "").lower()
+                    desc = (repo.get("description") or "").lower()
+                    blob = f"{full_name} {desc}"
+                    if any(k in blob for k in gh_keywords):
+                        github_items.append(repo)
+                logger.info(
+                    f"GitHub trending 抓 {len(trending)} 条，关键词命中 {len(github_items)} 条"
+                )
+            except Exception as e:
+                logger.warning(f"GitHub trending 抓取失败（继续，仅用 Reddit）: {e}")
+        run_stats["fetched_github"] = len(github_items)
+
+        if not reddit_posts and not github_items:
+            msg = "Reddit + GitHub 都抓不到（可能 VPN 断了 / 限频）"
+            logger.warning(msg)
+            run_stats["message"] = msg
+            _write_laoba_stats(run_stats)
+            return
+
+        # 2. 老巴摘要（缓存续跑：reddit 用 post.id, github 用 full_name 去重）
+        cache_path = f"logs/laoba_cache_{date_str}.json"
+        cached = _load_trending_cache(cache_path)
+        items_with_summary: List[Dict[str, Any]] = []
+        done_ids: set = set()
+        if cached and not force:
+            items_with_summary = [it for it in cached if it.get("summary_ok")]
+            for it in items_with_summary:
+                if it.get("source_type") == "reddit":
+                    rid = (it.get("raw") or {}).get("id", "")
+                    if rid:
+                        done_ids.add(f"r/{rid}")
+                else:
+                    fn = (it.get("raw") or {}).get("full_name", "")
+                    if fn:
+                        done_ids.add(f"gh/{fn}")
+            retried = len(cached) - len(items_with_summary)
+            if retried:
+                logger.info(
+                    f"老巴缓存命中 {len(done_ids)} 条成功项；{retried} 条失败项将在本次重试"
+                )
+
+        all_items: List[Dict[str, Any]] = [
+            {"source_type": "reddit", "raw": p, "key": f"r/{p.get('id','')}"}
+            for p in reddit_posts
+        ] + [
+            {"source_type": "github", "raw": r, "key": f"gh/{r.get('full_name','')}"}
+            for r in github_items
+        ]
+
+        for i, entry in enumerate(all_items, 1):
+            key = entry["key"]
+            source_type = entry["source_type"]
+            raw = entry["raw"]
+            if key in done_ids:
+                title = raw.get("title", "") if source_type == "reddit" else raw.get("full_name", "")
+                logger.info(f"[{i}/{len(all_items)}] 跳过（缓存已有）: {title[:50]}")
+                continue
+            title_log = raw.get("title", "") if source_type == "reddit" else raw.get("full_name", "")
+            logger.info(f"[{i}/{len(all_items)}] 老巴摘要 [{source_type}] {title_log[:50]}")
+            summary = summarizer.summarize_laoba_feng_item(raw, source_type=source_type)
+            summary_ok = summary is not None
+            if not summary:
+                summary = {
+                    "one_liner": title_log[:30] or "（老巴摘要失败）",
+                    "dim_a_freight_bd": "AI 摘要失败，老巴歇会儿",
+                    "dim_b_content_disruption": "",
+                    "dim_zoom": "",
+                    "dim_invert": "",
+                    "laoba_verdict": "悬",
+                }
+            items_with_summary.append({
+                "source_type": source_type,
+                "raw": raw,
+                "summary": summary,
+                "summary_ok": summary_ok,
+            })
+            _save_trending_cache(cache_path, items_with_summary)
+
+        run_stats["summarized"] = sum(1 for it in items_with_summary if it.get("summary_ok"))
+        run_stats["ai_failed"] = len(items_with_summary) - run_stats["summarized"]
+
+        # 3. 写飞书
+        try:
+            result = writer.write_daily_laoba_feng_report(
+                items_with_summary=items_with_summary,
+                parent_folder_title=parent_folder,
+                date_str=date_str,
+            )
+        except Exception as e:
+            import requests as _req
+            is_ssl = isinstance(e, (_req.exceptions.SSLError, _req.exceptions.ConnectionError))
+            logger.exception("老巴 Wiki 写入失败")
+            if is_ssl:
+                logger.error(
+                    "⚠️ 飞书 SSL 连接被切断（SSLEOFError）。摘要已缓存到 %s，"
+                    "排查代理后重跑 `python main.py import-laoba-feng` 自动续跑。",
+                    cache_path,
+                )
+            run_stats["status"] = "error"
+            run_stats["message"] = f"Wiki 写入失败: {type(e).__name__} {str(e)[:200]}"
+            _write_laoba_stats(run_stats)
+            return
+
+        if result:
+            run_stats["wiki_url"] = result["folder_url"]
+            run_stats["wiki_folder_token"] = result["folder_token"]
+            run_stats["pages_created"] = result["created_count"]
+            run_stats["pages_skipped"] = result["skipped_count"]
+            run_stats["status"] = "success" if run_stats["ai_failed"] == 0 else "partial"
+            run_stats["message"] = (
+                f"老巴写完了：{result['created_count']} 新页 + {result['skipped_count']} 跳过；"
+                f"摘要成功 {run_stats['summarized']} / 失败 {run_stats['ai_failed']}"
+            )
+            print(f"\n✅ 老巴疯啦日报: {result['folder_url']}")
+            print(
+                f"   Reddit {run_stats['fetched_reddit']} + GitHub {run_stats['fetched_github']} · "
+                f"摘要 {run_stats['summarized']} · AI失败 {run_stats['ai_failed']} · "
+                f"新建页 {result['created_count']} · 跳过 {result['skipped_count']}"
+            )
+            for p in result.get("repo_pages", []):
+                marker = "🆕" if p["created"] else "  "
+                print(f"   {marker} {p['title'][:70]}")
+                if p["url"]:
+                    print(f"        {p['url']}")
+        else:
+            run_stats["message"] = "老巴日报写入失败，可能飞书权限或节点问题"
+            logger.error(run_stats["message"])
+
+        _write_laoba_stats(run_stats)
+
+    except Exception as e:
+        logger.exception("import-laoba-feng 异常")
+        run_stats["message"] = f"异常终止: {e}"
+        _write_laoba_stats(run_stats)
+        raise
 
 
 def _run_legacy_pipeline(
@@ -853,23 +1144,27 @@ def _emit_chat_result(result: Dict[str, Any], json_output: bool) -> None:
 
 def cmd_cleanup_wiki(args):
     """
-    Wiki 清理：按标题前缀匹配批量删除空间下的节点。
+    Wiki 清理：按标题前缀 或 按 node_token 列表批量删除空间下的节点。
     **危险操作**：默认 --dry-run，只有显式加 --confirm 才真删。
+    删除路径：先试 wiki DELETE，forbidden（1061004）时兜底到 drive DELETE。
 
     用法:
-      python main.py cleanup-wiki --prefix "[诊断]"                    # 预览（安全）
-      python main.py cleanup-wiki --prefix "[诊断]" --confirm          # 真删
-      python main.py cleanup-wiki --prefix "GitHub Trending 日报 2025" --confirm
-      python main.py cleanup-wiki --json                                # UI 调用
+      python main.py cleanup-wiki --prefix "[诊断]"
+      python main.py cleanup-wiki --prefix "[诊断]" --confirm
+      python main.py cleanup-wiki --node-tokens tok1,tok2,tok3 --confirm --json
+      python main.py cleanup-wiki --json
     """
-    import argparse as _argparse
+    from src.agent import wiki_agent
 
     prefix = (getattr(args, "prefix", "") or "").strip()
+    node_tokens_raw = (getattr(args, "node_tokens", "") or "").strip()
+    node_tokens = [t.strip() for t in node_tokens_raw.split(",") if t.strip()]
     confirm = bool(getattr(args, "confirm", False))
     json_output = bool(getattr(args, "json", False))
 
     result: Dict[str, Any] = {
         "prefix": prefix,
+        "node_tokens": node_tokens,
         "dry_run": not confirm,
         "matched": [],
         "deleted": [],
@@ -878,8 +1173,8 @@ def cmd_cleanup_wiki(args):
         "message": "",
     }
 
-    if not prefix:
-        result["message"] = "必须指定 --prefix，否则拒绝（避免误删整个空间）"
+    if not prefix and not node_tokens:
+        result["message"] = "必须指定 --prefix 或 --node-tokens，避免误删整个空间"
         _emit_cleanup_result(result, json_output)
         return
 
@@ -894,90 +1189,97 @@ def cmd_cleanup_wiki(args):
         factory = FeishuClientFactory(creds["accounts"])
         client = factory.get_client("personal")
 
-        # 1. 扫顶层节点，按 title 前缀匹配
-        from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+        personal_cfg = creds["accounts"]["personal"]
+        tenant_token = wiki_agent.get_tenant_token(
+            personal_cfg.get("app_id", ""), personal_cfg.get("app_secret", "")
+        )
+        if not tenant_token:
+            result["message"] = "获取 tenant_access_token 失败，检查 app_id / app_secret"
+            _emit_cleanup_result(result, json_output)
+            return
 
-        matched_nodes: List[Dict[str, str]] = []
-        page_token = None
-        for _ in range(10):
-            builder = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50)
-            if page_token:
-                builder.page_token(page_token)
-            resp = client.wiki.v2.space_node.list(builder.build())
-            if not resp.success():
-                result["message"] = f"列节点失败: {resp.code} {resp.msg}"
-                _emit_cleanup_result(result, json_output)
-                return
-            for it in (getattr(resp.data, "items", None) or []):
-                title = getattr(it, "title", "") or ""
-                if title.startswith(prefix):
+        # 匹配目标节点
+        matched_nodes: List[Dict[str, Any]] = []
+        if node_tokens:
+            # 按 token 精确匹配，需要从树里拿到 title / obj_token / obj_type
+            all_nodes = wiki_agent.scan_wiki_tree(client, wiki_space_id)
+            by_tok = {n["node_token"]: n for n in all_nodes}
+            for tok in node_tokens:
+                n = by_tok.get(tok)
+                if n:
                     matched_nodes.append({
-                        "title": title,
-                        "node_token": it.node_token,
+                        "title": n["title"],
+                        "node_token": n["node_token"],
+                        "obj_token": n.get("obj_token", ""),
+                        "obj_type": n.get("obj_type", ""),
                     })
-            if not getattr(resp.data, "has_more", False):
-                break
-            page_token = getattr(resp.data, "page_token", None)
-            if not page_token:
-                break
+                else:
+                    matched_nodes.append({
+                        "title": "(未找到)",
+                        "node_token": tok,
+                        "obj_token": "",
+                        "obj_type": "",
+                        "not_found": True,
+                    })
+        else:
+            # 按前缀匹配，只扫一层顶层（保持原行为：前缀 delete 针对日报目录这类顶层）
+            from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+            page_token = None
+            for _ in range(10):
+                builder = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50)
+                if page_token:
+                    builder.page_token(page_token)
+                resp = client.wiki.v2.space_node.list(builder.build())
+                if not resp.success():
+                    result["message"] = f"列节点失败: {resp.code} {resp.msg}"
+                    _emit_cleanup_result(result, json_output)
+                    return
+                for it in (getattr(resp.data, "items", None) or []):
+                    title = getattr(it, "title", "") or ""
+                    if title.startswith(prefix):
+                        matched_nodes.append({
+                            "title": title,
+                            "node_token": it.node_token,
+                            "obj_token": getattr(it, "obj_token", "") or "",
+                            "obj_type": getattr(it, "obj_type", "") or "",
+                        })
+                if not getattr(resp.data, "has_more", False):
+                    break
+                page_token = getattr(resp.data, "page_token", None)
+                if not page_token:
+                    break
 
         result["matched"] = matched_nodes
 
         if not matched_nodes:
             result["status"] = "success"
-            result["message"] = f"没有标题以 '{prefix}' 开头的节点"
+            result["message"] = (
+                f"没有标题以 '{prefix}' 开头的节点" if prefix
+                else "未找到任何指定 node_token"
+            )
             _emit_cleanup_result(result, json_output)
             return
 
         if not confirm:
             result["status"] = "dry_run"
             result["message"] = (
-                f"预览模式：匹配到 {len(matched_nodes)} 个节点。"
-                f"加 --confirm 才会真删。"
+                f"预览模式：匹配到 {len(matched_nodes)} 个节点。加 --confirm 才会真删。"
             )
             _emit_cleanup_result(result, json_output)
             return
 
-        # 2. 真删 —— lark-oapi 1.5.3 没包 DeleteSpaceNode，用 raw REST
-        import requests as _requests
-
-        personal_cfg = creds["accounts"]["personal"]
-        auth_resp = _requests.post(
-            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-            json={
-                "app_id": personal_cfg.get("app_id", ""),
-                "app_secret": personal_cfg.get("app_secret", ""),
-            },
-            timeout=10,
+        # 真删（含 drive 兜底）
+        batch_result = wiki_agent.batch_delete_nodes(
+            tenant_token=tenant_token,
+            wiki_space_id=wiki_space_id,
+            targets=matched_nodes,
         )
-        auth_json = auth_resp.json() if auth_resp.status_code == 200 else {}
-        tenant_token = auth_json.get("tenant_access_token", "")
-        if not tenant_token:
-            result["message"] = f"获取 tenant_access_token 失败: {auth_json}"
-            _emit_cleanup_result(result, json_output)
-            return
-
-        headers = {"Authorization": f"Bearer {tenant_token}"}
-        for node in matched_nodes:
-            url = (
-                f"https://open.feishu.cn/open-apis/wiki/v2/spaces/"
-                f"{wiki_space_id}/nodes/{node['node_token']}"
-            )
-            try:
-                r = _requests.delete(url, headers=headers, timeout=15)
-                if r.status_code == 200 and r.json().get("code", -1) == 0:
-                    result["deleted"].append(node)
-                    logger.info(f"✅ 已删除: {node['title']}")
-                else:
-                    err = f"HTTP {r.status_code} {r.text[:200]}"
-                    result["failed"].append({**node, "error": err})
-                    logger.warning(f"删除失败 [{node['title']}]: {err}")
-            except Exception as e:
-                result["failed"].append({**node, "error": str(e)})
-                logger.exception(f"删除异常 [{node['title']}]")
-
+        result["deleted"] = batch_result["deleted"]
+        result["failed"] = batch_result["failed"]
         result["status"] = "success" if not result["failed"] else "partial"
-        result["message"] = f"删除 {len(result['deleted'])} 个，失败 {len(result['failed'])} 个"
+        result["message"] = (
+            f"删除 {len(result['deleted'])} 个，失败 {len(result['failed'])} 个"
+        )
         _emit_cleanup_result(result, json_output)
 
     except Exception as e:
@@ -992,18 +1294,908 @@ def _emit_cleanup_result(result: Dict[str, Any], json_output: bool) -> None:
     if json_output:
         print(json.dumps(result, ensure_ascii=False))
         return
-    prefix = result["prefix"]
-    print(f"\n清理目标前缀：'{prefix}'")
+    prefix = result.get("prefix") or ""
+    toks = result.get("node_tokens") or []
+    if prefix:
+        print(f"\n清理目标前缀：'{prefix}'")
+    if toks:
+        print(f"\n清理目标 node_tokens：{len(toks)} 个")
     print(f"匹配到 {len(result['matched'])} 个节点:")
     for n in result["matched"]:
-        marker = "✅" if n in result.get("deleted", []) else (
-            "❌" if any(f["node_token"] == n["node_token"] for f in result.get("failed", [])) else "·"
-        )
+        marker = "·"
+        if any(d["node_token"] == n["node_token"] for d in result.get("deleted", [])):
+            marker = "✅"
+        elif any(f["node_token"] == n["node_token"] for f in result.get("failed", [])):
+            marker = "❌"
         print(f"  {marker} {n['title']}  (token={n['node_token']})")
     if result["dry_run"]:
         print(f"\n[DRY-RUN] {result['message']}")
     else:
         print(f"\n{result['message']}")
+
+
+# ============================================================================
+# scan-empty-wiki：扫描 Wiki 树，找出正文为空的节点
+# ============================================================================
+def cmd_scan_empty_wiki(args):
+    """
+    扫全部 Wiki 节点 → 逐个读 docx 正文 → 判定空节点。
+    非 docx 类型（doc / sheet / file 等）计入 skipped。
+
+    用法:
+      python main.py scan-empty-wiki --json
+      python main.py scan-empty-wiki --threshold 5 --max 500
+    """
+    from src.agent import wiki_agent
+
+    threshold = int(getattr(args, "threshold", wiki_agent.EMPTY_BODY_CHAR_THRESHOLD)
+                    or wiki_agent.EMPTY_BODY_CHAR_THRESHOLD)
+    max_nodes = int(getattr(args, "max", wiki_agent.MAX_NODES_TO_SCAN)
+                    or wiki_agent.MAX_NODES_TO_SCAN)
+    json_output = bool(getattr(args, "json", False))
+
+    result: Dict[str, Any] = {
+        "scanned": 0,
+        "read_ok": 0,
+        "skipped": [],
+        "empty": [],
+        "body_threshold": threshold,
+        "status": "error",
+        "message": "",
+    }
+
+    try:
+        creds = config_loader.load_credentials()
+        wiki_space_id = creds["accounts"]["personal"].get("wiki_space_id", "")
+        if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+            result["message"] = "飞书 Wiki space_id 未配置"
+        else:
+            factory = FeishuClientFactory(creds["accounts"])
+            client = factory.get_client("personal")
+            personal_cfg = creds["accounts"]["personal"]
+            tenant_token = wiki_agent.get_tenant_token(
+                personal_cfg.get("app_id", ""), personal_cfg.get("app_secret", "")
+            )
+            if not tenant_token:
+                result["message"] = "获取 tenant_access_token 失败"
+            else:
+                scan = wiki_agent.detect_empty_nodes(
+                    client=client,
+                    tenant_token=tenant_token,
+                    wiki_space_id=wiki_space_id,
+                    body_threshold=threshold,
+                    max_nodes=max_nodes,
+                )
+                result.update(scan)
+                result["status"] = "success"
+                result["message"] = (
+                    f"扫 {scan['scanned']} 个 · 读到 {scan['read_ok']} 个 · "
+                    f"跳过 {len(scan['skipped'])} 个 · 真正空 {len(scan['empty'])} 个"
+                )
+    except Exception as e:
+        logger.exception("scan-empty-wiki 异常")
+        result["message"] = f"异常: {e}"
+
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    print(f"\n{result['message']}")
+    for n in result.get("empty", [])[:50]:
+        print(f"  · {n['title']}  (正文 {n.get('body_chars',0)} 字, token={n['node_token']})")
+
+
+# ============================================================================
+# agent-chat：对话式 Wiki 管家（意图路由 + 预览 + 确认执行 + 多轮会话）
+# ============================================================================
+def cmd_agent_chat(args):
+    """
+    对话 Agent · Wiki 管家。
+
+    能力: 搜 Wiki · 找空文档 · 删空文档 · 按前缀删除 · 整理建议 · 连续对话。
+    会话状态持久化在 logs/agent_sessions/{session_id}.json。
+
+    用法:
+      python main.py agent-chat --query "找空节点" --json
+      python main.py agent-chat --query "确认执行" --session sess-xxx --json
+      python main.py agent-chat --reset --session sess-xxx --json
+    """
+    from src.agent import wiki_agent
+
+    query = (getattr(args, "query", "") or "").strip()
+    session_id = (getattr(args, "session", "") or "").strip()
+    reset = bool(getattr(args, "reset", False))
+    json_output = bool(getattr(args, "json", False))
+
+    reply: Dict[str, Any] = {
+        "session_id": session_id or wiki_agent.new_session_id(),
+        "query": query,
+        "intent": "",
+        "reply_text": "",
+        "preview": None,        # {title, items: [...], summary}
+        "pending_action": None, # {id, type, params, confirm_hint}
+        "sources": [],          # 搜索结果
+        "status": "error",
+        "message": "",
+    }
+
+    # 重置会话
+    if reset:
+        session = {"id": reply["session_id"], "history": [], "pending_action": None}
+        wiki_agent.save_session(session)
+        reply.update({
+            "status": "success",
+            "intent": "reset",
+            "reply_text": "会话已重置。Agent 能做：搜 Wiki · 找空文档 · 删空文档 · 按前缀删除 · 整理建议。说句话开始吧。",
+        })
+        print(json.dumps(reply, ensure_ascii=False) if json_output else reply["reply_text"])
+        return
+
+    if not query:
+        reply["message"] = "请传入 --query"
+        print(json.dumps(reply, ensure_ascii=False) if json_output else reply["message"])
+        return
+
+    session = wiki_agent.load_session(session_id)
+    reply["session_id"] = session["id"]
+
+    try:
+        creds = config_loader.load_credentials()
+        personal_cfg = creds["accounts"]["personal"]
+        wiki_space_id = personal_cfg.get("wiki_space_id", "")
+        if not wiki_space_id or wiki_space_id == "your_personal_wiki_space_id":
+            reply["message"] = "飞书 Wiki space_id 未配置"
+            print(json.dumps(reply, ensure_ascii=False))
+            return
+
+        factory = FeishuClientFactory(creds["accounts"])
+        client = factory.get_client("personal")
+        tenant_token = wiki_agent.get_tenant_token(
+            personal_cfg.get("app_id", ""), personal_cfg.get("app_secret", "")
+        )
+        if not tenant_token:
+            reply["message"] = "获取 tenant_access_token 失败"
+            print(json.dumps(reply, ensure_ascii=False))
+            return
+
+        intent = wiki_agent.classify_intent(query, session)
+        reply["intent"] = intent
+
+        # ---- 确认执行待定动作 ----
+        if intent == "confirm":
+            pending = session.get("pending_action") or {}
+            action_type = pending.get("type")
+            params = pending.get("params") or {}
+            if not action_type:
+                reply["reply_text"] = "没有待确认的操作。"
+                reply["status"] = "success"
+            elif action_type == "delete_nodes":
+                targets = params.get("targets") or []
+                if not targets:
+                    reply["reply_text"] = "待删节点列表为空。"
+                    reply["status"] = "success"
+                else:
+                    br = wiki_agent.batch_delete_nodes(tenant_token, wiki_space_id, targets)
+                    ok = len(br["deleted"])
+                    bad = len(br["failed"])
+                    if bad == 0:
+                        reply["reply_text"] = f"本次删除完成：成功 {ok} 个。"
+                    else:
+                        # 全部/大部分失败时，给出真相 + 替代方案
+                        reply["reply_text"] = (
+                            f"删除成功 {ok} 个，失败 {bad} 个。\n\n"
+                            f"📌 原因：飞书 Wiki v2 API 没有删除节点方法，只能通过 drive 删底层 docx；"
+                            f"而个人 Wiki 下由您本人创建的 docx，应用 tenant_token 无删除权限 (1061004)。"
+                            f"这是飞书 API 硬限制，加权限也绕不过。\n\n"
+                            f"✅ 两条替代路径：\n"
+                            f"1) 说「标记空节点」让我把这些节点改名加 🗑[空] 前缀，"
+                            f"你在 Wiki UI 里肉眼排一片 🗑 批量选删；\n"
+                            f"2) 下方列出了全部直链，点进去手动删也行。"
+                        )
+                    # 失败节点附 wiki 直链
+                    failed_urls = wiki_agent.build_wiki_urls(br["failed"])
+                    reply["sources"] = failed_urls[:30]  # 超过 30 条就截断
+                    reply["preview"] = {
+                        "title": "处理结果",
+                        "items": [
+                            *[{"title": d["title"], "ok": True, "detail": "已通过 drive 删除"}
+                              for d in br["deleted"]],
+                            *[{"title": f["title"], "ok": False, "detail": (f.get("error", "")[:100])}
+                              for f in br["failed"]],
+                        ],
+                        "summary": f"成功 {ok} · 失败 {bad}",
+                    }
+                    reply["status"] = "success" if bad == 0 else "partial"
+            elif action_type == "mark_nodes":
+                targets = params.get("targets") or []
+                if not targets:
+                    reply["reply_text"] = "待标记节点为空。"
+                    reply["status"] = "success"
+                else:
+                    mr = wiki_agent.mark_node_titles(client, wiki_space_id, targets)
+                    ok = len(mr["marked"])
+                    bad = len(mr["failed"])
+                    reply["reply_text"] = (
+                        f"标记完成：{ok} 个节点已加 🗑[空] 前缀，{bad} 个失败。\n"
+                        f"现在到飞书 Wiki UI 里，搜 🗑 就能一眼圈出全部空节点，批量选中后手动删即可。"
+                    )
+                    reply["preview"] = {
+                        "title": "标记结果",
+                        "items": [
+                            *[{"title": f"{m.get('new_title','')}", "ok": True,
+                               "detail": "已改名"} for m in mr["marked"]],
+                            *[{"title": f["title"], "ok": False,
+                               "detail": f.get("error", "")} for f in mr["failed"]],
+                        ],
+                        "summary": f"成功 {ok} · 失败 {bad}",
+                    }
+                    reply["status"] = "success" if bad == 0 else "partial"
+            elif action_type == "move_nodes":
+                src_token = params.get("source_node_token")
+                src_title = params.get("source_title", "")
+                rng = params.get("range") or [1, 1]
+                dst_title = params.get("dest_title", "")
+                dst_token = params.get("dest_node_token")
+                create_dest = params.get("create_dest", False)
+                dest_parent_token = params.get("dest_parent_token")
+
+                if create_dest or not dst_token:
+                    # 先创建目标父目录（放在 source 同级，如果 source 有 parent 就用同 parent；否则空间根下）
+                    dst_token = wiki_agent.create_wiki_folder_node(
+                        client, wiki_space_id, title=dst_title,
+                        parent_node_token=dest_parent_token or None,
+                    )
+                    if not dst_token:
+                        reply["reply_text"] = (
+                            f"创建目标目录「{dst_title}」失败（可能权限不够）。"
+                            f"先到 Wiki 里手动建一个再来。"
+                        )
+                        reply["status"] = "error"
+                        session["pending_action"] = None
+                    else:
+                        logger.info(f"✅ 已建目标目录 {dst_title} token={dst_token}")
+
+                if dst_token:
+                    # 假装 source 节点是 parent 入参（move 只需要 node_token + has_child 字段）
+                    src_node = {"node_token": src_token, "title": src_title, "has_child": True}
+                    mr = wiki_agent.move_nodes_by_index_range(
+                        client, wiki_space_id, src_node,
+                        index_range=(rng[0], rng[1]),
+                        dest_parent_node_token=dst_token,
+                    )
+                    if mr.get("error"):
+                        reply["reply_text"] = f"移动失败: {mr['error']}"
+                        reply["status"] = "error"
+                    else:
+                        moved = mr["moved"]
+                        failed = mr["failed"]
+                        reply["reply_text"] = (
+                            f"✅ 移动完成：成功 {len(moved)} 个，失败 {len(failed)} 个。"
+                            f"现在「{src_title}」第 {mr['range_resolved'][0]}-{mr['range_resolved'][1]} 条"
+                            f"已搬到「{dst_title}」下。"
+                        )
+                        reply["preview"] = {
+                            "title": "移动结果",
+                            "items": [
+                                *[{"title": m["title"], "ok": True, "detail": "已移动"} for m in moved],
+                                *[{"title": f["title"], "ok": False, "detail": f.get("error", "")} for f in failed],
+                            ],
+                            "summary": f"成功 {len(moved)} · 失败 {len(failed)}",
+                        }
+                        reply["status"] = "success" if len(failed) == 0 else "partial"
+            elif action_type == "cleanup_prefix":
+                prefix = params.get("prefix", "")
+                targets = params.get("targets") or []
+                if not targets:
+                    reply["reply_text"] = f"前缀 '{prefix}' 没有匹配节点。"
+                    reply["status"] = "success"
+                else:
+                    br = wiki_agent.batch_delete_nodes(tenant_token, wiki_space_id, targets)
+                    ok = len(br["deleted"])
+                    bad = len(br["failed"])
+                    reply["reply_text"] = f"按前缀 '{prefix}' 清理完成：成功 {ok}，失败 {bad}。"
+                    reply["preview"] = {
+                        "title": "删除结果",
+                        "items": [
+                            *[{"title": d["title"], "ok": True, "detail": f"path={d.get('path','?')}"}
+                              for d in br["deleted"]],
+                            *[{"title": f["title"], "ok": False, "detail": f.get("error", "")}
+                              for f in br["failed"]],
+                        ],
+                        "summary": f"成功 {ok} · 失败 {bad}",
+                    }
+                    reply["status"] = "success" if bad == 0 else "partial"
+            session["pending_action"] = None
+
+        # ---- 取消 ----
+        elif intent == "cancel":
+            session["pending_action"] = None
+            reply["reply_text"] = "好的，已取消。没有做任何修改。"
+            reply["status"] = "success"
+
+        # ---- 找空节点（只预览） ----
+        elif intent == "scan_empty":
+            scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+            # 缓存到 session 供后续 delete_empty / mark_empty 复用
+            session["last_scan"] = {"empty": scan["empty"], "ts": int(time.time())}
+            reply["reply_text"] = (
+                f"扫 {scan['scanned']} 个 · 读到 {scan['read_ok']} 个 · "
+                f"跳过 {len(scan['skipped'])} 个（权限/类型不支持） · 真正空 {len(scan['empty'])} 个。"
+                + ("" if not scan['empty']
+                   else "\n\n如需删除，回复「删空节点」；想改名加 🗑 前缀方便手动删，回复「标记空节点」。"
+                        "（结果已缓存 5 分钟，不用等重扫）")
+            )
+            reply["preview"] = {
+                "title": "扫描结果",
+                "items": [
+                    {"title": n["title"], "ok": True,
+                     "detail": f"正文 {n.get('body_chars',0)} 字"}
+                    for n in scan["empty"]
+                ],
+                "summary": f"空节点 {len(scan['empty'])} 个",
+            }
+            reply["status"] = "success"
+
+        # ---- 删空节点（预览 + stage pending_action） ----
+        elif intent == "delete_empty":
+            # 优先复用最近 5 分钟内的扫描结果
+            cached = session.get("last_scan") or {}
+            if cached and (int(time.time()) - cached.get("ts", 0) < 300):
+                empties = cached.get("empty", [])
+                logger.info(f"复用 5 分钟内缓存的扫描结果: {len(empties)} 个空节点")
+                scan_info = f"（复用 {len(empties)} 个已缓存空节点）"
+            else:
+                scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+                empties = scan["empty"]
+                session["last_scan"] = {"empty": empties, "ts": int(time.time())}
+                scan_info = f"（新扫 {scan['scanned']} 个节点，其中 {len(empties)} 个真正空）"
+            if not empties:
+                reply["reply_text"] = (
+                    f"扫 {scan['scanned']} 个节点，没找到空节点，无需清理。"
+                )
+                reply["status"] = "success"
+            else:
+                targets = [
+                    {"title": n["title"], "node_token": n["node_token"],
+                     "obj_token": n.get("obj_token", ""), "obj_type": n.get("obj_type", "")}
+                    for n in empties
+                ]
+                session["pending_action"] = {
+                    "id": "act-" + time.strftime("%H%M%S"),
+                    "type": "delete_nodes",
+                    "params": {"targets": targets},
+                    "confirm_hint": "回复「确认执行」真删，或「取消」放弃。",
+                }
+                reply["reply_text"] = (
+                    f"找到 {len(empties)} 个空节点 {scan_info}。\n"
+                    f"⚠️ 真删路径在个人 Wiki 下通常会因飞书 API 限制失败（drive 权限不够）。"
+                    f"如果删除大面积失败，换句话说「标记空节点」——我会把标题加 🗑[空] 前缀，"
+                    f"你在 Wiki UI 里肉眼批量删。\n\n"
+                    f"确认真删请回「确认执行」，想改走标记路径回「标记空节点」，不想动回「取消」。"
+                )
+                reply["preview"] = {
+                    "title": f"即将删除 {len(empties)} 个空节点",
+                    "items": [
+                        {"title": n["title"], "ok": True,
+                         "detail": f"正文 {n.get('body_chars',0)} 字"}
+                        for n in empties
+                    ],
+                    "summary": f"共 {len(empties)} 个，删除后不可恢复",
+                }
+                reply["pending_action"] = session["pending_action"]
+                reply["status"] = "success"
+
+        # ---- 标记空节点（改名加 🗑[空] 前缀，作为真删的替代方案） ----
+        elif intent == "mark_empty":
+            # 同样优先复用缓存
+            cached = session.get("last_scan") or {}
+            if cached and (int(time.time()) - cached.get("ts", 0) < 300):
+                empties = cached.get("empty", [])
+                logger.info(f"mark_empty 复用缓存: {len(empties)} 个空节点")
+            else:
+                scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+                empties = scan["empty"]
+                session["last_scan"] = {"empty": empties, "ts": int(time.time())}
+            if not empties:
+                reply["reply_text"] = f"扫 {scan['scanned']} 个节点，没找到空节点，无需标记。"
+                reply["status"] = "success"
+            else:
+                targets = [
+                    {"title": n["title"], "node_token": n["node_token"],
+                     "obj_token": n.get("obj_token", ""), "obj_type": n.get("obj_type", "")}
+                    for n in empties
+                ]
+                session["pending_action"] = {
+                    "id": "act-" + time.strftime("%H%M%S"),
+                    "type": "mark_nodes",
+                    "params": {"targets": targets},
+                    "confirm_hint": "回复「确认执行」开始改名，或「取消」放弃。",
+                }
+                reply["reply_text"] = (
+                    f"找到 {len(empties)} 个空节点。"
+                    f"将给它们的标题加 🗑[空] 前缀（可恢复，不会删内容）。"
+                    f"这样你在 Wiki UI 里搜 🗑 就能一键圈出。回复「确认执行」或「取消」。"
+                )
+                reply["preview"] = {
+                    "title": f"即将标记 {len(empties)} 个空节点",
+                    "items": [
+                        {"title": n["title"], "ok": True,
+                         "detail": f"→ 🗑[空] {n['title']}"[:60]}
+                        for n in empties
+                    ],
+                    "summary": f"共 {len(empties)} 个（可恢复）",
+                }
+                reply["pending_action"] = session["pending_action"]
+                reply["status"] = "success"
+
+        # ---- 按前缀清理 ----
+        elif intent == "cleanup_prefix":
+            # 从 query 里抽取前缀（优先方括号/引号/「」）
+            prefix = _extract_prefix_from_query(query)
+            if not prefix:
+                reply["reply_text"] = (
+                    "请告诉我前缀。例如：「按前缀删 [诊断]」或「删除所有 GitHub Trending 日报 开头的节点」。"
+                )
+                reply["status"] = "success"
+            else:
+                # 扫顶层匹配
+                from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+                matched = []
+                page_token = None
+                for _ in range(10):
+                    b = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50)
+                    if page_token:
+                        b.page_token(page_token)
+                    r = client.wiki.v2.space_node.list(b.build())
+                    if not r.success():
+                        break
+                    for it in (getattr(r.data, "items", None) or []):
+                        t = getattr(it, "title", "") or ""
+                        if t.startswith(prefix):
+                            matched.append({
+                                "title": t,
+                                "node_token": it.node_token,
+                                "obj_token": getattr(it, "obj_token", "") or "",
+                                "obj_type": getattr(it, "obj_type", "") or "",
+                            })
+                    if not getattr(r.data, "has_more", False):
+                        break
+                    page_token = getattr(r.data, "page_token", None)
+                    if not page_token:
+                        break
+                if not matched:
+                    reply["reply_text"] = f"没有标题以 '{prefix}' 开头的顶层节点。"
+                    reply["status"] = "success"
+                else:
+                    session["pending_action"] = {
+                        "id": "act-" + time.strftime("%H%M%S"),
+                        "type": "cleanup_prefix",
+                        "params": {"prefix": prefix, "targets": matched},
+                        "confirm_hint": "回复「确认执行」真删，或「取消」放弃。",
+                    }
+                    reply["reply_text"] = (
+                        f"匹配到 {len(matched)} 个以 '{prefix}' 开头的顶层节点。"
+                        f"⚠️ 确认后将连同子页**不可恢复**地删除。回复「确认执行」或「取消」。"
+                    )
+                    reply["preview"] = {
+                        "title": f"即将删除 {len(matched)} 个节点",
+                        "items": [{"title": m["title"], "ok": True,
+                                   "detail": f"token={m['node_token'][:16]}…"} for m in matched],
+                        "summary": f"前缀 '{prefix}'",
+                    }
+                    reply["pending_action"] = session["pending_action"]
+                    reply["status"] = "success"
+
+        # ---- 导出 Wiki 子树为 Markdown ----
+        elif intent == "export_md":
+            # 1. 扫树（复用缓存的全树扫描结果不太合适，因为缓存是空节点；这里要全树）
+            nodes = wiki_agent.scan_wiki_tree(client, wiki_space_id)
+            target = wiki_agent.find_matching_parent_node(nodes, query)
+            if not target:
+                reply["reply_text"] = (
+                    f"没在 Wiki 里找到匹配的目录节点。请明确点目录名，例如：\n"
+                    f"  「整理老巴疯啦 2026-05-12 为 .md」\n"
+                    f"  「把 GitHub Trending 日报 2026-04-21 导出成 markdown」"
+                )
+                reply["status"] = "success"
+            else:
+                # 2. 执行导出
+                result = wiki_agent.export_subtree_to_md(
+                    client=client,
+                    tenant_token=tenant_token,
+                    wiki_space_id=wiki_space_id,
+                    parent_node=target,
+                )
+                reply["reply_text"] = (
+                    f"✅ 已把 「{result['parent_title']}」 下 {result['children_count']} 条子页"
+                    f"整理为 Markdown ({result['children_exported']} 条正文成功"
+                    + (f" / {len(result['skipped'])} 条跳过" if result['skipped'] else "")
+                    + f"，共 {result['byte_size']} 字节)。\n\n"
+                    f"📄 本地文件: {result['md_path']}\n"
+                    f"（直接在文件管理器里打开此路径，或回复「打开导出文件」让我用系统默认编辑器打开）"
+                )
+                reply["preview"] = {
+                    "title": "导出结果",
+                    "items": [
+                        {"title": f"📄 {result['parent_title']}.md",
+                         "ok": True,
+                         "detail": f"{result['children_exported']} 段正文 · {result['byte_size']} 字节"},
+                        *[{"title": s["title"], "ok": False, "detail": s["reason"]}
+                          for s in result["skipped"]],
+                    ],
+                    "summary": result["md_path"],
+                }
+                # 把路径存到 session 让下一轮"打开导出文件"可用
+                session["last_export_md"] = result["md_path"]
+                reply["status"] = "success"
+
+        # ---- 打开本次导出文件 ----
+        elif ("打开" in query and ("文件" in query or "md" in query.lower() or "导出" in query)) \
+             and session.get("last_export_md"):
+            import subprocess as _sp
+            import platform as _pl
+            md_path = session.get("last_export_md", "")
+            if md_path and os.path.exists(md_path):
+                try:
+                    if _pl.system() == "Windows":
+                        os.startfile(md_path)  # type: ignore
+                    elif _pl.system() == "Darwin":
+                        _sp.Popen(["open", md_path])
+                    else:
+                        _sp.Popen(["xdg-open", md_path])
+                    reply["reply_text"] = f"已请求系统打开: {md_path}"
+                except Exception as e:
+                    reply["reply_text"] = f"打开失败: {e}\n你可以手动到这个路径打开: {md_path}"
+                reply["status"] = "success"
+            else:
+                reply["reply_text"] = "找不到导出文件，请先说「整理 XX 为 .md」生成一份。"
+                reply["status"] = "success"
+            reply["intent"] = "open_export"
+
+        # ---- 整理建议 ----
+        elif intent == "suggest":
+            nodes = wiki_agent.scan_wiki_tree(client, wiki_space_id)
+            # 缓存扫描结果，复用
+            cached_scan = session.get("last_scan") or {}
+            if cached_scan and (int(time.time()) - cached_scan.get("ts", 0) < 300):
+                scan = {"empty": cached_scan.get("empty", []),
+                        "read_ok": 0, "skipped": [], "body_threshold": 8}
+            else:
+                scan = wiki_agent.detect_empty_nodes(client, tenant_token, wiki_space_id)
+                session["last_scan"] = {"empty": scan["empty"], "ts": int(time.time())}
+
+            # 先尝试豆包 LLM 版建议（基于真实树概览）
+            overview = wiki_agent.summarize_tree_for_llm(nodes)
+            ai_text = None
+            try:
+                from src.importers.ai_summarizer import AISummarizer
+                ai_cfg = config_loader.get_ai_config()
+                summarizer = AISummarizer(ai_cfg)
+                ai_text = wiki_agent.ai_suggestions(
+                    summarizer, overview, len(scan["empty"]), user_question=query
+                )
+            except Exception as e:
+                logger.warning(f"AI suggestions 调用失败: {e}")
+
+            # 规则版 fallback
+            tips = wiki_agent.generate_suggestions(nodes, scan)
+
+            if ai_text:
+                reply["reply_text"] = f"Wiki 结构分析（AI）：\n{ai_text}"
+            else:
+                reply["reply_text"] = "Wiki 结构分析：\n" + "\n".join(f"• {t}" for t in tips)
+
+            # 预览卡片：展示顶层目录概览
+            items = []
+            for f in overview["top_folders"][:15]:
+                samples = "、".join(f["sample_titles"][:3]) if f["sample_titles"] else ""
+                detail = f"{f['node_count']} 个子节点" + (f" · 样例: {samples}" if samples else "")
+                items.append({"title": f["title"], "ok": True, "detail": detail[:80]})
+            # 追加规则结论
+            for t in tips[:5]:
+                items.append({"title": "💡 " + t, "ok": True, "detail": ""})
+            reply["preview"] = {
+                "title": "整理建议",
+                "items": items,
+                "summary": f"共 {overview['total_nodes']} 节点 · 顶层 {overview['top_level_count']} · 空 {len(scan['empty'])}",
+            }
+            reply["status"] = "success"
+
+        # ---- 移动节点 ----
+        elif intent == "move_nodes":
+            from src.importers.ai_summarizer import AISummarizer
+            ai_cfg = config_loader.get_ai_config()
+            summarizer = AISummarizer(ai_cfg)
+            llm_args = wiki_agent.llm_classify_intent(query, summarizer) or {}
+
+            # 抽参数（规则优先，LLM 兜底）
+            rng = wiki_agent.parse_index_range(query)
+            if not rng and llm_args.get("range_start") and llm_args.get("range_end"):
+                rng = (int(llm_args["range_start"]), int(llm_args["range_end"]))
+
+            src_hint = wiki_agent.parse_source_folder(query) or llm_args.get("target_folder")
+            dst_hint = wiki_agent.parse_dest_folder(query) or llm_args.get("dest_folder")
+
+            if not src_hint or not rng or not dst_hint:
+                missing = []
+                if not src_hint: missing.append("源目录（如'老巴疯啦'）")
+                if not rng: missing.append("范围（如'13到21'）")
+                if not dst_hint: missing.append("目标目录（如'2026-05-13'）")
+                reply["reply_text"] = (
+                    f"我理解你想移动节点，但缺少：{' / '.join(missing)}。\n"
+                    f"完整例子：「把老巴疯啦目录中 13 到 21 的文件移到 2026-05-13 下」"
+                )
+                reply["status"] = "success"
+            else:
+                # 找源目录
+                nodes = wiki_agent.scan_wiki_tree(client, wiki_space_id)
+                source = wiki_agent.find_matching_parent_node(nodes, src_hint)
+                if not source:
+                    reply["reply_text"] = f"找不到名为 '{src_hint}' 的目录。请确认 Wiki 里有这个父节点。"
+                    reply["status"] = "success"
+                else:
+                    # 自动下钻：如果源目录直接子节点很少（≤ 3 个）且其中只有 1 个目录型，
+                    # 而 range_end > 直接子节点数，说明用户实际想操作那个目录型下的内容。
+                    direct_children = [n for n in nodes
+                                       if n.get("parent_node_token") == source["node_token"]]
+                    dir_children = [n for n in direct_children if n.get("has_child")]
+                    drill_msg = ""
+                    if (len(direct_children) <= 3 and len(dir_children) == 1
+                            and rng[1] > len(direct_children) and rng[1] > 1):
+                        old_title = source["title"]
+                        source = dir_children[0]
+                        drill_msg = (
+                            f"（提示：「{old_title}」只有 {len(direct_children)} 个直接子节点，"
+                            f"我自动下钻到唯一的子目录「{source['title']}」来取范围）"
+                        )
+                        logger.info(f"自动下钻: {old_title} → {source['title']}")
+
+                    # 找或创建目标目录（dest 可以是新建的）
+                    dest = wiki_agent.find_matching_parent_node(nodes, dst_hint)
+                    dest_token = dest["node_token"] if dest else None
+                    will_create = False
+                    if not dest_token:
+                        will_create = True
+
+                    # stage 成 pending_action 等用户确认
+                    session["pending_action"] = {
+                        "id": "act-" + time.strftime("%H%M%S"),
+                        "type": "move_nodes",
+                        "params": {
+                            "source_node_token": source["node_token"],
+                            "source_title": source["title"],
+                            "range": list(rng),
+                            "dest_title": dst_hint,
+                            "dest_node_token": dest_token,
+                            "create_dest": will_create,
+                            "dest_parent_token": source.get("parent_node_token") or None,
+                        },
+                        "confirm_hint": "回复「确认执行」开始移动，或「取消」放弃。",
+                    }
+                    create_note = "（目标目录不存在，将先创建）" if will_create else ""
+                    reply["reply_text"] = (
+                        f"准备把「{source['title']}」下索引 {rng[0]}-{rng[1]} 的节点"
+                        f"移动到「{dst_hint}」{create_note}。\n"
+                        + (drill_msg + "\n" if drill_msg else "")
+                        + f"⚠️ 这会改变 Wiki 结构（不会删内容，但移动后位置变化）。"
+                        + f"回复「确认执行」继续，或「取消」放弃。"
+                    )
+                    reply["preview"] = {
+                        "title": "即将移动",
+                        "items": [{"title": f"源: {source['title']}", "ok": True, "detail": ""},
+                                  {"title": f"范围: 第 {rng[0]} - {rng[1]} 条", "ok": True, "detail": ""},
+                                  {"title": f"目标: {dst_hint}" + (" (新建)" if will_create else ""),
+                                   "ok": True, "detail": ""}],
+                        "summary": "等待确认",
+                    }
+                    reply["pending_action"] = session["pending_action"]
+                    reply["status"] = "success"
+
+        # ---- 搜 Wiki（默认 / LLM 兜底） ----
+        else:
+            # LLM 兜底：规则没覆盖的复杂指令，让豆包做一次意图分类
+            from src.importers.ai_summarizer import AISummarizer
+            ai_cfg = config_loader.get_ai_config()
+            summarizer = AISummarizer(ai_cfg)
+            llm_args = wiki_agent.llm_classify_intent(query, summarizer) if summarizer.configured() else None
+
+            if llm_args and llm_args.get("intent") and llm_args["intent"] != "search":
+                # LLM 把 query 改判到了其他意图。提示用户用更明确的话再发一次。
+                # （不直接执行，避免 LLM 误判带来的副作用）
+                target_intent = llm_args["intent"]
+                args_str = ", ".join(f"{k}={v}" for k, v in llm_args.items() if k != "intent")
+                reply["reply_text"] = (
+                    f"💡 我猜你想做的是「{target_intent}」（{args_str}）。"
+                    f"如果对，按下面建议的更明确的话再发一次，我就能直接执行：\n\n"
+                    + _intent_example_prompt(target_intent, llm_args)
+                )
+                reply["intent"] = "llm_clarify"
+                reply["status"] = "success"
+                session["history"].append({"role": "user", "content": query, "ts": int(time.time())})
+                session["history"].append({"role": "agent", "content": reply["reply_text"],
+                                            "intent": "llm_clarify", "ts": int(time.time())})
+                wiki_agent.save_session(session)
+                reply["history"] = session["history"][-10:]
+                if json_output:
+                    print(json.dumps(reply, ensure_ascii=False))
+                else:
+                    print(reply.get("reply_text") or "")
+                return
+
+            sources = _search_wiki_titles(client, wiki_space_id, query, limit=5)
+            # 如果是长句 + 整句 substring 匹配找不到，尝试把长句切成关键词再搜
+            if not sources and len(query) > 6:
+                import re as _re
+                # 去掉常见停用词，抽 2-6 字的名词短语
+                stop = set("你我他的了是在有没和与或吗呢啊请帮给让把对就也都还这那么什么怎么能可以应该如何".split())
+                tokens = [t for t in _re.findall(r"[\u4e00-\u9fa5]{2,6}|[A-Za-z]{2,20}", query)
+                          if t not in stop and len(t) >= 2]
+                seen = set()
+                merged: List[Dict[str, Any]] = []
+                for tok in tokens[:5]:
+                    hits = _search_wiki_titles(client, wiki_space_id, tok, limit=3)
+                    for h in hits:
+                        if h["node_token"] in seen:
+                            continue
+                        seen.add(h["node_token"])
+                        merged.append(h)
+                sources = merged[:5]
+                reply["sources"] = sources
+
+            if not sources:
+                # 长句且无命中 → 主动引导走 suggest
+                if len(query) > 12:
+                    reply["reply_text"] = (
+                        f"没找到直接相关的 Wiki 页面。你这个问题更像是在让我分析知识库结构，"
+                        f"我重新路由到「整理建议」了——再发一句"
+                        f"「给点整理建议」或「你觉得我的 Wiki 怎么整理」，我就扫全树给你分析。"
+                    )
+                else:
+                    reply["reply_text"] = (
+                        f"Wiki 里没找到与「{query}」相关的页面。"
+                        f"换个说法试试，或说「给点整理建议」让我扫全树分析。"
+                    )
+                reply["status"] = "success"
+            else:
+                from src.importers.ai_summarizer import AISummarizer
+                ai_cfg = config_loader.get_ai_config()
+                summarizer = AISummarizer(ai_cfg)
+                if summarizer.configured():
+                    lines = "\n".join(f"- {s['title']}  {s['url']}" for s in sources)
+                    ai = summarizer._chat_json(
+                        tag=f"agent[{query[:20]}]",
+                        user_prompt=(
+                            f"用户询问: {query}\n\n"
+                            f"检索到以下相关 Wiki 页面：\n{lines}\n\n"
+                            f"用中文给出 200 字以内的帮助回答，引用具体页名，"
+                            f"不要编造不存在的内容。返回 JSON: "
+                            '{"one_liner": "一句话答复", "detail": "展开"}'
+                        ),
+                        timeout=60,
+                        retries=1,
+                    )
+                    if ai:
+                        reply["reply_text"] = ai.get("detail") or ai.get("one_liner") or ""
+                    else:
+                        reply["reply_text"] = f"找到 {len(sources)} 个相关页面（AI 摘要失败，直接看下方链接）。"
+                else:
+                    reply["reply_text"] = f"找到 {len(sources)} 个相关页面（未配置豆包，仅列标题）。"
+                reply["status"] = "success"
+
+        # 追加到 history
+        session["history"].append({"role": "user", "content": query, "ts": int(time.time())})
+        session["history"].append({
+            "role": "agent",
+            "content": reply["reply_text"],
+            "intent": intent,
+            "ts": int(time.time()),
+        })
+        # 限制 history 长度
+        if len(session["history"]) > 40:
+            session["history"] = session["history"][-40:]
+        wiki_agent.save_session(session)
+
+        # 附带最近 history 给 UI 展示
+        reply["history"] = session["history"][-10:]
+
+    except Exception as e:
+        logger.exception("agent-chat 异常")
+        reply["message"] = f"异常: {e}"
+
+    if json_output:
+        print(json.dumps(reply, ensure_ascii=False))
+    else:
+        print(f"\n[Agent · intent={reply.get('intent')}]")
+        print(reply.get("reply_text") or reply.get("message") or "")
+
+
+def _intent_example_prompt(intent: str, args: Dict[str, Any]) -> str:
+    """LLM 兜底命中其他意图时，给用户一句更明确的示例话术。"""
+    if intent == "move_nodes":
+        src = args.get("target_folder", "X 目录")
+        rs, re_ = args.get("range_start", 1), args.get("range_end", 5)
+        dst = args.get("dest_folder", "Y 目录")
+        return f"  「把 {src} 目录中 {rs} 到 {re_} 的文件移到 {dst} 下」"
+    if intent == "export_md":
+        tgt = args.get("target_folder", "X")
+        return f"  「整理 {tgt} 为 .md 文档」"
+    if intent == "scan_empty":
+        return "  「找一下空节点」 或 「扫描空文档」"
+    if intent == "delete_empty":
+        return "  「删空节点」（先扫，再确认）"
+    if intent == "mark_empty":
+        return "  「标记空节点」（加 🗑[空] 前缀）"
+    if intent == "cleanup_prefix":
+        pfx = args.get("prefix", "X")
+        return f"  「按前缀删 {pfx}」"
+    if intent == "suggest":
+        return "  「给点整理建议」 或 「你觉得我的 Wiki 怎么整理」"
+    if intent == "search":
+        kw = args.get("keyword", "X")
+        return f"  「找一下 {kw} 的资料」"
+    return f"  （意图：{intent}）"
+
+
+def _extract_prefix_from_query(query: str) -> str:
+    """从用户 query 中抽取前缀：支持 []、""、「」、''。找不到则返回空串。"""
+    import re as _re
+    for pattern in [r"\[([^\]]+)\]", r"「([^」]+)」", r"\"([^\"]+)\"", r"'([^']+)'"]:
+        m = _re.search(pattern, query)
+        if m:
+            return m.group(1).strip()
+    # 回退：去掉常见动词/助词后取剩余前面一段
+    cleaned = _re.sub(r"(按前缀|前缀|删除|删|清理|批量|所有|开头的|节点|wiki|Wiki|把|请|帮我|为我|所有以|以)", "", query)
+    cleaned = cleaned.strip()
+    return cleaned if 1 <= len(cleaned) <= 40 else ""
+
+
+def _search_wiki_titles(client, wiki_space_id: str, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """轻量递归搜索 Wiki 标题（ListSpaceNode，不走 v1 search）。"""
+    from lark_oapi.api.wiki.v2 import ListSpaceNodeRequest
+    q = query.lower()
+    hits: List[Dict[str, Any]] = []
+
+    def _scan(parent: Optional[str], depth: int):
+        if len(hits) >= limit * 3 or depth > 4:
+            return
+        page_token = None
+        for _ in range(5):
+            b = ListSpaceNodeRequest.builder().space_id(wiki_space_id).page_size(50)
+            if parent:
+                b.parent_node_token(parent)
+            if page_token:
+                b.page_token(page_token)
+            r = client.wiki.v2.space_node.list(b.build())
+            if not r.success():
+                return
+            for it in (getattr(r.data, "items", None) or []):
+                t = getattr(it, "title", "") or ""
+                if q in t.lower():
+                    hits.append({
+                        "title": t,
+                        "node_token": it.node_token,
+                        "url": f"https://open.feishu.cn/wiki/{it.node_token}",
+                    })
+                    if len(hits) >= limit * 3:
+                        return
+                if getattr(it, "has_child", False) and depth < 4:
+                    _scan(it.node_token, depth + 1)
+                    if len(hits) >= limit * 3:
+                        return
+            if not getattr(r.data, "has_more", False):
+                break
+            page_token = getattr(r.data, "page_token", None)
+            if not page_token:
+                break
+
+    _scan(None, 0)
+
+    def _score(title: str) -> int:
+        t = title.lower()
+        if t == q: return 100
+        if t.startswith(q): return 50
+        return 10
+    hits.sort(key=lambda h: _score(h["title"]), reverse=True)
+    return hits[:limit]
 
 
 def cmd_schedule(args):
@@ -1049,6 +2241,13 @@ def main():
     p_import_reddit = subparsers.add_parser("import-reddit", help="Reddit AI 日报 → 飞书")
     p_import_reddit.add_argument("--force", action="store_true", help="忽略缓存，重新调用豆包摘要")
 
+    # import-laoba-feng 子命令
+    p_import_laoba = subparsers.add_parser(
+        "import-laoba-feng",
+        help="老巴疯啦：8 个垂直 subreddit + GitHub 关键词 → 五维度头脑风暴 → 飞书",
+    )
+    p_import_laoba.add_argument("--force", action="store_true", help="忽略缓存，重新调用豆包")
+
     # manage 子命令
     p_manage = subparsers.add_parser("manage", help="管理飞书资源")
     p_manage.add_argument("resource", choices=["email", "messages", "calendar", "contacts"])
@@ -1062,10 +2261,25 @@ def main():
     p_chat.add_argument("--json", action="store_true", help="输出 JSON 供 UI 调用")
 
     # cleanup-wiki 子命令：批量删除 Wiki 节点
-    p_cleanup = subparsers.add_parser("cleanup-wiki", help="按前缀批量删 Wiki 节点（默认 dry-run）")
+    p_cleanup = subparsers.add_parser("cleanup-wiki", help="按前缀或 token 批量删 Wiki 节点（默认 dry-run）")
     p_cleanup.add_argument("--prefix", required=False, default="", help="要匹配的节点标题前缀")
+    p_cleanup.add_argument("--node-tokens", dest="node_tokens", required=False, default="",
+                           help="逗号分隔的 node_token 列表（优先于 --prefix）")
     p_cleanup.add_argument("--confirm", action="store_true", help="真删（不加则仅预览）")
     p_cleanup.add_argument("--json", action="store_true", help="输出 JSON 供 UI 调用")
+
+    # scan-empty-wiki 子命令：找空节点
+    p_scan = subparsers.add_parser("scan-empty-wiki", help="扫 Wiki 树找出正文为空的节点")
+    p_scan.add_argument("--threshold", type=int, default=8, help="正文字数阈值（≤ 视为空）")
+    p_scan.add_argument("--max", type=int, default=500, help="最多扫多少个节点")
+    p_scan.add_argument("--json", action="store_true", help="输出 JSON 供 UI 调用")
+
+    # agent-chat 子命令：Wiki 管家对话 Agent
+    p_agent = subparsers.add_parser("agent-chat", help="对话 Agent · Wiki 管家")
+    p_agent.add_argument("--query", default="", help="用户问题 / 指令")
+    p_agent.add_argument("--session", default="", help="会话 id（不传则新建）")
+    p_agent.add_argument("--reset", action="store_true", help="重置会话")
+    p_agent.add_argument("--json", action="store_true", help="输出 JSON 供 UI 调用")
 
     # schedule 子命令（守护进程）
     subparsers.add_parser("schedule", help="启动定时任务调度器")
@@ -1079,6 +2293,8 @@ def main():
         cmd_import_github(args)
     elif args.command == "import-reddit":
         cmd_import_reddit(args)
+    elif args.command == "import-laoba-feng":
+        cmd_import_laoba_feng(args)
     elif args.command == "manage":
         cmd_manage(args)
     elif args.command == "schedule":
@@ -1089,6 +2305,10 @@ def main():
         cmd_chat(args)
     elif args.command == "cleanup-wiki":
         cmd_cleanup_wiki(args)
+    elif args.command == "scan-empty-wiki":
+        cmd_scan_empty_wiki(args)
+    elif args.command == "agent-chat":
+        cmd_agent_chat(args)
     else:
         parser.print_help()
 
